@@ -404,7 +404,10 @@ go_sdk.from_file(
     name = "go_sdk",
     go_mod = "//:go.mod",
     patch_strip = 1,
-    patches = ["//tools:go_types_memoize.patch"],
+    patches = [
+        "//tools:go_types_memoize.patch",
+        "//tools:go_support_clone.patch",
+    ],
 )
 use_repo(go_sdk, "go_sdk")
 

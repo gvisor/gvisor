@@ -84,6 +84,7 @@ exports_files([
     "build_cover.sh",
     "llvm-dev-backends.patch",
     "llvm-linux-header-default.patch",
+    "go_support_clone.patch",
 ])
 
 # Go toolchain patched to allow imports of internal packages for coverage
