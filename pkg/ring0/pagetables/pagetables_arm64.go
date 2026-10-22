@@ -98,3 +98,8 @@ func (p *PageTables) cloneUpperShared() {
 	p.archPageTables.root = p.upperSharedPageTables.archPageTables.root
 	p.archPageTables.rootPhysical = p.upperSharedPageTables.archPageTables.rootPhysical
 }
+
+// MapLarge is equivalent to Map. See the amd64 version.
+func (p *PageTables) MapLarge(addr hostarch.Addr, length uintptr, opts MapOpts, physical uintptr) bool {
+	return p.Map(addr, length, opts, physical)
+}

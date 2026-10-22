@@ -125,3 +125,95 @@ func TestNumMemoryTypes(t *testing.T) {
 		t.Errorf("PTE.Set() and PTE.Opts() must be altered to handle %d MemoryTypes", hostarch.NumMemoryTypes)
 	}
 }
+
+// TestMapLarge checks that MapLarge produces the same translations as Map.
+func TestMapLarge(t *testing.T) {
+	cpuid.Initialize()
+	type rng struct {
+		addr, length, physical uintptr
+		opts                   MapOpts
+	}
+	rw := MapOpts{AccessType: hostarch.ReadWrite}
+	ro := MapOpts{AccessType: hostarch.Read, Global: true}
+	for _, tc := range [][]rng{
+		// Like the KVM physical map: unaligned head, huge interior.
+		{{0x1000, 0x79fbf8a2b000 - 0x1000, 0x200001000, rw}, {0x79fbf8a2d000, 0x7ffffffff000 - 0x79fbf8a2d000, 0x79fdf8a2d000, rw}},
+		// Exactly aligned, crossing a 512GiB boundary.
+		{{0x7f00000000, 0x200 * pudSize, 0x40000000, ro}},
+		// Smaller than 1GiB: falls back to Map.
+		{{0x400000, 0x200000, 0x1000000, rw}},
+		// Physical not congruent modulo 1GiB: falls back to Map.
+		{{0x40000000, 2 * pudSize, 0x200000, rw}},
+		// Overlapping an existing mapping.
+		{{0x80000000, pudSize + pteSize, 0x80000000, rw}, {0x40000000, 4 * pudSize, 0x40000000, ro}},
+	} {
+		want := New(NewRuntimeAllocator())
+		want.InitArch(NewRuntimeAllocator())
+		got := New(NewRuntimeAllocator())
+		got.InitArch(NewRuntimeAllocator())
+		for _, r := range tc {
+			wp := want.Map(hostarch.Addr(r.addr), r.length, r.opts, r.physical)
+			gp := got.MapLarge(hostarch.Addr(r.addr), r.length, r.opts, r.physical)
+			if wp != gp {
+				t.Errorf("Map(%#x, %#x) returned %v, MapLarge returned %v", r.addr, r.length, wp, gp)
+			}
+		}
+		for _, r := range tc {
+			for _, off := range []uintptr{0, pteSize, pmdSize, pudSize - pteSize, pudSize, 3*pudSize + 5*pteSize, r.length / 2, r.length - pteSize} {
+				if off >= r.length {
+					continue
+				}
+				a := hostarch.Addr(r.addr + off)
+				wv, wphys, wsize, wopts := want.Lookup(a, false)
+				gv, gphys, gsize, gopts := got.Lookup(a, false)
+				if wv != gv || wphys != gphys || wsize != gsize || wopts != gopts {
+					t.Errorf("Lookup(%#x): Map gave (%#x, %#x, %#x, %+v), MapLarge gave (%#x, %#x, %#x, %+v)", a, wv, wphys, wsize, wopts, gv, gphys, gsize, gopts)
+				}
+			}
+		}
+	}
+}
+
+// TestMapLargeNonCanonical checks that MapLarge panics like Map on a range that
+// crosses from the lower half into the non-canonical hole, and does not modify
+// the read-only shared upper page tables.
+func TestMapLargeNonCanonical(t *testing.T) {
+	cpuid.Initialize()
+	upper := New(NewRuntimeAllocator())
+	upperStart := upperBottom
+	// Populate the first upper root entry, but leave its first 1GiB entry
+	// empty.
+	upper.Map(hostarch.Addr(upperStart+2*pudSize), pudSize, MapOpts{AccessType: hostarch.Read, Global: true}, 5*pudSize)
+	upper.MarkReadOnlyShared()
+
+	// [lowerTop+1-1GiB, lowerTop+1+1GiB) crosses into the hole.
+	addr := hostarch.Addr(lowerTop + 1 - pudSize)
+	length := uintptr(2 * pudSize)
+	rw := MapOpts{AccessType: hostarch.ReadWrite}
+	for _, tc := range []struct {
+		name string
+		fn   func(p *PageTables)
+	}{
+		{"Map", func(p *PageTables) { p.Map(addr, length, rw, 0) }},
+		{"MapLarge", func(p *PageTables) { p.MapLarge(addr, length, rw, 0) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewWithUpper(NewRuntimeAllocator(), upper, upperStart)
+			panicked := func() (r bool) {
+				defer func() {
+					if recover() != nil {
+						r = true
+					}
+				}()
+				tc.fn(p)
+				return false
+			}()
+			if !panicked {
+				t.Errorf("%s(%#x, %#x) did not panic on a non-canonical range", tc.name, addr, length)
+			}
+			if _, phys, size, opts := upper.Lookup(hostarch.Addr(upperStart), false); size != 0 {
+				t.Errorf("%s changed the shared upper page tables: Lookup(%#x) = (%#x, %#x, %+v), want no mapping", tc.name, upperStart, phys, size, opts)
+			}
+		})
+	}
+}
