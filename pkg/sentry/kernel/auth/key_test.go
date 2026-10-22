@@ -63,9 +63,9 @@ func joinByName(t *testing.T, s *KeySet, desc string) *Key {
 	return found
 }
 
-func addKey(t *testing.T, s *KeySet, creds *Credentials, desc string) *Key {
+func addKey(t *testing.T, s *KeySet, q *KeyQuotas, creds *Credentials, desc string) *Key {
 	t.Helper()
-	k, err := s.Add(desc, creds, DefaultNamedSessionKeyringPermissions, MaxSetSize)
+	k, err := s.Add(desc, creds, DefaultNamedSessionKeyringPermissions, q, false)
 	if err != nil {
 		t.Fatalf("Add(%q): %v", desc, err)
 	}
@@ -88,13 +88,14 @@ func TestSessionKeyringReferencesDoNotLeak(t *testing.T) {
 	ns := NewRootUserNamespace()
 	creds := NewRootCredentials(ns)
 	s := &ns.Keys
+	q := NewKeyQuotas()
 
 	// Task A joins a new named keyring, and clones task B, which shares it.
-	shared := addKey(t, s, creds, "shared")
+	shared := addKey(t, s, q, creds, "shared")
 	shared.IncRef()
 
 	// B joins a new anonymous keyring, dropping its reference on shared.
-	anon := addKey(t, s, creds, DefaultSessionKeyringName)
+	anon := addKey(t, s, q, creds, DefaultSessionKeyringName)
 	shared.DecRef(ctx)
 	if _, err := s.Lookup(shared.ID); err != nil {
 		t.Fatalf("Lookup(%d) while A still holds it: %v", shared.ID, err)
@@ -121,6 +122,12 @@ func TestSessionKeyringReferencesDoNotLeak(t *testing.T) {
 	if n != 0 {
 		t.Errorf("KeySet holds %d keys after every reference was dropped, want 0", n)
 	}
+	q.mu.Lock()
+	users := len(q.users)
+	q.mu.Unlock()
+	if users != 0 {
+		t.Errorf("KeyQuotas charges %d users after every reference was dropped, want 0", users)
+	}
 	if report := leakCheck(); report != "" {
 		t.Errorf("leak checker reported leaks:\n%s", report)
 	}
@@ -129,7 +136,7 @@ func TestSessionKeyringReferencesDoNotLeak(t *testing.T) {
 func TestLeakCheckerReportsHeldKey(t *testing.T) {
 	enableLeakPanics(t)
 	ns := NewRootUserNamespace()
-	k := addKey(t, &ns.Keys, NewRootCredentials(ns), "leaked")
+	k := addKey(t, &ns.Keys, NewKeyQuotas(), NewRootCredentials(ns), "leaked")
 	defer k.DecRef(context.Background())
 
 	report := leakCheck()

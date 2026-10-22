@@ -64,11 +64,6 @@ const (
 	// MaxKeyDescSize is the maximum size of the "Description" field of keys.
 	// Corresponds to `KEY_MAX_DESC_SIZE` in Linux.
 	MaxKeyDescSize = 4096
-
-	// MaxSetSize is the default maximum number of keys in a `KeySet`.
-	// By default, Linux limits this number to 200 per non-root user.
-	// Here, we limit it to 200 per Set, which is stricter.
-	MaxSetSize = 200
 )
 
 // Key represents a key in the keyrings subsystem.
@@ -100,8 +95,8 @@ type Key struct {
 	// superset of this `Description`.
 	Description string
 
-	// kuid is the owner of the key in the root namespace.
-	// It is immutable.
+	// kuid is the owner of the key in the root namespace. The owner is charged
+	// for the key. It is immutable.
 	kuid KUID
 
 	// kgid is the group of the key in the root namespace.
@@ -121,12 +116,21 @@ type Key struct {
 
 	// set is the KeySet that contains the key. It is immutable.
 	set *KeySet
+
+	// quotas holds the quota charged to kuid for the key. It is immutable.
+	quotas *KeyQuotas
+
+	// quotalen is the number of bytes charged to kuid for the key. It is
+	// immutable.
+	quotalen uint32
 }
 
-// DecRef implements refs.RefCounter.DecRef. Dropping the last reference
-// removes k from its KeySet, which locks KeySet.mu.
+// DecRef implements refs.RefCounter.DecRef. Like key_put in Linux, dropping
+// the last reference returns the key's quota to its owner. It also removes k
+// from its KeySet, which locks KeySet.mu.
 func (k *Key) DecRef(ctx context.Context) {
 	k.keyRefs.DecRef(func() {
+		k.quotas.uncharge(k.kuid, k.quotalen)
 		k.set.remove(k)
 	})
 }
@@ -410,41 +414,59 @@ func getNewID() (KeySerial, error) {
 	return KeySerial(newID), nil
 }
 
-// Add adds a new Key to the KeySet. The returned key has one reference, which
-// is owned by the caller.
+// Add adds a new keyring to the KeySet, owned by the real user and group of
+// creds, and charges it to its owner in quotas until its last reference is
+// dropped. It returns EDQUOT if that exceeds the owner's quota, unless
+// quotaOverrun is set. The returned key has one reference, which is owned by
+// the caller.
 //
 // +checklocksexclude:s.mu
-func (s *KeySet) Add(description string, creds *Credentials, perms KeyPermissions, keySizeLimit int) (*Key, error) {
+func (s *KeySet) Add(description string, creds *Credentials, perms KeyPermissions, quotas *KeyQuotas, quotaOverrun bool) (*Key, error) {
 	if len(description) >= MaxKeyDescSize {
 		return nil, linuxerr.EINVAL
 	}
+	k := &Key{
+		Description: description,
+		kuid:        creds.RealKUID,
+		kgid:        creds.RealKGID,
+		perms:       atomicbitops.FromUint64(uint64(perms)),
+		set:         s,
+		quotas:      quotas,
+		// Like key_alloc, the quota charge covers the description and its
+		// terminating NUL. Keyrings have no payload.
+		quotalen: uint32(len(description)) + 1,
+	}
+	if err := quotas.charge(k.kuid, k.quotalen, quotaOverrun); err != nil {
+		return nil, err
+	}
+	if err := s.add(k); err != nil {
+		quotas.uncharge(k.kuid, k.quotalen)
+		return nil, err
+	}
+	return k, nil
+}
+
+// add gives k a fresh ID and one reference, and inserts it into s.
+//
+// +checklocksexclude:s.mu
+func (s *KeySet) add(k *Key) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.keys) >= keySizeLimit {
-		return nil, linuxerr.EDQUOT
-	}
 	newID, err := getNewID()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for s.keys[newID] != nil {
 		newID, err = getNewID()
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if s.keys == nil {
 		s.keys = make(map[KeySerial]*Key)
 	}
-	k := &Key{
-		ID:          newID,
-		Description: description,
-		kuid:        creds.EffectiveKUID,
-		kgid:        creds.EffectiveKGID,
-		perms:       atomicbitops.FromUint64(uint64(perms)),
-		set:         s,
-	}
+	k.ID = newID
 	k.InitRefs()
 	s.keys[newID] = k
-	return k, nil
+	return nil
 }

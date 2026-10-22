@@ -13,7 +13,13 @@
 // limitations under the License.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/capability.h>
+#include <linux/prctl.h>
+#include <sys/prctl.h>
+#include <sys/statvfs.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -25,71 +31,161 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+#ifndef SECBIT_NO_SETUID_FIXUP
+#define SECBIT_NO_SETUID_FIXUP (1 << 2)
+#endif
 
 namespace gvisor {
 namespace testing {
 namespace {
 
-constexpr char kMaxKeysPath[] = "/proc/sys/kernel/keys/maxkeys";
+constexpr uid_t kNobody = 65534;
 
-TEST(ProcSysKernelKeysMax, Exists) {
-  const std::string maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kMaxKeysPath));
-  int32_t value;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &value));
+struct KeyQuotaFile {
+  const char* name;
+  uint32_t linux_default;
+};
+
+class ProcSysKernelKeysQuotaTest
+    : public ::testing::TestWithParam<KeyQuotaFile> {
+ protected:
+  std::string Path() const {
+    return absl::StrCat("/proc/sys/kernel/keys/", GetParam().name);
+  }
+};
+
+TEST_P(ProcSysKernelKeysQuotaTest, Exists) {
+  const std::string contents = ASSERT_NO_ERRNO_AND_VALUE(GetContents(Path()));
+  uint32_t value;
+  ASSERT_TRUE(absl::SimpleAtoi(contents, &value)) << contents;
   EXPECT_GT(value, 0);
+  EXPECT_LE(value, std::numeric_limits<int32_t>::max());
   if (IsRunningOnGvisor()) {
-    // Each sandbox initializes its own limit; Linux's host policy may differ.
-    EXPECT_EQ(value, 200);
+    // Linux's host policy may differ.
+    EXPECT_EQ(value, GetParam().linux_default);
   }
 }
 
-// Returns true if the caller can write to /proc/sys/kernel/keys/maxkeys. On
+// Returns true if the caller can write to the key quota file at path. On
 // Linux, sysctl file permissions ignore capabilities and only allow the global
-// root user to write to this file (see test_perm() in fs/proc/proc_sysctl.c).
-PosixErrorOr<bool> CanSetMaxKeys() {
-  ASSIGN_OR_RETURN_ERRNO(bool have_sys_admin, HaveCapability(CAP_SYS_ADMIN));
+// root user to write to these files (see test_perm() in fs/proc/proc_sysctl.c).
+// /proc/sys may also be mounted read-only.
+PosixErrorOr<bool> CanSetKeyQuotas(const std::string& path) {
   ASSIGN_OR_RETURN_ERRNO(bool in_init_userns, InInitialUserNamespace());
-  return have_sys_admin && in_init_userns && geteuid() == 0;
+  if (!in_init_userns || geteuid() != 0) {
+    return false;
+  }
+  struct statvfs st;
+  if (statvfs(path.c_str(), &st) < 0) {
+    return PosixError(errno, absl::StrCat("statvfs ", path));
+  }
+  return (st.f_flag & ST_RDONLY) == 0;
 }
 
-TEST(ProcSysKernelKeysMax, InvalidMaxKeysValue) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetMaxKeys()));
-  const std::string before =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kMaxKeysPath));
-  auto cleanup = Cleanup([before] {
-    EXPECT_NO_ERRNO(SetContents(kMaxKeysPath, before));
-    EXPECT_THAT(GetContents(kMaxKeysPath), IsPosixErrorOkAndHolds(before));
+// The quotas accept values from 1 to INT_MAX (see key_sysctls in
+// security/keys/sysctl.c).
+TEST_P(ProcSysKernelKeysQuotaTest, InvalidValue) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas(Path())));
+  const std::string before = ASSERT_NO_ERRNO_AND_VALUE(GetContents(Path()));
+  const Cleanup cleanup([this, before] {
+    EXPECT_NO_ERRNO(SetContents(Path(), before));
+    EXPECT_THAT(GetContents(Path()), IsPosixErrorOkAndHolds(before));
   });
-  ASSERT_THAT(SetContents(kMaxKeysPath, "-1"), PosixErrorIs(EINVAL));
-  EXPECT_THAT(GetContents(kMaxKeysPath), IsPosixErrorOkAndHolds(before));
+  for (const char* value : {"0", "-1", "2147483648", "4294967296"}) {
+    SCOPED_TRACE(value);
+    ASSERT_THAT(SetContents(Path(), value), PosixErrorIs(EINVAL));
+    EXPECT_THAT(GetContents(Path()), IsPosixErrorOkAndHolds(before));
+  }
 }
 
-TEST(ProcSysKernelKeysMax, SetMaxKeys) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetMaxKeys()));
-  const std::string before =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kMaxKeysPath));
-  int32_t value;
-  ASSERT_TRUE(absl::SimpleAtoi(before, &value));
-  ASSERT_GT(value, 0);
-  auto cleanup = Cleanup([before] {
-    EXPECT_NO_ERRNO(SetContents(kMaxKeysPath, before));
-    EXPECT_THAT(GetContents(kMaxKeysPath), IsPosixErrorOkAndHolds(before));
+TEST_P(ProcSysKernelKeysQuotaTest, SetValue) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas(Path())));
+  const std::string before = ASSERT_NO_ERRNO_AND_VALUE(GetContents(Path()));
+  uint32_t value;
+  ASSERT_TRUE(absl::SimpleAtoi(before, &value)) << before;
+  const Cleanup cleanup([this, before] {
+    EXPECT_NO_ERRNO(SetContents(Path(), before));
+    EXPECT_THAT(GetContents(Path()), IsPosixErrorOkAndHolds(before));
   });
-  // Change the limit even when the host already uses a nondefault policy.
-  const int32_t updated =
-      value == std::numeric_limits<int32_t>::max() ? value - 1 : value + 1;
-  ASSERT_NO_ERRNO(SetContents(kMaxKeysPath, absl::StrCat(updated)));
-  const std::string maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kMaxKeysPath));
-  int32_t actual;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &actual));
-  EXPECT_EQ(actual, updated);
+  // Raising the limit keeps the host usable even when it is not Linux.
+  const uint32_t updated = value == std::numeric_limits<int32_t>::max()
+                               ? value - 1
+                               : std::numeric_limits<int32_t>::max();
+  ASSERT_NO_ERRNO(SetContents(Path(), absl::StrCat(updated)));
+  // Checkpoint and restore with the new value set.
+  MaybeSave();
+  EXPECT_THAT(GetContents(Path()),
+              IsPosixErrorOkAndHolds(absl::StrCat(updated, "\n")));
 }
+
+// Writing the files needs no capability, only the global root user.
+TEST_P(ProcSysKernelKeysQuotaTest, WriteWithoutCapSysAdmin) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas(Path())));
+  const std::string before = ASSERT_NO_ERRNO_AND_VALUE(GetContents(Path()));
+  AutoCapability no_sys_admin(CAP_SYS_ADMIN, false);
+  EXPECT_NO_ERRNO(SetContents(Path(), before));
+}
+
+// The writer's credentials are checked on every write, so a descriptor that
+// root opened can't change the limit once its effective UID is not 0, even
+// with CAP_DAC_OVERRIDE (see proc_sys_call_handler() in fs/proc/proc_sysctl.c).
+TEST_P(ProcSysKernelKeysQuotaTest, WriteAfterDroppingRoot) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas(Path())));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETPCAP)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_DAC_OVERRIDE)));
+  const std::string before = ASSERT_NO_ERRNO_AND_VALUE(GetContents(Path()));
+  uint32_t value;
+  ASSERT_TRUE(absl::SimpleAtoi(before, &value)) << before;
+  const std::string updated =
+      absl::StrCat(value == std::numeric_limits<int32_t>::max()
+                       ? value - 1
+                       : std::numeric_limits<int32_t>::max());
+  const Cleanup cleanup([this, before] {
+    EXPECT_NO_ERRNO(SetContents(Path(), before));
+    EXPECT_THAT(GetContents(Path()), IsPosixErrorOkAndHolds(before));
+  });
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(Path(), O_WRONLY));
+
+  ScopedThread([&] {
+    // Use raw syscalls to change only this thread's credentials, and keep its
+    // effective capabilities across the UID change.
+    ASSERT_THAT(prctl(PR_SET_SECUREBITS, SECBIT_NO_SETUID_FIXUP, 0, 0, 0),
+                SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresuid, -1, kNobody, -1), SyscallSucceeds());
+    ASSERT_THAT(HaveCapability(CAP_DAC_OVERRIDE), IsPosixErrorOkAndHolds(true));
+
+    EXPECT_THAT(pwrite(fd.get(), updated.data(), updated.size(), 0),
+                SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(Open(Path(), O_WRONLY), PosixErrorIs(EACCES));
+    EXPECT_THAT(GetContents(Path()), IsPosixErrorOkAndHolds(before));
+  }).Join();
+  EXPECT_THAT(GetContents(Path()), IsPosixErrorOkAndHolds(before));
+
+  // The same descriptor can be written again with effective UID 0.
+  ASSERT_THAT(pwrite(fd.get(), updated.data(), updated.size(), 0),
+              SyscallSucceedsWithValue(updated.size()));
+  EXPECT_THAT(GetContents(Path()),
+              IsPosixErrorOkAndHolds(absl::StrCat(updated, "\n")));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    , ProcSysKernelKeysQuotaTest,
+    ::testing::Values(KeyQuotaFile{"maxkeys", 200},
+                      KeyQuotaFile{"maxbytes", 20000},
+                      KeyQuotaFile{"root_maxkeys", 1000000},
+                      KeyQuotaFile{"root_maxbytes", 25000000}),
+    [](const ::testing::TestParamInfo<KeyQuotaFile>& info) {
+      return info.param.name;
+    });
 
 }  // namespace
 }  // namespace testing
