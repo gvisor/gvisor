@@ -61,6 +61,7 @@ BAZEL_IMAGE_CONTEXTS := \
   basic_tmpfile=//images/basic:tmpfile_context \
   benchmarks_bun-spawn=//images/benchmarks/bun-spawn:bun_spawn_context \
   benchmarks_httpd=//images/benchmarks:httpd_context \
+  benchmarks_nginx=//images/benchmarks:nginx_context \
   benchmarks_redis=//images/basic:benchmark_redis_context \
   compatibility_postgresql_postgresql=//images/compatibility:postgresql_context
 ifeq ($(ARCH),x86_64)
