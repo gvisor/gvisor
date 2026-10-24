@@ -59,6 +59,7 @@ BAZEL_IMAGE_CONTEXTS := \
   basic_redis=//images/basic:redis_context \
   basic_symlink-resolv=//images/basic:symlink_resolv_context \
   basic_tmpfile=//images/basic:tmpfile_context \
+  basic_tomcat=//images/basic:tomcat_context \
   benchmarks_bun-spawn=//images/benchmarks/bun-spawn:bun_spawn_context \
   benchmarks_httpd=//images/benchmarks:httpd_context \
   benchmarks_redis=//images/basic:benchmark_redis_context \
