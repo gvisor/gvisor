@@ -332,14 +332,19 @@ PosixErrorOr<std::vector<Link>> DumpLinks(const FileDescriptor& fd) {
   return links;
 }
 
-PosixErrorOr<Link> GetLinkByName(const std::string& name) {
-  ASSIGN_OR_RETURN_ERRNO(auto links, DumpLinks());
+PosixErrorOr<Link> FindLinkByName(const std::vector<Link>& links,
+                                  const std::string& name) {
   for (const auto& link : links) {
     if (link.name == name) {
       return link;
     }
   }
   return PosixError(ENOENT, "interface not found");
+}
+
+PosixErrorOr<Link> GetLinkByName(const std::string& name) {
+  ASSIGN_OR_RETURN_ERRNO(auto links, DumpLinks());
+  return FindLinkByName(links, name);
 }
 
 PosixErrorOr<Link> LoopbackLink() {
