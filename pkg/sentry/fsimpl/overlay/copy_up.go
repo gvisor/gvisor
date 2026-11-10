@@ -515,22 +515,46 @@ func (d *dentry) copyXattrsLocked(ctx context.Context) error {
 	return nil
 }
 
-// copyUpDescendantsLocked ensures that all descendants of d are copied up.
+// copyUpWithDescendantsLocked ensures that d and, if d is a directory, all
+// descendants of d are copied up.
+//
+// It collects all descendants before copying anything up. If the layers
+// overlap, copy-ups can show up in a lower layer; collecting first keeps them
+// out of the walk.
 //
 // Preconditions:
-//   - filesystem.renameMu must be locked.
-//   - d.dirMu must be locked.
-//   - d.isDir().
-func (d *dentry) copyUpDescendantsLocked(ctx context.Context, ds **[]*dentry) error {
-	return d.copyUpDescendantsAtDepthLocked(ctx, ds, 0)
+//   - filesystem.renameMu must be locked for writing.
+//   - If d.isDir(), d.dirMu must be locked.
+func (d *dentry) copyUpWithDescendantsLocked(ctx context.Context, ds **[]*dentry) error {
+	var descendants []*dentry
+	// Without an upper layer, nothing can be copied up, and d.copyUpLocked()
+	// below fails with EROFS.
+	if d.isDir() && d.fs.opts.UpperRoot.Ok() {
+		if err := d.collectDescendantsLocked(ctx, ds, &descendants, 0); err != nil {
+			return err
+		}
+	}
+	if err := d.copyUpLocked(ctx); err != nil {
+		return err
+	}
+	for _, child := range descendants {
+		if err := child.copyUpLocked(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// copyUpDescendantsAtDepthLocked implements copyUpDescendantsLocked. depth is
-// the number of directories between d and the directory whose descendants are
-// being copied up, so it is 0 for that directory itself.
+// collectDescendantsLocked appends all descendants of d to descendants, each
+// directory before its children. It does not write to any layer. depth is the
+// number of directories between d and the directory whose descendants are
+// being collected, so it is 0 for that directory itself.
 //
-// Preconditions: Same as copyUpDescendantsLocked.
-func (d *dentry) copyUpDescendantsAtDepthLocked(ctx context.Context, ds **[]*dentry, depth int) error {
+// Preconditions:
+//   - filesystem.renameMu must be locked for writing.
+//   - d.dirMu must be locked.
+//   - d.isDir().
+func (d *dentry) collectDescendantsLocked(ctx context.Context, ds **[]*dentry, descendants *[]*dentry, depth int) error {
 	dirents, err := d.getDirentsLocked(ctx)
 	if err != nil {
 		return err
@@ -543,9 +567,7 @@ func (d *dentry) copyUpDescendantsAtDepthLocked(ctx context.Context, ds **[]*den
 		if err != nil {
 			return err
 		}
-		if err := child.copyUpLocked(ctx); err != nil {
-			return err
-		}
+		*descendants = append(*descendants, child)
 		if child.isDir() {
 			// Each level of the recursion holds the dirMu of a directory and
 			// of its child directory, always parent before child, so this
@@ -558,11 +580,11 @@ func (d *dentry) copyUpDescendantsAtDepthLocked(ctx context.Context, ds **[]*den
 			if depth == 0 {
 				dirIdx := child.dirLockIndex(dirLockD1Child)
 				child.dirMu.NestedLock(dirIdx)
-				err = child.copyUpDescendantsAtDepthLocked(ctx, ds, depth+1)
+				err = child.collectDescendantsLocked(ctx, ds, descendants, depth+1)
 				child.dirMu.NestedUnlock(dirIdx)
 			} else {
 				child.dirMu.LockBypass()
-				err = child.copyUpDescendantsAtDepthLocked(ctx, ds, depth+1)
+				err = child.collectDescendantsLocked(ctx, ds, descendants, depth+1)
 				child.dirMu.UnlockBypass()
 			}
 			if err != nil {
