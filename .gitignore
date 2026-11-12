@@ -6,6 +6,8 @@
 /.build_events.json
 # Local fscheckpoint compatibility corpus checkout.
 /.fscheckpoint_corpus
+# Build contexts of build-image.sh (deploy/kubernetes).
+/.build-image.*
 # Generated repository.
 /repo
 /repo.key

@@ -2,6 +2,11 @@
 
 This tool is meant to make deploying `runsc` in a Kubernetes cluster easier.
 
+It runs an installer image that you supply on the nodes of a cluster, for
+example to test a development build of `runsc` on GKE Sandbox node pools. To
+install gVisor on nodes that you manage, use gvisor-deploy
+([`deploy/kubernetes`](../../deploy/kubernetes)).
+
 ## Usage
 
 ```shell

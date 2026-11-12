@@ -1,0 +1,162 @@
+# This workflow publishes gvisor-deploy (deploy/kubernetes) for a gVisor
+# release: the installer image ghcr.io/gvisor/gvisor-installer:<version>, for
+# amd64 and arm64, and the Helm chart
+# oci://ghcr.io/gvisor/charts/gvisor-deploy, with chart version <version>.0
+# (Helm finds the newest chart only among versions with three numbers).
+#
+# It runs when the Release Mirror workflow is done for a release tag push,
+# because the image is built from the published release tarballs. The
+# installer and the chart come from the release tag. If the chart version is
+# already published, it does nothing. After a manual Release Mirror run, run
+# this workflow by hand.
+name: "gvisor-deploy Release"
+
+"on":
+  # The job runs only for tag pushes of release_mirror.yml in this
+  # repository, and checks out only a validated release tag.
+  workflow_run:  # zizmor: ignore[dangerous-triggers]
+    workflows: ["Release Mirror"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. release-20261116.0)'
+        required: true
+        type: string
+      force:
+        description: 'Publish again if the chart version exists'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish gvisor-deploy
+    if: >-
+      github.repository == 'gvisor/gvisor' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.path == '.github/workflows/release_mirror.yml' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/gvisor/gvisor-installer
+      CHARTS: oci://ghcr.io/gvisor/charts
+    steps:
+      - name: Determine tag and version
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-${RUN_TAG}}"
+          if ! [[ "${TAG}" =~ ^release-20[0-9]{6}\.[0-9]+$ ]]; then
+            echo "::error::Not a valid release tag: '${TAG}'"
+            exit 1
+          fi
+          echo "tag=${TAG}" >>"${GITHUB_OUTPUT}"
+          echo "version=${TAG#release-}" >>"${GITHUB_OUTPUT}"
+
+      - name: Check if the chart version is published
+        id: exists
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          [[ "${FORCE}" != true ]] || exit 0
+          if err="$(helm show chart "${CHARTS}/gvisor-deploy" --version "${VERSION}.0" 2>&1 >/dev/null)"; then
+            echo "Chart ${VERSION}.0 is already published; nothing to do."
+            echo "skip=true" >>"${GITHUB_OUTPUT}"
+          # A missing version is "not found". A package that does not exist
+          # yet, or is still private, is "denied".
+          elif ! grep -qE ': not found$|denied' <<<"${err}"; then
+            echo "::error::Cannot check if chart ${VERSION}.0 is published: ${err}"
+            exit 1
+          fi
+
+      - name: Checkout
+        if: steps.exists.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.meta.outputs.tag }}
+          persist-credentials: false
+
+      - name: Test the chart and the image build
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          deploy/kubernetes/test/chart_test.sh
+          deploy/kubernetes/test/build_image_test.sh
+
+      - name: Build the installer images
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            deploy/kubernetes/build-image.sh --release "${VERSION}" --arch "${arch}" \
+              --image "${IMAGE}:${VERSION}-${arch}"
+          done
+
+      - name: Push the image and the chart
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "${TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+          echo "${TOKEN}" | helm registry login ghcr.io -u "${ACTOR}" --password-stdin
+          trap 'docker logout ghcr.io; helm registry logout ghcr.io' EXIT
+          for arch in amd64 arm64; do
+            docker push "${IMAGE}:${VERSION}-${arch}"
+          done
+          tags=(-t "${IMAGE}:${VERSION}")
+          # "latest" is the newest release, also if an older release is
+          # published again.
+          newest="$(git ls-remote --tags --refs origin 'refs/tags/release-*' |
+            sed -En 's,.*refs/tags/(release-[0-9]+\.[0-9]+)$,\1,p' | sort -V | tail -1)"
+          if [[ "${TAG}" == "${newest}" ]]; then
+            tags+=(-t "${IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            "${IMAGE}:${VERSION}-amd64" "${IMAGE}:${VERSION}-arm64"
+          helm package deploy/kubernetes/chart/gvisor-deploy \
+            --version "${VERSION}.0" --app-version "${VERSION}" -d "${RUNNER_TEMP}"
+          helm push "${RUNNER_TEMP}/gvisor-deploy-${VERSION}.0.tgz" "${CHARTS}"
+
+      # Without credentials, as users pull. The packages must be public.
+      - name: Check the published image and chart
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          platforms="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}")"
+          for p in linux/amd64 linux/arm64; do
+            grep -q "Platform: *${p}$" <<<"${platforms}" || {
+              echo "::error::${IMAGE}:${VERSION} has no ${p} image"
+              exit 1
+            }
+          done
+          out="$(helm template t "${CHARTS}/gvisor-deploy" --version "${VERSION}.0")"
+          [[ "$(grep -c "image: ${IMAGE}:${VERSION}$" <<<"${out}")" == 2 ]] || {
+            echo "::error::chart ${VERSION}.0 does not use ${IMAGE}:${VERSION}"
+            exit 1
+          }
