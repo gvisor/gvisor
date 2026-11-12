@@ -198,6 +198,10 @@ type MemoryFile struct {
 	// release all MemoryFile resources and exit. destroyed is protected by mu.
 	destroyed bool
 
+	// unadopted is true if KeepFileContents was set and AdoptExisting has not
+	// yet completed. unadopted is protected by mu.
+	unadopted bool
+
 	// stopNotifyPressure stops memory cgroup pressure level
 	// notifications used to drive eviction. stopNotifyPressure is
 	// immutable.
@@ -392,6 +396,11 @@ type MemoryFileOpts struct {
 	// If DisableMemoryAccounting is true, memory usage observed by the
 	// MemoryFile will not be reported in usage.MemoryAccounting.
 	DisableMemoryAccounting bool
+
+	// If KeepFileContents is true, NewMemoryFile does not truncate the
+	// backing file. The caller must then call MemoryFile.AdoptExisting before
+	// it allocates from the MemoryFile.
+	KeepFileContents bool
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -440,9 +449,12 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 		return nil, fmt.Errorf("invalid MemoryFileOpts.DelayedEviction: %v", opts.DelayedEviction)
 	}
 
-	// Truncate the file to 0 bytes first to ensure that it's empty.
-	if err := file.Truncate(0); err != nil {
-		return nil, err
+	// Unless the caller keeps the file's contents, truncate the file to 0
+	// bytes first to ensure that it's empty.
+	if !opts.KeepFileContents {
+		if err := file.Truncate(0); err != nil {
+			return nil, err
+		}
 	}
 	f := &MemoryFile{
 		opts: opts,
@@ -483,6 +495,7 @@ func (f *MemoryFile) initFields() {
 	f.unfreeHuge.InsertRange(fullFR, unfreeInfo{})
 	f.subreleased = make(map[uint64]uint64)
 	f.evictable = make(map[EvictableMemoryUser]*evictableMemoryUserInfo)
+	f.unadopted = f.opts.KeepFileContents
 	chunks := []chunkInfo(nil)
 	f.chunks.Store(&chunks)
 }
@@ -911,6 +924,9 @@ func recycleRange(uwgap unwasteGapIterator, alloc *allocState) (memmap.FileRange
 
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
+	if f.unadopted {
+		panic("MemoryFile created with KeepFileContents must call AdoptExisting before allocating")
+	}
 	unfree := &f.unfreeSmall
 	if alloc.huge {
 		unfree = &f.unfreeHuge
@@ -931,7 +947,6 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 		}
 	}
 	incNrChunks := (alloc.length + chunkMask - tail) / chunkSize
-	incFileSize := incNrChunks * chunkSize
 	newNrChunks := oldNrChunks + incNrChunks
 	if newNrChunks > maxChunks || newNrChunks < oldNrChunks /* overflow */ {
 		return linuxerr.ENOMEM
@@ -944,11 +959,29 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	// mm/shmem.c:shmem_get_unmapped_area().
 	//
 	// In tests, f.file may be nil.
-	var mapStart uintptr
 	if f.file != nil {
 		if err := f.file.Truncate(int64(newFileSize)); err != nil {
 			return err
 		}
+	}
+	return f.mapAndAddChunksLocked(oldChunks, newNrChunks, alloc.huge)
+}
+
+// mapAndAddChunksLocked maps [oldFileSize, newFileSize) of f.file, applies
+// madvise across the new mapping once, installs the extended chunk descriptors,
+// and marks the newly added range free in the corresponding unfree set.
+//
+// Preconditions:
+//   - f.mu must be locked.
+//   - newNrChunks > uint64(len(oldChunks)).
+//   - If f.file != nil, f.file is already at least newNrChunks*chunkSize bytes.
+func (f *MemoryFile) mapAndAddChunksLocked(oldChunks []chunkInfo, newNrChunks uint64, huge bool) error {
+	oldNrChunks := uint64(len(oldChunks))
+	oldFileSize := oldNrChunks * chunkSize
+	incFileSize := (newNrChunks - oldNrChunks) * chunkSize
+
+	var mapStart uintptr
+	if f.file != nil {
 		m, _, errno := unix.Syscall6(
 			unix.SYS_MMAP,
 			0,
@@ -961,7 +994,7 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 			return errno
 		}
 		mapStart = m
-		f.madviseChunkMapping(mapStart, uintptr(incFileSize), alloc.huge)
+		f.madviseChunkMapping(mapStart, uintptr(incFileSize), huge)
 	}
 
 	// Update chunk state.
@@ -969,7 +1002,7 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	copy(newChunks, oldChunks)
 	m := mapStart
 	for i := oldNrChunks; i < newNrChunks; i++ {
-		newChunks[i].huge = alloc.huge
+		newChunks[i].huge = huge
 		if f.file != nil {
 			newChunks[i].mapping = m
 			m += chunkSize
@@ -978,8 +1011,12 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	f.chunks.Store(&newChunks)
 
 	// Mark void pages free.
+	unfree := &f.unfreeSmall
+	if huge {
+		unfree = &f.unfreeHuge
+	}
 	unfree.RemoveFullRange(memmap.FileRange{
-		Start: oldNrChunks * chunkSize,
+		Start: oldFileSize,
 		End:   newNrChunks * chunkSize,
 	})
 
