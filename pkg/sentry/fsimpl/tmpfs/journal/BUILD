@@ -19,6 +19,7 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/safecopy",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",

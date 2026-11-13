@@ -334,7 +334,12 @@ func Open(mf *pgalloc.MemoryFile, file *os.File, opts Options, keepJournal bool)
 		return nil, nil, fmt.Errorf("journal generation %#x is out of range", active)
 	}
 
+	filestoreLimit := uint64(dataStat.Size)
+	if opts.FilestoreSize != 0 && opts.FilestoreSize < filestoreLimit {
+		filestoreLimit = opts.FilestoreSize
+	}
 	filestoreEnd := binary.LittleEndian.Uint64(hdr[filestoreEndOff:])
+	limit := min(filestoreLimit, filestoreEnd)
 
 	gen := active
 	activeSlot := int(gen & 1)
@@ -353,7 +358,14 @@ func Open(mf *pgalloc.MemoryFile, file *os.File, opts Options, keepJournal bool)
 		unmapRange(activeMap)
 		return nil, nil, err
 	}
-	st, tail, nextSeq := &State{}, uint64(regionHeaderSize), startSeq
+	st, tail, nextSeq, err := replayRegion(activeMap, startSeq, limit)
+	if err != nil {
+		unmapRange(activeMap)
+		if filestoreEnd < filestoreLimit {
+			return nil, nil, fmt.Errorf("failed to replay journal with filestore end mark %#x: %w", filestoreEnd, err)
+		}
+		return nil, nil, fmt.Errorf("failed to replay journal: %w", err)
+	}
 
 	if err := mf.AdoptExisting(st.UsedRanges(), usage.Tmpfs); err != nil {
 		unmapRange(activeMap)
