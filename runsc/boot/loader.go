@@ -401,6 +401,13 @@ type Loader struct {
 	// +checklocks:journalingUpperMu
 	journalingUpperDestroyed bool
 
+	// restoredJournalFiles holds the journal files of journaling rootfs
+	// uppers of restored containers, by container ID, until their journals
+	// are activated.
+	//
+	// +checklocks:journalingUpperMu
+	restoredJournalFiles map[string]*os.File
+
 	// journalingUpperWG tracks pending background journal activations so a
 	// clean container exit waits for activation to complete.
 	journalingUpperWG     sync.WaitGroup
