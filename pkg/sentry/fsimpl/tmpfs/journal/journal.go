@@ -290,6 +290,13 @@ func Create(file *os.File, opts Options) (*Journal, error) {
 	return create(file, opts, false /* incomplete */)
 }
 
+// CreateIncomplete is like Create, but marks the journal as incomplete. Until
+// the returned Journal commits its first snapshot, Open refuses the journal
+// with ErrIncomplete.
+func CreateIncomplete(file *os.File, opts Options) (*Journal, error) {
+	return create(file, opts, true /* incomplete */)
+}
+
 // Open replays the journal in file and adopts the filestore pages that it
 // references into mf, which must have been created with KeepFileContents.
 //
@@ -628,9 +635,57 @@ func checkHeaderFormat(h []byte) (uint64, error) {
 	return regionSize, nil
 }
 
+// Invalidate marks the journal header in file as broken so Open refuses to
+// replay it later (for example, when a filestore is imported without runtime
+// journaling and mutated in place). Invalidate does not take ownership of file.
+func Invalidate(file *os.File) error {
+	fd := int(file.Fd())
+	var hdr [headerSize]byte
+	n, err := preadFull(fd, hdr[:], 0)
+	if err != nil {
+		return fmt.Errorf("failed to read journal header: %w", err)
+	}
+	if n < headerSize {
+		return nil
+	}
+	if _, err := checkHeaderFormat(hdr[:]); err != nil {
+		return nil
+	}
+	active := binary.LittleEndian.Uint64(hdr[activeOff:])
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], active|brokenBit)
+	for written := 0; written < len(buf); {
+		w, err := unix.Pwrite(fd, buf[written:], activeOff+int64(written))
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to invalidate journal header: %w", err)
+		}
+		written += w
+	}
+	return nil
+}
+
 // ErrIncomplete is returned by Open if the journal is incomplete or was never
 // initialized. See CreateIncomplete.
 var ErrIncomplete = errors.New("journal is incomplete")
+
+// Incomplete returns true if the journal in file is marked as incomplete.
+func Incomplete(file *os.File) (bool, error) {
+	var hdr [headerSize]byte
+	n, err := preadFull(int(file.Fd()), hdr[:], 0)
+	if err != nil {
+		return false, fmt.Errorf("failed to read journal header: %w", err)
+	}
+	if n < headerSize {
+		return false, nil
+	}
+	if _, err := checkHeaderFormat(hdr[:]); err != nil {
+		return false, nil
+	}
+	return binary.LittleEndian.Uint64(hdr[activeOff:])&incompleteBit != 0, nil
+}
 
 // ImageMismatchError is returned by Open when the journal was created for a
 // different image.
