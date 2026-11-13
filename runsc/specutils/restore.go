@@ -176,6 +176,13 @@ func shouldValidateAnnotation(key string) bool {
 	if strings.HasPrefix(key, annotationMountPrefix) && strings.HasSuffix(key, ".source") {
 		return false
 	}
+	// Journaling rootfs upper annotations (dev.gvisor.journal.rootfs.upper and
+	// all .<subkey> / .<container> variants) may be added or removed across
+	// checkpoint and restore.
+	if key == AnnotationRootfsUpperJournal ||
+		strings.HasPrefix(key, AnnotationRootfsUpperJournal+".") {
+		return false
+	}
 	// Flag annotations controlling debug logging can change. They don't impact
 	// the restorability of the snapshot.
 	if strings.HasPrefix(key, annotationFlagPrefix) {
