@@ -255,6 +255,153 @@ func (i *inode) fillJournalRecord(r *journal.InodeRecord, sortXattrs bool) {
 	}
 }
 
+// journalInodeLocked appends an INODE record for i, if fs is journaled.
+//
+// +checklocks:i.mu
+func (i *inode) journalInodeLocked() {
+	if j := i.fs.journal.Load(); j != nil {
+		i.journalInodeSlowLocked(j)
+	}
+}
+
+// +checklocks:i.mu
+func (i *inode) journalInodeSlowLocked(j *journal.Journal) {
+	var r journal.InodeRecord
+	i.fillJournalRecord(&r, true /* sortXattrs */)
+	j.Inode(&r)
+}
+
+// journalInode appends an INODE record for i, if fs is journaled.
+//
+// +checklocksexclude:i.mu
+func (i *inode) journalInode() {
+	if j := i.fs.journal.Load(); j != nil {
+		i.journalInodeSlow(j)
+	}
+}
+
+// +checklocksexclude:i.mu
+func (i *inode) journalInodeSlow(j *journal.Journal) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.journalInodeSlowLocked(j)
+}
+
+// journalCreateLocked journals the creation of child as the entry name in
+// parent.
+//
+// Preconditions: filesystem.mu must be locked for writing.
+func (fs *filesystem) journalCreateLocked(parent *directory, name string, child *inode) {
+	if j := fs.journal.Load(); j != nil {
+		child.journalInodeSlow(j)
+		j.DirentAdd(parent.inode.ino, name, child.ino)
+	}
+}
+
+// journalLinkLocked journals a new entry name in parent for child.
+//
+// Preconditions: filesystem.mu must be locked for writing.
+func (fs *filesystem) journalLinkLocked(parent *directory, name string, child *inode) {
+	if j := fs.journal.Load(); j != nil {
+		j.DirentAdd(parent.inode.ino, name, child.ino)
+	}
+}
+
+// journalUnlinkLocked journals the removal of the entry name from parent. It
+// must be called before the entry's inode can be released.
+//
+// +checklocks:fs.mu
+func (fs *filesystem) journalUnlinkLocked(parent *directory, name string) {
+	if j := fs.journal.Load(); j != nil {
+		j.DirentDel(parent.inode.ino, name)
+	}
+}
+
+// journalRenameLocked journals a rename. It must be called before a replaced
+// inode can be released.
+//
+// +checklocks:fs.mu
+func (fs *filesystem) journalRenameLocked(oldParent *directory, oldName string, newParent *directory, newName string, exchange bool) {
+	if j := fs.journal.Load(); j != nil {
+		j.Rename(oldParent.inode.ino, oldName, newParent.inode.ino, newName, exchange)
+	}
+}
+
+// journalRenamedInodes journals the inodes whose attributes a rename
+// changes. replaced may be nil.
+func (fs *filesystem) journalRenamedInodes(oldParent, newParent *directory, renamed, replaced *inode) {
+	j := fs.journal.Load()
+	if j == nil {
+		return
+	}
+	oldParent.inode.journalInodeSlow(j)
+	if newParent != oldParent {
+		newParent.inode.journalInodeSlow(j)
+	}
+	renamed.journalInodeSlow(j)
+	if replaced != nil {
+		replaced.journalInodeSlow(j)
+	}
+}
+
+// journalRelease journals the release of i. It must be called before i's
+// pages are returned to the MemoryFile.
+func (i *inode) journalRelease() {
+	j := i.fs.journal.Load()
+	if j == nil {
+		return
+	}
+	if _, ok := i.impl.(*regularFile); ok {
+		j.ExtentClear(i.ino, 0, journal.MaxFileOffset)
+	}
+	j.InodeFree(i.ino)
+}
+
+// journalExtentSetLocked journals that file range mr is stored at MemoryFile
+// offset mfOff.
+//
+// +checklocks:rf.dataMu
+func (rf *regularFile) journalExtentSetLocked(mr memmap.MappableRange, mfOff uint64) {
+	if j := rf.inode.fs.journal.Load(); j != nil {
+		j.ExtentSet(rf.inode.ino, mr.Start, mr.Length(), mfOff)
+	}
+}
+
+// journalExtentsLocked journals all extents of rf that intersect mr.
+//
+// +checklocks:rf.dataMu
+func (rf *regularFile) journalExtentsLocked(mr memmap.MappableRange) {
+	if j := rf.inode.fs.journal.Load(); j != nil {
+		rf.journalExtentsSlowLocked(j, mr)
+	}
+}
+
+// +checklocks:rf.dataMu
+func (rf *regularFile) journalExtentsSlowLocked(j *journal.Journal, mr memmap.MappableRange) {
+	for seg := rf.data.LowerBoundSegment(mr.Start); seg.Ok() && seg.Start() < mr.End; seg = seg.NextSegment() {
+		segMR := seg.Range().Intersect(mr)
+		j.ExtentSet(rf.inode.ino, segMR.Start, segMR.Length(), seg.FileRangeOf(segMR).Start)
+	}
+}
+
+// journalTruncateLocked journals the removal of pages at or past newpgend.
+//
+// +checklocks:rf.dataMu
+func (rf *regularFile) journalTruncateLocked(newpgend uint64) {
+	if newpgend < journal.MaxFileOffset {
+		rf.journalExtentClearLocked(memmap.MappableRange{Start: newpgend, End: journal.MaxFileOffset})
+	}
+}
+
+// journalExtentClearLocked journals that file range mr is not stored.
+//
+// +checklocks:rf.dataMu
+func (rf *regularFile) journalExtentClearLocked(mr memmap.MappableRange) {
+	if j := rf.inode.fs.journal.Load(); j != nil && mr.Length() != 0 {
+		j.ExtentClear(rf.inode.ino, mr.Start, mr.Length())
+	}
+}
+
 // rebuildFromJournal creates the files in st in fs. The MemoryFile of fs
 // must already have adopted st.UsedRanges().
 //
