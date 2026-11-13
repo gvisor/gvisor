@@ -507,6 +507,10 @@ type containerMounter struct {
 	// upper journal file.
 	rootfsJournalFD *fd.FD
 
+	// pendingJournalActivations holds async journal activations queued during
+	// createMountNamespace until mountAll completes mountSubmounts.
+	pendingJournalActivations []func(cancel bool)
+
 	spec *specs.Spec
 	conf *config.Config
 }
@@ -556,6 +560,13 @@ func getMountAccessType(conf *config.Config, hint *sentryapi.MountHint) config.F
 
 func (c *containerMounter) mountAll(rootCtx context.Context, rootCreds *auth.Credentials, spec *specs.Spec, conf *config.Config, rootProcArgs *kernel.CreateProcessArgs) (*vfs.MountNamespace, error) {
 	log.Infof("Configuring container's file system")
+	cu := cleanup.Make(func() {
+		for _, fn := range c.pendingJournalActivations {
+			fn(true)
+		}
+		c.pendingJournalActivations = nil
+	})
+	defer cu.Clean()
 
 	mns, err := c.createMountNamespace(rootCtx, spec, conf, rootCreds)
 	if err != nil {
@@ -584,6 +595,12 @@ func (c *containerMounter) mountAll(rootCtx context.Context, rootCreds *auth.Cre
 		return nil, fmt.Errorf("mounting submounts: %w", err)
 	}
 	rootProcArgs.StartupTimeline.Reached("submounts mounted")
+
+	cu.Release()
+	for _, fn := range c.pendingJournalActivations {
+		c.l.scheduleJournalingUpperActivation(fn)
+	}
+	c.pendingJournalActivations = nil
 
 	return mns, nil
 }

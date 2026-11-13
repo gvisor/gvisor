@@ -382,6 +382,30 @@ type Loader struct {
 	// is a socket connected to a checkpoint gofer.
 	fsSaveCheckpointGofer bool
 
+	journalingUpperMu sync.Mutex
+
+	// journalingUpperActivations activate journaling rootfs upper journals
+	// after the kernel starts. See activateJournalingUpperAsync.
+	//
+	// +checklocks:journalingUpperMu
+	journalingUpperActivations []func(cancel bool)
+
+	// journalingUpperKernelStarted is true after the kernel started.
+	//
+	// +checklocks:journalingUpperMu
+	journalingUpperKernelStarted bool
+
+	// journalingUpperDestroyed is true once Loader.Destroy begins tearing down
+	// the sandbox so pending activations exit without touching the kernel.
+	//
+	// +checklocks:journalingUpperMu
+	journalingUpperDestroyed bool
+
+	// journalingUpperWG tracks pending background journal activations so a
+	// clean container exit waits for activation to complete.
+	journalingUpperWG     sync.WaitGroup
+	journalingUpperFailed atomicbitops.Bool
+
 	// hostinetNetDevFile is the pre-opened /proc/net/dev file for hostinet restore.
 	//
 	// Restore initializes both hostinet files before taking mu.
@@ -1168,6 +1192,7 @@ func createProcessArgs(id string, spec *specs.Spec, conf *config.Config, creds *
 // +checklocksexclude:l.k.fsSaveMu
 func (l *Loader) Destroy() {
 	l.noRootContainer.stop()
+	l.cancelJournalingUpperActivations()
 	if l.stopSignalForwarding != nil {
 		l.stopSignalForwarding()
 	}
@@ -1198,6 +1223,10 @@ func (l *Loader) Destroy() {
 	// long-running control operations that are in flight, e.g.
 	// profiling operations.
 	l.ctrl.stop()
+
+	// Drain any in-flight background journal activation or postRestore
+	// goroutines before releasing the kernel and checking references.
+	l.journalingUpperWG.Wait()
 
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
@@ -1563,6 +1592,7 @@ func (l *Loader) run() error {
 		return err
 	}
 	l.startupTimer.Reached("kernel started")
+	l.startJournalingUpperActivations()
 	l.root.procArgs.StartupTimeline.End()
 	l.root.procArgs.StartupTimeline = nil
 	switch l.state {
@@ -2085,7 +2115,7 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 
 	// If the thread either has already exited or exits during waiting,
 	// consider the container exited.
-	ws := l.wait(tg)
+	ws := l.awaitJournalingUppersOnCleanExit(l.wait(tg))
 	*waitStatus = ws
 
 	// Check for leaks and write coverage report after the root container has
@@ -2180,7 +2210,7 @@ func (l *Loader) WaitExit() linux.WaitStatus {
 	// Wait for container.
 	l.k.WaitExited()
 
-	return l.k.GlobalInit().ExitStatus()
+	return linux.WaitStatus(l.awaitJournalingUppersOnCleanExit(uint32(l.k.GlobalInit().ExitStatus())))
 }
 
 func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *auth.UserNamespace, uid uniqueid.Provider) (*inet.Namespace, error) {
