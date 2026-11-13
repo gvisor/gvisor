@@ -409,6 +409,7 @@ syscall_test(
 
 syscall_test(
     add_fusefs = True,
+    add_journaled_overlay = True,
     add_overlay = True,
     test = "//test/syscalls/linux:link_test",
 )
@@ -471,6 +472,7 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_journaled_overlay = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:mmap_test",
 )
@@ -740,6 +742,7 @@ syscall_test(
 syscall_test(
     size = "medium",
     add_fusefs = True,
+    add_journaled_overlay = True,
     add_overlay = True,
     test = "//test/syscalls/linux:rename_test",
 )
@@ -1273,6 +1276,7 @@ syscall_test(
 
 syscall_test(
     add_fusefs = True,
+    add_journaled_overlay = True,
     add_overlay = True,
     test = "//test/syscalls/linux:truncate_test",
 )
@@ -1314,6 +1318,7 @@ syscall_test(
 
 syscall_test(
     add_fusefs = True,
+    add_journaled_overlay = True,
     add_overlay = True,
     test = "//test/syscalls/linux:unlink_test",
 )
@@ -1323,6 +1328,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_journaled_overlay = True,
     test = "//test/syscalls/linux:utimes_test",
 )
 
@@ -1404,6 +1410,7 @@ syscall_test(
 
 syscall_test(
     add_fusefs = True,
+    add_journaled_overlay = True,
     add_overlay = True,
     test = "//test/syscalls/linux:xattr_test",
 )
