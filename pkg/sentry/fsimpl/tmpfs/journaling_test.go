@@ -16,11 +16,15 @@ package tmpfs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"runtime"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -144,6 +148,20 @@ func mountImported(t testing.TB, ctx context.Context, fd int, keepJournal bool) 
 		Journal:      j,
 		JournalState: st,
 	})
+}
+
+// mountForPopulate mounts an unjournaled tmpfs on fd, as a restore or tar
+// archive does before journal activation.
+func mountForPopulate(t testing.TB, ctx context.Context, fd int) *journaledTmpfs {
+	t.Helper()
+	mf, err := pgalloc.NewMemoryFile(dupFile(t, fd, "filestore"), pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryFile: %v", err)
+	}
+	return mountTmpfsForTest(t, ctx, mf, FilesystemOpts{MemoryFile: mf})
 }
 
 func mountTmpfsForTest(t testing.TB, ctx context.Context, mf *pgalloc.MemoryFile, opts FilesystemOpts) *journaledTmpfs {
@@ -549,10 +567,97 @@ func TestJournalCleanRelease(t *testing.T) {
 	compareModels(t, "after release", m2.model(t), want)
 }
 
+func TestJournalConcurrentCompaction(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd := newJournalTestFD(t)
+	const regionSize = 4 << 20
+	m1 := mountFreshJournaled(t, ctx, fd, regionSize)
+	creds := rootCreds()
+
+	const workers = 4
+	const iterations = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			if err := concurrentWorker(m1, creds, w, iterations); err != nil {
+				errs <- fmt.Errorf("worker %d: %w", w, err)
+			}
+		}(w)
+	}
+	compactions := 0
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+loop:
+	for {
+		select {
+		case <-done:
+			break loop
+		default:
+		}
+		if err := m1.fs.compactJournal(); err != nil {
+			t.Fatalf("compactJournal: %v", err)
+		}
+		compactions++
+	}
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	want := m1.model(t)
+	m1.crash()
+	m2 := mountImported(t, ctx, fd, true /* keepJournal */)
+	compareModels(t, fmt.Sprintf("after %d concurrent compactions", compactions), m2.model(t), want)
+}
+
+func concurrentWorker(m *journaledTmpfs, creds *auth.Credentials, w, iterations int) error {
+	ctx := m.ctx
+	dir := fmt.Sprintf("/w%d", w)
+	if err := m.vfsObj.MkdirAt(ctx, creds, m.pop(dir), &vfs.MkdirOptions{Mode: 0755}); err != nil {
+		return err
+	}
+	fd, err := m.vfsObj.OpenAt(ctx, creds, m.pop(dir+"/f"), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT, Mode: 0644})
+	if err != nil {
+		return err
+	}
+	defer fd.DecRef(ctx)
+	for i := 0; i < iterations; i++ {
+		if _, err := fd.PWrite(ctx, usermem.BytesIOSequence(pattern(int(pageSize)+i, byte(w+i))), int64(i)*int64(pageSize)/2, vfs.WriteOptions{}); err != nil {
+			return err
+		}
+		name := fmt.Sprintf("%s/n%d", dir, i)
+		nf, err := m.vfsObj.OpenAt(ctx, creds, m.pop(name), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT, Mode: 0644})
+		if err != nil {
+			return err
+		}
+		_, err = nf.Write(ctx, usermem.BytesIOSequence([]byte(strings.Repeat("z", i))), vfs.WriteOptions{})
+		nf.DecRef(ctx)
+		if err != nil {
+			return err
+		}
+		if i%3 == 0 {
+			if err := m.vfsObj.UnlinkAt(ctx, creds, m.pop(name)); err != nil {
+				return err
+			}
+		}
+		if i%5 == 0 {
+			if err := m.vfsObj.SetStatAt(ctx, creds, m.pop(dir+"/f"), &vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: uint64(i) * pageSize / 3}}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func TestJournalAutomaticCompaction(t *testing.T) {
 	ctx := contexttest.Context(t)
 	fd := newJournalTestFD(t)
-	const regionSize = 64 << 10
+	regionSize := max(uint64(64<<10), 4*pageSize)
 	m1 := mountFreshJournaled(t, ctx, fd, regionSize)
 	s := &journalScript{t: t, ctx: m1.ctx, creds: rootCreds(), m: m1}
 	f := s.open("/f", linux.O_RDWR|linux.O_CREAT)
@@ -608,6 +713,127 @@ func TestJournalLargeSnapshot(t *testing.T) {
 	compareModels(t, "after rebuild and crash", m3.model(t), want)
 }
 
+func openCheckIncomplete(t *testing.T, fd int, jopts journal.Options) {
+	t.Helper()
+	mf, err := pgalloc.NewMemoryFile(dupFile(t, fd, "filestore"), pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+		KeepFileContents:        true,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+	jf := journalFile(t, fd)
+	defer jf.Close()
+	if _, _, err := journal.Open(mf, jf, jopts, true /* keepJournal */); !errors.Is(err, journal.ErrIncomplete) {
+		t.Fatalf("journal.Open: got %v, want ErrIncomplete", err)
+	}
+}
+
+func TestJournalActivateAfterPopulate(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd := newJournalTestFD(t)
+	const regionSize = 4 << 20
+	jopts := journal.Options{BuildID: "build", ImageID: "image", RegionSize: regionSize}
+	m1 := mountForPopulate(t, ctx, fd)
+	creds := rootCreds()
+	s := &journalScript{t: t, ctx: m1.ctx, creds: creds, m: m1}
+	// The first regular file written in s.run(), which s.run() later
+	// replaces by a rename while its FD stays open, holds MemoryFile offset 0.
+	// The journal is in its own file, so activation leaves the page in place.
+	keep := s.run()
+
+	jf := journalFile(t, fd)
+	j, err := journal.CreateIncomplete(jf, jopts)
+	if err != nil {
+		jf.Close()
+		t.Fatalf("journal.CreateIncomplete: %v", err)
+	}
+	t.Cleanup(j.Close)
+
+	// The unlinked open file still reads back its original bytes.
+	var unlinkedBuf [7]byte
+	if n, err := keep[0].PRead(m1.ctx, usermem.BytesIOSequence(unlinkedBuf[:]), 0, vfs.ReadOptions{}); err != nil || string(unlinkedBuf[:n]) != "hello\x00\x00" {
+		t.Fatalf("reading page 0 of unlinked file: got %q, %v; want %q", unlinkedBuf[:n], err, "hello\x00\x00")
+	}
+	if n, err := keep[0].PRead(m1.ctx, usermem.BytesIOSequence(unlinkedBuf[:]), int64(3*pageSize), vfs.ReadOptions{}); err != nil || string(unlinkedBuf[:n]) != "world!!" {
+		t.Fatalf("reading page 3 of unlinked file: got %q, %v; want %q", unlinkedBuf[:n], err, "world!!")
+	}
+
+	// A crash before ActivateJournal leaves the journal incomplete.
+	openCheckIncomplete(t, fd, jopts)
+
+	const workers = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			if err := concurrentWorker(m1, creds, w, 30); err != nil {
+				errs <- fmt.Errorf("worker %d: %w", w, err)
+			}
+		}(w)
+	}
+	if err := ActivateJournal(&m1.fs.vfsfs, j); err != nil {
+		t.Fatalf("ActivateJournal: %v", err)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	s.runAfterCompaction()
+	want := m1.model(t)
+	m1.crash()
+
+	m2 := mountImported(t, ctx, fd, true /* keepJournal */)
+	compareModels(t, "after activation and crash", m2.model(t), want)
+}
+
+func TestJournalActivateLargeSnapshot(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd := newJournalTestFD(t)
+	const regionSize = 4 * pageSize
+	jopts := journal.Options{BuildID: "build", ImageID: "image", RegionSize: regionSize}
+	m1 := mountForPopulate(t, ctx, fd)
+	createFiles(t, m1, 600)
+	jf := journalFile(t, fd)
+	j, err := journal.CreateIncomplete(jf, jopts)
+	if err != nil {
+		jf.Close()
+		t.Fatalf("journal.CreateIncomplete: %v", err)
+	}
+	if err := ActivateJournal(&m1.fs.vfsfs, j); err != nil {
+		t.Fatalf("ActivateJournal: %v", err)
+	}
+	want := m1.model(t)
+	m1.crash()
+	m2 := mountImported(t, ctx, fd, true /* keepJournal */)
+	compareModels(t, "after activation and crash", m2.model(t), want)
+}
+
+func TestJournalActivateAfterRelease(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd := newJournalTestFD(t)
+	jopts := journal.Options{BuildID: "build", ImageID: "image"}
+	m1 := mountForPopulate(t, ctx, fd)
+	createFiles(t, m1, 10)
+	jf := journalFile(t, fd)
+	j, err := journal.CreateIncomplete(jf, jopts)
+	if err != nil {
+		jf.Close()
+		t.Fatalf("journal.CreateIncomplete: %v", err)
+	}
+	m1.fs.Release(ctx)
+	if err := ActivateJournal(&m1.fs.vfsfs, j); err == nil {
+		t.Fatalf("ActivateJournal after Release succeeded")
+	}
+	m1.mf.Destroy()
+	openCheckIncomplete(t, fd, jopts)
+}
+
 func TestJournalPrepareSaveStopsCompactorAndSelfWhiteoutsPreserveRootTimes(t *testing.T) {
 	ctx := contexttest.Context(t)
 	fd := newJournalTestFD(t)
@@ -652,16 +878,16 @@ func TestJournalPrepareSaveStopsCompactorAndSelfWhiteoutsPreserveRootTimes(t *te
 	if err := m1.fs.PrepareSave(m1.ctx, vfs.PrepareSaveOptions{}); err != nil {
 		t.Fatalf("PrepareSave: %v", err)
 	}
-	m1.fs.mu.RLock()
+	m1.fs.mu.Lock()
 	stopped := m1.fs.journalStop == nil
-	m1.fs.mu.RUnlock()
+	m1.fs.mu.Unlock()
 	if !stopped {
 		t.Fatalf("journalCompactor still running after PrepareSave")
 	}
 	m1.fs.BeforeResume(m1.ctx)
-	m1.fs.mu.RLock()
+	m1.fs.mu.Lock()
 	restarted := m1.fs.journalStop != nil
-	m1.fs.mu.RUnlock()
+	m1.fs.mu.Unlock()
 	if !restarted {
 		t.Fatalf("journalCompactor not restarted by BeforeResume")
 	}
@@ -689,5 +915,222 @@ func TestJournalPrepareSaveStopsCompactorAndSelfWhiteoutsPreserveRootTimes(t *te
 	}
 	if importedStat.Mtime != wantMtime {
 		t.Errorf("imported root mtime = %+v, want %+v", importedStat.Mtime, wantMtime)
+	}
+}
+
+func TestJournalMaxInt64TruncateAndShrink(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd := newJournalTestFD(t)
+	regionSize := max(uint64(64<<10), 4*pageSize)
+	m1 := mountFreshJournaled(t, ctx, fd, regionSize)
+	creds := rootCreds()
+	f, err := m1.vfsObj.OpenAt(m1.ctx, creds, m1.pop("/huge"), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT, Mode: 0644})
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	if _, err := f.PWrite(m1.ctx, usermem.BytesIOSequence([]byte("hello")), 0, vfs.WriteOptions{}); err != nil {
+		t.Fatalf("PWrite: %v", err)
+	}
+	// Grow to math.MaxInt64, then shrink into (MaxFileOffset-pageSize, MaxInt64]
+	// and verify the journal replays cleanly.
+	for _, size := range []uint64{math.MaxInt64, journal.MaxFileOffset - pageSize + 1, math.MaxInt64} {
+		if err := f.SetStat(m1.ctx, vfs.SetStatOptions{
+			Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: size},
+		}); err != nil {
+			t.Fatalf("SetStat(size=%#x): %v", size, err)
+		}
+	}
+	f.DecRef(m1.ctx)
+	m1.crash()
+
+	m2 := mountImported(t, ctx, fd, true /* keepJournal */)
+	defer m2.crash()
+	st, err := m2.vfsObj.StatAt(m2.ctx, creds, m2.pop("/huge"), &vfs.StatOptions{Mask: linux.STATX_SIZE})
+	if err != nil {
+		t.Fatalf("StatAt: %v", err)
+	}
+	if st.Size != math.MaxInt64 {
+		t.Fatalf("replayed size = %#x, want %#x", st.Size, uint64(math.MaxInt64))
+	}
+}
+
+func TestJournalFailedRebuildRetainsFilestorePages(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd := newJournalTestFD(t)
+	regionSize := max(uint64(64<<10), 4*pageSize)
+	m1 := mountFreshJournaled(t, ctx, fd, regionSize)
+	creds := rootCreds()
+	data := bytes.Repeat([]byte("A"), int(4*pageSize))
+	f, err := m1.vfsObj.OpenAt(m1.ctx, creds, m1.pop("/data"), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT, Mode: 0644})
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	if _, err := f.PWrite(m1.ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil {
+		t.Fatalf("PWrite: %v", err)
+	}
+	f.DecRef(m1.ctx)
+	m1.crash()
+
+	// Attempt to import into a tmpfs capped below the file's page count so
+	// rebuildFromJournal fails partway through.
+	mf, err := pgalloc.NewMemoryFile(dupFile(t, fd, "filestore"), pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		KeepFileContents:        true,
+		DisableMemoryAccounting: true,
+		DisableIMAWorkAround:    true,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryFile: %v", err)
+	}
+	jf := journalFile(t, fd)
+	j, st, err := journal.Open(mf, jf, journal.Options{BuildID: "build", ImageID: "image"}, true)
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatalf("VFS.Init: %v", err)
+	}
+	vfsObj.MustRegisterFilesystemType(Name, FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	if _, err := vfsObj.MountDisconnected(ctx, creds, "", Name, &vfs.MountOptions{
+		GetFilesystemOptions: vfs.GetFilesystemOptions{
+			Data: fmt.Sprintf("size=%d", pageSize),
+			InternalData: FilesystemOpts{
+				MemoryFile:   mf,
+				Journal:      j,
+				JournalState: st,
+			},
+		},
+	}); err == nil {
+		t.Fatalf("MountDisconnected unexpectedly succeeded despite size limit")
+	}
+	j.Close()
+	mf.Destroy()
+
+	// Re-import without the size cap and verify the file contents were NOT
+	// hole-punched by the failed rebuild teardown.
+	m2 := mountImported(t, ctx, fd, true /* keepJournal */)
+	defer m2.crash()
+	f2, err := m2.vfsObj.OpenAt(m2.ctx, creds, m2.pop("/data"), &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	if err != nil {
+		t.Fatalf("OpenAt(/data) after failed rebuild: %v", err)
+	}
+	defer f2.DecRef(m2.ctx)
+	got := make([]byte, len(data))
+	if n, err := f2.PRead(m2.ctx, usermem.BytesIOSequence(got), 0, vfs.ReadOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("PRead: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("filestore contents were corrupted/hole-punched after failed rebuild")
+	}
+}
+
+func TestJournalPosixACLs(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd := newJournalTestFD(t)
+	regionSize := max(uint64(64<<10), 4*pageSize)
+	m1 := mountFreshJournaled(t, ctx, fd, regionSize)
+	creds := rootCreds()
+	if err := m1.vfsObj.MkdirAt(m1.ctx, creds, m1.pop("/acldir"), &vfs.MkdirOptions{Mode: 0755}); err != nil {
+		t.Fatalf("MkdirAt: %v", err)
+	}
+	f, err := m1.vfsObj.OpenAt(m1.ctx, creds, m1.pop("/acldir/file"), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT, Mode: 0644})
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	f.DecRef(m1.ctx)
+
+	mask := vfs.MayRead | vfs.MayWrite
+	accessACL := &vfs.PosixACL{
+		UGOPerms: 0750,
+		Mask:     &mask,
+		Users:    []vfs.ACLUser{{UID: 1000, Perms: vfs.MayRead | vfs.MayWrite}},
+	}
+	defaultACL := &vfs.PosixACL{
+		UGOPerms: 0755,
+		Mask:     &mask,
+		Groups:   []vfs.ACLGroup{{GID: 2000, Perms: vfs.MayRead}},
+	}
+	rootNS := auth.NewRootUserNamespace()
+	if err := m1.vfsObj.SetXattrAt(m1.ctx, creds, m1.pop("/acldir/file"), &vfs.SetXattrOptions{
+		Name:  linux.XATTR_NAME_POSIX_ACL_ACCESS,
+		Value: string(accessACL.Serialize(rootNS)),
+	}); err != nil {
+		t.Fatalf("SetXattrAt(access ACL): %v", err)
+	}
+	if err := m1.vfsObj.SetXattrAt(m1.ctx, creds, m1.pop("/acldir"), &vfs.SetXattrOptions{
+		Name:  linux.XATTR_NAME_POSIX_ACL_DEFAULT,
+		Value: string(defaultACL.Serialize(rootNS)),
+	}); err != nil {
+		t.Fatalf("SetXattrAt(default ACL): %v", err)
+	}
+
+	want1 := m1.model(t)
+	if want1["/acldir/file"].ACL == "" || want1["/acldir"].DefaultACL == "" {
+		t.Fatalf("ACLs not populated in model: file=%+v dir=%+v", want1["/acldir/file"], want1["/acldir"])
+	}
+	m1.crash()
+
+	// Replay, compact, update/remove ACLs, and replay again.
+	m2 := mountImported(t, ctx, fd, true /* keepJournal */)
+	compareModels(t, "after POSIX ACL replay", m2.model(t), want1)
+	if err := m2.fs.compactJournal(); err != nil {
+		t.Fatalf("compactJournal: %v", err)
+	}
+	if err := m2.vfsObj.RemoveXattrAt(m2.ctx, creds, m2.pop("/acldir"), linux.XATTR_NAME_POSIX_ACL_DEFAULT); err != nil {
+		t.Fatalf("RemoveXattrAt(default ACL): %v", err)
+	}
+	want2 := m2.model(t)
+	if want2["/acldir"].DefaultACL != "" {
+		t.Fatalf("default ACL still present after RemoveXattrAt")
+	}
+	m2.crash()
+
+	m3 := mountImported(t, ctx, fd, true /* keepJournal */)
+	defer m3.crash()
+	compareModels(t, "after POSIX ACL compaction and removal", m3.model(t), want2)
+}
+
+func BenchmarkJournalCreateWriteUnlink(b *testing.B) {
+	for _, prepopulate := range []int{0, 200} {
+		for _, journaled := range []bool{false, true} {
+			b.Run(fmt.Sprintf("files=%d/journaled=%t", prepopulate, journaled), func(b *testing.B) {
+				ctx := contexttest.Context(b)
+				rawFD := newJournalTestFD(b)
+				var m *journaledTmpfs
+				if journaled {
+					m = mountFreshJournaled(b, ctx, rawFD, journal.DefaultRegionSize)
+				} else {
+					m = mountForPopulate(b, ctx, rawFD)
+				}
+				defer m.crash()
+				creds := rootCreds()
+				for i := 0; i < prepopulate; i++ {
+					fd, err := m.vfsObj.OpenAt(m.ctx, creds, m.pop(fmt.Sprintf("/pre-%03d", i)), &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT, Mode: 0644})
+					if err != nil {
+						b.Fatalf("OpenAt(pre-%03d): %v", i, err)
+					}
+					fd.DecRef(m.ctx)
+				}
+				src := usermem.BytesIOSequence(make([]byte, pageSize))
+				pop := m.pop("/bench-file")
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					fd, err := m.vfsObj.OpenAt(m.ctx, creds, pop, &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_CREAT | linux.O_EXCL, Mode: 0644})
+					if err != nil {
+						b.Fatalf("OpenAt: %v", err)
+					}
+					if _, err := fd.PWrite(m.ctx, src, 0, vfs.WriteOptions{}); err != nil {
+						b.Fatalf("PWrite: %v", err)
+					}
+					fd.DecRef(m.ctx)
+					if err := m.vfsObj.UnlinkAt(m.ctx, creds, pop); err != nil {
+						b.Fatalf("UnlinkAt: %v", err)
+					}
+				}
+				b.StopTimer()
+			})
+		}
 	}
 }
