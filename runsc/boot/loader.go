@@ -158,6 +158,10 @@ type containerInfo struct {
 	// upper layer changes.
 	rootfsUpperTarFD *fd.FD
 
+	// rootfsJournalFD is the optional file descriptor to the rootfs overlay
+	// upper journal file.
+	rootfsJournalFD *fd.FD
+
 	// useCPUNums indicates whether to use platform assigned CPU numbers as CPU numbers in the sentry.
 	useCPUNums bool
 }
@@ -572,6 +576,9 @@ type Args struct {
 	// RootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	RootfsUpperTarFD int
+	// RootfsJournalFD is the optional file descriptor to the rootfs overlay
+	// upper journal file (-1 when unset).
+	RootfsJournalFD int
 	// NoRootContainer boots without a root container; Spec then has neither
 	// Process nor Root. See Loader.noRootContainer.
 	NoRootContainer bool
@@ -811,6 +818,9 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("rootfs upper tar file is mutually exclusive with filesystem checkpoint restore")
 		}
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
+	}
+	if args.RootfsJournalFD >= 0 {
+		l.root.rootfsJournalFD = fd.New(args.RootfsJournalFD)
 	}
 
 	// Create kernel and platform.
@@ -1214,6 +1224,9 @@ func (l *Loader) Destroy() {
 	if l.root.devGoferFD != nil {
 		_ = l.root.devGoferFD.Close()
 	}
+	if l.root.rootfsJournalFD != nil {
+		_ = l.root.rootfsJournalFD.Close()
+	}
 
 	l.stopProfiling()
 	// Check all references.
@@ -1586,7 +1599,7 @@ func (l *Loader) createSubcontainer(cid string, tty *fd.FD) error {
 // for the caller to close any remaining files upon return.
 //
 // +checklocksexclude:l.mu
-func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf, rootfsUpperTarFD *fd.FD) error {
+func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf, rootfsUpperTarFD, rootfsJournalFD *fd.FD) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -1657,6 +1670,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		nvidiaHostSettings: l.root.nvidiaHostSettings,
 		nvproxyDevInfo:     l.root.nvproxyDevInfo,
 		rootfsUpperTarFD:   rootfsUpperTarFD,
+		rootfsJournalFD:    rootfsJournalFD,
 	}
 	var err error
 	info.procArgs, err = createProcessArgs(cid, spec, conf, creds, l.k, pidns)

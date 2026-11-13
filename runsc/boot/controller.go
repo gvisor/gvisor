@@ -236,6 +236,9 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 		}
 		expectedFDs++
 	}
+	if args.IsRootfsJournalFilePresent {
+		expectedFDs++
+	}
 	if len(args.Files) < expectedFDs {
 		return fmt.Errorf("start arguments must contain at least %d FDs, but only got %d", expectedFDs, len(args.Files))
 	}
@@ -298,6 +301,17 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 		defer rootfsUpperTarFD.Close()
 	}
 
+	var rootfsJournalFD *fd.FD
+	if args.IsRootfsJournalFilePresent {
+		var err error
+		rootfsJournalFD, err = fd.NewFromFile(goferFiles[0])
+		if err != nil {
+			return fmt.Errorf("error dup'ing rootfs journal file: %w", err)
+		}
+		goferFiles = goferFiles[1:]
+		defer rootfsJournalFD.Close()
+	}
+
 	goferFDs, err := fd.NewFromFiles(goferFiles)
 	if err != nil {
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
@@ -308,7 +322,7 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 		}
 	}()
 
-	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs, rootfsUpperTarFD); err != nil {
+	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs, rootfsUpperTarFD, rootfsJournalFD); err != nil {
 		log.Debugf("containerManager.StartSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
 	}
@@ -651,6 +665,9 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply
 	if args.IsRootfsUpperTarFilePresent {
 		return errors.New("rootfs upper tar file is not supported during restore")
 	}
+	if args.IsRootfsJournalFilePresent {
+		expectedFDs++
+	}
 	if len(args.Files) < expectedFDs {
 		return fmt.Errorf("restore arguments must contain at least %d FDs, but only got %d", expectedFDs, len(args.Files))
 	}
@@ -691,12 +708,22 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply
 		goferFiles = goferFiles[1:]
 	}
 
+	var rootfsJournalFD *fd.FD
+	if args.IsRootfsJournalFilePresent {
+		var err error
+		rootfsJournalFD, err = fd.NewFromFile(goferFiles[0])
+		if err != nil {
+			return fmt.Errorf("error dup'ing rootfs journal file: %w", err)
+		}
+		goferFiles = goferFiles[1:]
+	}
+
 	goferFDs, err := fd.NewFromFiles(goferFiles)
 	if err != nil {
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
 	}
 
-	reply.KernelStarted, err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
+	reply.KernelStarted, err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs, rootfsJournalFD)
 	if err != nil {
 		log.Debugf("containerManager.RestoreSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err

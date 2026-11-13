@@ -279,7 +279,7 @@ type restorer struct {
 
 // restoreSubcontainer restores a subcontainer.
 // It returns whether this started the kernel.
-func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) (bool, error) {
+func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf, rootfsJournalFD *fd.FD) (bool, error) {
 	containerName := r.registerContainer(l, spec, cid)
 	info := &containerInfo{
 		cid:               cid,
@@ -291,6 +291,7 @@ func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l 
 		devGoferFD:        devGoferFD,
 		goferFilestoreFDs: goferFilestoreFDs,
 		goferMountConfs:   goferMountConfs,
+		rootfsJournalFD:   rootfsJournalFD,
 	}
 	return r.restoreContainerInfo(l, info)
 }
