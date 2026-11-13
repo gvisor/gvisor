@@ -15,6 +15,7 @@
 package tmpfs
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs/journal"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -53,6 +55,205 @@ import (
 // Atime updates by reads are not journaled; the next INODE record or
 // snapshot of the inode records them.
 
+
+func (fs *filesystem) startJournal(j *journal.Journal) error {
+	fs.mu.Lock()
+	if fs.released {
+		fs.mu.Unlock()
+		return fmt.Errorf("tmpfs filesystem was released")
+	}
+	fs.journal.Store(j)
+	fs.journaled.Store(true)
+	fs.mu.Unlock()
+	if err := fs.compactJournal(); err != nil {
+		fs.mu.Lock()
+		fs.journal.Store(nil)
+		fs.journaled.Store(false)
+		fs.mu.Unlock()
+		return fmt.Errorf("failed to compact tmpfs journal: %w", err)
+	}
+	return nil
+}
+
+// SetRetainPages prevents Release from returning regular file pages to the
+// MemoryFile. Used when tearing down a mounted imported upper before the
+// container starts so adopted pages in the host filestore are not hole-punched.
+func SetRetainPages(vfsfs *vfs.Filesystem) {
+	if fs, ok := vfsfs.Impl().(*filesystem); ok {
+		fs.retainPages.Store(true)
+	}
+}
+
+// stopJournal stops journaling. Later changes to fs are not journaled, so
+// that releasing the filesystem does not delete its contents from the
+// journal.
+func (fs *filesystem) stopJournal() {
+	j := fs.journal.Swap(nil)
+	if j == nil {
+		return
+	}
+	j.Close()
+}
+
+// snapshotWriter is implemented by journal.Snapshot, which writes snapshot
+// records, and by journal.SnapshotSizer, which computes their size.
+type snapshotWriter interface {
+	Inode(r *journal.InodeRecord)
+	DirentAdd(parent uint64, name string, child uint64)
+	ExtentSet(ino, off, length, mfOff uint64)
+}
+
+// compactionAttempts is the number of times that compactJournal tries to
+// write a snapshot whose region overflows because the filesystem grew during
+// the compaction.
+const compactionAttempts = 3
+
+// compactJournal writes a snapshot of fs to the journal.
+func (fs *filesystem) compactJournal() error {
+	fs.journalCompactMu.Lock()
+	defer fs.journalCompactMu.Unlock()
+
+	// Compute the size of the snapshot first, then release fs.mu before
+	// preparing the inactive journal region (which may invoke blocking host
+	// file syscalls). Files can grow between the two passes, and records are
+	// appended during the compaction; the journal leaves room for both, and
+	// the size doubles on each retry.
+	fs.mu.RLock()
+	j := fs.journal.Load()
+	if j == nil {
+		fs.mu.RUnlock()
+		return nil
+	}
+	var sizer journal.SnapshotSizer
+	snapshotLocked(fs, &sizer, false /* sortXattrs */)
+	size := sizer.Size()
+	fs.mu.RUnlock()
+
+	var err error
+	for attempt := 0; attempt < compactionAttempts; attempt++ {
+		if err = j.PrepareSnapshot(size); err != nil {
+			return err
+		}
+		fs.mu.RLock()
+		if fs.journal.Load() != j {
+			fs.mu.RUnlock()
+			return nil
+		}
+		var s *journal.Snapshot
+		s, err = j.BeginSnapshot(fs.root.inode.ino, fs.nextInoMinusOne.Load()+1, size)
+		if err != nil {
+			fs.mu.RUnlock()
+			return err
+		}
+		snapshotLocked(fs, s, true /* sortXattrs */)
+		err = s.Commit()
+		fs.mu.RUnlock()
+		if err == nil {
+			j.ReclaimInactive()
+			return nil
+		}
+		if !errors.Is(err, journal.ErrSnapshotOverflow) {
+			return err
+		}
+		log.Infof("tmpfs: journal snapshot overflowed its region; retrying: %v", err)
+		size *= 2
+	}
+	return err
+}
+
+// snapshotLocked writes snapshot records for all inodes in fs to s iteratively.
+//
+// +checklocksread:fs.mu
+func snapshotLocked[W snapshotWriter](fs *filesystem, s W, sortXattrs bool) {
+	visited := make(map[*inode]struct{}, int(fs.inodesUsed.Load()))
+	var rec journal.InodeRecord
+	snapshotInode(fs.root.inode, s, &rec, sortXattrs)
+	visited[fs.root.inode] = struct{}{}
+
+	stack := []*dentry{fs.root}
+	for len(stack) > 0 {
+		d := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		dir, ok := d.inode.impl.(*directory)
+		if !ok {
+			continue
+		}
+		for name, child := range dir.childMap {
+			if _, ok := visited[child.inode]; !ok {
+				visited[child.inode] = struct{}{}
+				snapshotInode(child.inode, s, &rec, sortXattrs)
+				if _, isDir := child.inode.impl.(*directory); isDir {
+					stack = append(stack, child)
+				}
+			}
+			s.DirentAdd(d.inode.ino, name, child.inode.ino)
+		}
+	}
+}
+
+// snapshotInode writes the snapshot records of i using the reusable buffer rec.
+func snapshotInode[W snapshotWriter](i *inode, s W, rec *journal.InodeRecord, sortXattrs bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.fillJournalRecord(rec, sortXattrs)
+	rf, ok := i.impl.(*regularFile)
+	if !ok {
+		s.Inode(rec)
+		return
+	}
+	rf.dataMu.RLock()
+	defer rf.dataMu.RUnlock()
+	s.Inode(rec)
+	for seg := rf.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		s.ExtentSet(i.ino, seg.Start(), seg.Range().Length(), seg.Value())
+	}
+}
+
+// fillJournalRecord sets r to the state of i, reusing r.Xattrs backing storage.
+//
+// +checklocks:i.mu
+func (i *inode) fillJournalRecord(r *journal.InodeRecord, sortXattrs bool) {
+	xattrsBuf := r.Xattrs[:0]
+	*r = journal.InodeRecord{
+		Ino:    i.ino,
+		Mode:   i.mode.Load(),
+		UID:    i.uid.Load(),
+		GID:    i.gid.Load(),
+		Atime:  i.atime.Load(),
+		Mtime:  i.mtime.Load(),
+		Ctime:  i.ctime.Load(),
+		Btime:  i.btime.Load(),
+		Xattrs: xattrsBuf,
+	}
+	switch impl := i.impl.(type) {
+	case *regularFile:
+		r.Size = impl.size.Load()
+	case *symlink:
+		r.Target = impl.target
+	case *deviceFile:
+		r.RdevMajor = impl.major
+		r.RdevMinor = impl.minor
+	}
+	if xattrs := i.xattrs.RawXattrs(); len(xattrs) != 0 {
+		if cap(r.Xattrs) < len(xattrs)+2 {
+			r.Xattrs = make([]journal.Xattr, 0, len(xattrs)+2)
+		}
+		for name, value := range xattrs {
+			r.Xattrs = append(r.Xattrs, journal.Xattr{Name: name, Value: value})
+		}
+		if sortXattrs {
+			sort.Slice(r.Xattrs, func(a, b int) bool { return r.Xattrs[a].Name < r.Xattrs[b].Name })
+		}
+	}
+	// ACLs are stored outside i.xattrs. Record them in their xattr
+	// representation; KUIDs and KGIDs are not mapped.
+	if acl := i.accessACL.Load(); acl != nil {
+		r.Xattrs = append(r.Xattrs, journal.Xattr{Name: linux.XATTR_NAME_POSIX_ACL_ACCESS, Value: string(acl.Serialize(auth.NewRootUserNamespace()))})
+	}
+	if acl := i.defaultACL.Load(); acl != nil {
+		r.Xattrs = append(r.Xattrs, journal.Xattr{Name: linux.XATTR_NAME_POSIX_ACL_DEFAULT, Value: string(acl.Serialize(auth.NewRootUserNamespace()))})
+	}
+}
 
 // rebuildFromJournal creates the files in st in fs. The MemoryFile of fs
 // must already have adopted st.UsedRanges().
