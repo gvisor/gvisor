@@ -635,6 +635,71 @@ func checkHeaderFormat(h []byte) (uint64, error) {
 	return regionSize, nil
 }
 
+// FilestoreEnd returns the filestoreEnd header field of the journal in file.
+// No extent that Open accepts ends beyond it, so the filestore can be shrunk
+// to it before the journal is opened. ok is false if file does not hold a valid
+// journal header matching opts, if the journal is marked broken or incomplete,
+// or if its active region descriptor is not valid in file; the caller must then
+// not use end. FilestoreEnd does not take ownership of file.
+func FilestoreEnd(file *os.File, opts Options) (end uint64, ok bool, err error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return 0, false, fmt.Errorf("failed to stat journal: %w", err)
+	}
+	if stat.Size < headerSize {
+		return 0, false, nil
+	}
+	var hdr [headerSize]byte
+	n, err := preadFull(int(file.Fd()), hdr[:], 0)
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to read journal header: %w", err)
+	}
+	if n < headerSize {
+		return 0, false, nil
+	}
+	if _, err := checkHeader(hdr[:], opts); err != nil {
+		return 0, false, nil
+	}
+	active := binary.LittleEndian.Uint64(hdr[activeOff:])
+	if active&activeFlags != 0 {
+		return 0, false, nil
+	}
+	if !loadRegionFromHeader(hdr[:], int(active&1)).valid(uint64(stat.Size)) {
+		return 0, false, nil
+	}
+	return binary.LittleEndian.Uint64(hdr[filestoreEndOff:]), true, nil
+}
+
+// Compactions returns the number of completed compactions recorded in the
+// journal header of file. ok is false if file does not hold a valid, complete,
+// non-broken journal header matching opts. Compactions does not take ownership
+// of file.
+func Compactions(file *os.File, opts Options) (count uint64, ok bool, err error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return 0, false, fmt.Errorf("failed to stat journal: %w", err)
+	}
+	if stat.Size < headerSize {
+		return 0, false, nil
+	}
+	var hdr [headerSize]byte
+	n, err := preadFull(int(file.Fd()), hdr[:], 0)
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to read journal header: %w", err)
+	}
+	if n < headerSize {
+		return 0, false, nil
+	}
+	if _, err := checkHeader(hdr[:], opts); err != nil {
+		return 0, false, nil
+	}
+	active := binary.LittleEndian.Uint64(hdr[activeOff:])
+	if active&activeFlags != 0 || active < 1 {
+		return 0, false, nil
+	}
+	return active - 1, true, nil
+}
+
 // Invalidate marks the journal header in file as broken so Open refuses to
 // replay it later (for example, when a filestore is imported without runtime
 // journaling and mutated in place). Invalidate does not take ownership of file.
