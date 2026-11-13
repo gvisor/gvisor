@@ -158,6 +158,11 @@ type Journal struct {
 	// regionSize is the minimum size of a region. regionSize is immutable.
 	regionSize uint64
 
+	// needCompaction is called, without mu held, when the active region is
+	// half full or full. needCompaction is immutable after
+	// SetCompactionRequester.
+	needCompaction func()
+
 	// compactMu serializes region preparation (disk I/O on the inactive slot)
 	// and Close so file and inactive region mappings cannot be closed or
 	// relocated concurrently while mu is dropped.
@@ -182,6 +187,12 @@ type Journal struct {
 	//
 	// +checklocks:mu
 	incomplete bool
+
+	// broken is true if a record was dropped because the active region was
+	// full or hit a host I/O fault.
+	//
+	// +checklocks:mu
+	broken bool
 
 	// active is the writer for the active region.
 	//
@@ -222,6 +233,12 @@ type Journal struct {
 	//
 	// +checklocks:mu
 	scratch []byte
+
+	// requested is true if needCompaction was called and compaction has
+	// not finished since.
+	//
+	// +checklocks:mu
+	requested bool
 
 	// closed is true after Close. Appends are dropped after Close.
 	//
@@ -630,6 +647,9 @@ func (e *ImageMismatchError) Error() string {
 // +checklocks:j.mu
 func (j *Journal) storeActiveLocked() error {
 	v := j.gen
+	if j.broken {
+		v |= brokenBit
+	}
 	if j.incomplete {
 		v |= incompleteBit
 	}
@@ -714,6 +734,7 @@ func (j *Journal) prepareRegion(need uint64) error {
 		return fmt.Errorf("compaction already in progress")
 	}
 	if need > maxRegionSize {
+		j.requested = false
 		j.mu.Unlock()
 		return fmt.Errorf("journal snapshot needs %d bytes, more than the maximum region size %d", need, uint64(maxRegionSize))
 	}
@@ -735,6 +756,7 @@ func (j *Journal) prepareRegion(need uint64) error {
 		m, err := mmapRange(int(j.file.Fd()), cur.off, cur.size)
 		j.mu.Lock()
 		if err != nil {
+			j.requested = false
 			j.mu.Unlock()
 			return err
 		}
@@ -748,6 +770,7 @@ func (j *Journal) prepareRegion(need uint64) error {
 	if cur.size != 0 {
 		if err := j.storeRegionLocked(slot, region{}); err != nil {
 			j.regionMaps[slot] = oldMap
+			j.requested = false
 			j.mu.Unlock()
 			return fmt.Errorf("failed to clear inactive journal region descriptor: %w", err)
 		}
@@ -770,15 +793,22 @@ func (j *Journal) prepareRegion(need uint64) error {
 	}
 	// Grow or shrink the file to the end of the last region.
 	if err := j.file.Truncate(int64(max(next.end(), active.end()))); err != nil {
+		j.mu.Lock()
+		j.requested = false
+		j.mu.Unlock()
 		return fmt.Errorf("failed to resize journal file for a %d-byte region: %w", want, err)
 	}
 	m, err := mmapRange(int(j.file.Fd()), next.off, next.size)
 	if err != nil {
+		j.mu.Lock()
+		j.requested = false
+		j.mu.Unlock()
 		return err
 	}
 
 	j.mu.Lock()
 	if err := j.storeRegionLocked(slot, next); err != nil {
+		j.requested = false
 		j.mu.Unlock()
 		unmapRange(m)
 		return fmt.Errorf("failed to write journal region descriptor: %w", err)
@@ -848,6 +878,16 @@ func checkRegionHeader(regionMap []byte, gen uint64) (uint64, error) {
 	return binary.LittleEndian.Uint64(h[16:]), nil
 }
 
+// SetCompactionRequester sets the function that the Journal calls when the
+// active region is half full. fn is called without any Journal lock held, and
+// must not block. The Journal calls fn at most once until Snapshot.Commit or
+// Snapshot.Abort.
+//
+// Preconditions: No other goroutine is using j.
+func (j *Journal) SetCompactionRequester(fn func()) {
+	j.needCompaction = fn
+}
+
 // Close stops appends, unmaps the journal's mappings, and closes the journal
 // file. Records appended after Close are dropped. Close does not modify the
 // journal file, so that a new sandbox can replay the journal.
@@ -871,6 +911,22 @@ func (j *Journal) Close() {
 	if err := j.file.Close(); err != nil {
 		log.Warningf("tmpfs journal: failed to close journal file: %v", err)
 	}
+}
+
+// CompactionPending returns true if the Journal requested a compaction that
+// has not finished yet.
+func (j *Journal) CompactionPending() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.requested
+}
+
+// Broken returns true if a record was dropped because the active region was
+// full or hit an I/O fault, and no compaction has finished since.
+func (j *Journal) Broken() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.broken
 }
 
 var errRegionFull = errors.New("journal region is full")
@@ -938,6 +994,106 @@ func (j *Journal) writeRecordLocked(w *regionWriter, typ RecordType, payloadLen 
 	return nil
 }
 
+// markBrokenLocked marks the journal broken in memory and on disk.
+//
+// +checklocks:j.mu
+func (j *Journal) markBrokenLocked(err error) {
+	if j.broken {
+		return
+	}
+	if errors.Is(err, errRegionFull) {
+		log.Warningf("tmpfs journal: active region is full; the journal is unusable until compaction finishes")
+	} else {
+		log.Warningf("tmpfs journal: failed to write to active region (%v); the journal is unusable until compaction finishes", err)
+	}
+	j.broken = true
+	if storeErr := j.storeActiveLocked(); storeErr != nil {
+		log.Warningf("tmpfs journal: failed to set broken flag in header: %v", storeErr)
+	}
+}
+
+// beginLocked returns the scratch payload buffer into which the caller must
+// encode a record of length payloadLen, or nil if the record is dropped.
+// The caller must then call endLocked.
+//
+// +checklocks:j.mu
+func (j *Journal) beginLocked(payloadLen uint64) []byte {
+	if j.closed {
+		return nil
+	}
+	if j.active.full && (j.next == nil || j.next.full) {
+		return nil
+	}
+	return j.prepareScratchLocked(payloadLen)
+}
+
+// endLocked writes the record encoded in j.scratch to the active region and,
+// during compaction, also to the inactive region. It returns true if the
+// caller must call j.needCompaction after it unlocks j.mu.
+//
+// +checklocks:j.mu
+func (j *Journal) endLocked(typ RecordType, payloadLen uint64) bool {
+	if j.closed {
+		return false
+	}
+	if !j.active.full {
+		if err := j.writeRecordLocked(&j.active, typ, payloadLen); err != nil {
+			j.markBrokenLocked(err)
+		}
+	}
+	if j.next != nil && !j.next.full {
+		_ = j.writeRecordLocked(j.next, typ, payloadLen)
+	}
+	if j.requested || j.needCompaction == nil {
+		return false
+	}
+	if j.active.full || j.active.tail > j.active.size/2 {
+		j.requested = true
+		return true
+	}
+	return false
+}
+
+// +checklocksrelease:j.mu
+func (j *Journal) end(typ RecordType, payloadLen uint64) {
+	request := j.endLocked(typ, payloadLen)
+	j.mu.Unlock()
+	if request {
+		j.needCompaction()
+	}
+}
+
+// Inode appends a RecordInode record.
+func (j *Journal) Inode(r *InodeRecord) {
+	n := r.payloadLen()
+	j.mu.Lock()
+	if buf := j.beginLocked(n); buf != nil {
+		e := encoder{buf: buf}
+		r.encode(&e)
+	}
+	j.end(RecordInode, n)
+}
+
+// InodeFree appends a RecordInodeFree record.
+func (j *Journal) InodeFree(ino uint64) {
+	const n = 8
+	j.mu.Lock()
+	if buf := j.beginLocked(n); buf != nil {
+		binary.LittleEndian.PutUint64(buf, ino)
+	}
+	j.end(RecordInodeFree, n)
+}
+
+// DirentAdd appends a RecordDirentAdd record.
+func (j *Journal) DirentAdd(parent uint64, name string, child uint64) {
+	n := direntAddLen(name)
+	j.mu.Lock()
+	if buf := j.beginLocked(n); buf != nil {
+		encodeDirentAdd(buf, parent, name, child)
+	}
+	j.end(RecordDirentAdd, n)
+}
+
 func direntAddLen(name string) uint64 {
 	return 8 + 8 + 2 + uint64(len(name))
 }
@@ -949,6 +1105,41 @@ func encodeDirentAdd(buf []byte, parent uint64, name string, child uint64) {
 	e.str16(name)
 }
 
+// DirentDel appends a RecordDirentDel record.
+func (j *Journal) DirentDel(parent uint64, name string) {
+	n := 8 + 2 + uint64(len(name))
+	j.mu.Lock()
+	if buf := j.beginLocked(n); buf != nil {
+		e := encoder{buf: buf}
+		e.u64(parent)
+		e.str16(name)
+	}
+	j.end(RecordDirentDel, n)
+}
+
+const renameExchange = 1
+
+// Rename appends a RecordRename record. If exchange is false, the entry
+// oldName in oldParent moves to newName in newParent, and replaces any entry
+// with that name. If exchange is true, the two entries are exchanged.
+func (j *Journal) Rename(oldParent uint64, oldName string, newParent uint64, newName string, exchange bool) {
+	var flags uint32
+	if exchange {
+		flags = renameExchange
+	}
+	n := 8 + 8 + 4 + 2 + uint64(len(oldName)) + 2 + uint64(len(newName))
+	j.mu.Lock()
+	if buf := j.beginLocked(n); buf != nil {
+		e := encoder{buf: buf}
+		e.u64(oldParent)
+		e.u64(newParent)
+		e.u32(flags)
+		e.str16(oldName)
+		e.str16(newName)
+	}
+	j.end(RecordRename, n)
+}
+
 func encodeExtent(buf []byte, ino, off, length, mfOff uint64) {
 	binary.LittleEndian.PutUint64(buf[0:], ino)
 	binary.LittleEndian.PutUint64(buf[8:], off)
@@ -956,6 +1147,33 @@ func encodeExtent(buf []byte, ino, off, length, mfOff uint64) {
 	if len(buf) > 24 {
 		binary.LittleEndian.PutUint64(buf[24:], mfOff)
 	}
+}
+
+// ExtentSet appends a RecordExtentSet record.
+func (j *Journal) ExtentSet(ino, off, length, mfOff uint64) {
+	const n = 32
+	j.mu.Lock()
+	if buf := j.beginLocked(n); buf != nil {
+		encodeExtent(buf, ino, off, length, mfOff)
+		// The record may go to both regions. Cover it in the mark before
+		// it is sealed, and in nextEnd for the inactive region.
+		end := extentEnd(length, mfOff)
+		j.raiseFilestoreEndLocked(end)
+		if j.next != nil {
+			j.nextEnd = max(j.nextEnd, end)
+		}
+	}
+	j.end(RecordExtentSet, n)
+}
+
+// ExtentClear appends a RecordExtentClear record.
+func (j *Journal) ExtentClear(ino, off, length uint64) {
+	const n = 24
+	j.mu.Lock()
+	if buf := j.beginLocked(n); buf != nil {
+		encodeExtent(buf, ino, off, length, 0)
+	}
+	j.end(RecordExtentClear, n)
 }
 
 // Snapshot writes a new snapshot to the inactive region. Records that are
@@ -990,6 +1208,7 @@ func (j *Journal) BeginSnapshot(rootIno, nextIno, size uint64) (*Snapshot, error
 		return nil, fmt.Errorf("compaction already in progress")
 	}
 	if j.gen+1 >= incompleteBit {
+		j.requested = false
 		return nil, fmt.Errorf("journal generation %#x exhausted", j.gen)
 	}
 	gen := j.gen + 1
@@ -997,10 +1216,12 @@ func (j *Journal) BeginSnapshot(rootIno, nextIno, size uint64) (*Snapshot, error
 	r := j.regions[slot]
 	m := j.regionMaps[slot]
 	if m == nil {
+		j.requested = false
 		return nil, fmt.Errorf("inactive journal region is not mapped")
 	}
 	startSeq := j.active.nextSeq
 	if err := writeRegionHeader(m, gen, startSeq); err != nil {
+		j.requested = false
 		return nil, fmt.Errorf("failed to write journal region header: %w", err)
 	}
 	j.next = &regionWriter{mapping: m, size: r.size, tail: regionHeaderSize, nextSeq: startSeq}
@@ -1011,6 +1232,7 @@ func (j *Journal) BeginSnapshot(rootIno, nextIno, size uint64) (*Snapshot, error
 	binary.LittleEndian.PutUint64(buf[8:], nextIno)
 	if err := j.writeRecordLocked(j.next, RecordRoot, n); err != nil {
 		j.next = nil
+		j.requested = false
 		return nil, fmt.Errorf("failed to write root snapshot record: %w", err)
 	}
 	return &Snapshot{j: j}, nil
@@ -1092,6 +1314,7 @@ func (s *Snapshot) Commit() error {
 	defer j.mu.Unlock()
 	next := j.next
 	j.next = nil
+	j.requested = false
 	if next == nil {
 		return fmt.Errorf("journal closed during compaction")
 	}
@@ -1103,11 +1326,14 @@ func (s *Snapshot) Commit() error {
 	}
 	// This single atomic store makes the new region active and clears
 	// brokenBit and incompleteBit.
+	wasBroken := j.broken
 	wasIncomplete := j.incomplete
 	j.gen++
+	j.broken = false
 	j.incomplete = false
 	if err := j.storeActiveLocked(); err != nil {
 		j.gen--
+		j.broken = wasBroken
 		j.incomplete = wasIncomplete
 		return fmt.Errorf("failed to commit journal snapshot: %w", err)
 	}
@@ -1128,6 +1354,7 @@ func (s *Snapshot) Abort() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.next = nil
+	j.requested = false
 }
 
 // SnapshotSizer computes the size of snapshot records for BeginSnapshot. It
