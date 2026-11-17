@@ -77,9 +77,7 @@ go_test(
     embed = [":container"],
     shard_count = most_shards,
     tags = ["requires-kvm"],
-    x_defs = {
-        "gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}",
-    },
+    x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//pkg/abi/linux",
         "//pkg/cleanup",
@@ -111,6 +109,7 @@ go_test(
         "//runsc/flag",
         "//runsc/sandbox",
         "//runsc/specutils",
+        "//runsc/version",
         "//test/metricclient",
         "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_creack_pty//:go_default_library",
@@ -261,5 +260,68 @@ go_test(
         "//runsc/flag",
         "//runsc/specutils",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
+)
+
+# Functional test for BenchmarkJournalingUpperGitClone.
+go_test(
+    name = "journaling_upper_bench_test",
+    size = "medium",
+    srcs = ["journaling_upper_bench_test.go"],
+    data = [
+        "//:release",
+    ],
+    embed = [":container"],
+    tags = ["requires-kvm"],
+    x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
+    deps = [
+        "//pkg/log",
+        "//pkg/sentry/control/controlapi",
+        "//pkg/sentry/fsimpl/tmpfs/journal",
+        "//pkg/test/testutil",
+        "//runsc/boot/sentryapi",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/specutils",
+        "//runsc/version",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+# End-to-end git clone benchmark for --journaling-rootfs-upper.
+go_test(
+    name = "journaling_upper_benchmark_test",
+    size = "large",
+    srcs = ["journaling_upper_bench_test.go"],
+    args = [
+        "-test.bench=.",
+        "-test.run=^$$",
+        "-test.benchtime=1x",
+        "-test.v",
+        "--test_platforms=systrap",
+    ],
+    data = [
+        "//:release",
+    ],
+    embed = [":container"],
+    tags = [
+        "manual",
+        "notap",
+        "requires-kvm",
+    ],
+    x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
+    deps = [
+        "//pkg/log",
+        "//pkg/sentry/control/controlapi",
+        "//pkg/sentry/fsimpl/tmpfs/journal",
+        "//pkg/test/testutil",
+        "//runsc/boot/sentryapi",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/specutils",
+        "//runsc/version",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
