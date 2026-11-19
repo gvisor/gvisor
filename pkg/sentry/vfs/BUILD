@@ -121,6 +121,18 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "landlock_key_atomicptrmap",
+    out = "landlock_key_atomicptrmap_unsafe.go",
+    package = "vfs",
+    prefix = "landlockKey",
+    template = "//pkg/sync/atomicptrmap:generic_atomicptrmap",
+    types = {
+        "Key": "LandlockKey",
+        "Value": "LandlockObject",
+    },
+)
+
 proto_library(
     name = "events",
     srcs = ["events.proto"],
@@ -151,6 +163,10 @@ go_library(
         "inotify.go",
         "inotify_event_mutex.go",
         "inotify_mutex.go",
+        "landlock_domain.go",
+        "landlock_key_atomicptrmap_unsafe.go",
+        "landlock_object.go",
+        "landlock_ruleset.go",
         "lock.go",
         "mount.go",
         "mount_list.go",

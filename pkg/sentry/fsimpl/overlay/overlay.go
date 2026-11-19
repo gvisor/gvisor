@@ -956,6 +956,12 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.watches
 }
 
+// LandlockSlot implements vfs.DentryImpl.LandlockSlot. Landlock rules cannot
+// name overlay files.
+func (d *dentry) LandlockSlot() vfs.LandlockSlot {
+	return nil
+}
+
 // contextID is this package's type for context.Context.Value keys.
 type contextID int
 

@@ -18,11 +18,11 @@
 //
 //	EpollInstance.interestMu
 //		FileDescription.epollMu
-//		  Locks acquired by FilesystemImpl/DentryImpl/FileDescriptionImpl methods (except FilesystemImpl.PrependPath, FilesystemImpl.IsDescendant, DentryImpl.InotifyWithParent)
+//		  Locks acquired by FilesystemImpl/DentryImpl/FileDescriptionImpl methods (except FilesystemImpl.PrependPath, FilesystemImpl.IsDescendant, FilesystemImpl.WalkAncestors, DentryImpl.InotifyWithParent)
 //		    VirtualFilesystem.mountMu
 //		      Dentry.mu
 //		        Locks acquired by FilesystemImpls between Prepare{Delete,Rename}Dentry and Commit{Delete,Rename*}Dentry
-//		          Locks acquired by FilesystemImpl.PrependPath, FilesystemImpl.IsDescendant, DentryImpl.InotifyWithParent (typically genericfstree.Filesystem.ancestryMu)
+//		          Locks acquired by FilesystemImpl.PrependPath, FilesystemImpl.IsDescendant, FilesystemImpl.WalkAncestors, DentryImpl.InotifyWithParent (typically genericfstree.Filesystem.ancestryMu)
 //		      VirtualFilesystem.filesystemsMu
 //		    fdnotifier.notifier.mu
 //		      EpollInstance.readyMu
@@ -220,7 +220,7 @@ func (vfs *VirtualFilesystem) Init(ctx context.Context) error {
 	}
 	anonfs.vfsfs.Init(vfs, &anonFilesystemType{}, &anonfs)
 	defer anonfs.vfsfs.DecRef(ctx)
-	anonMount := vfs.NewDisconnectedMount(&anonfs.vfsfs, nil, &MountOptions{})
+	anonMount := vfs.NewDisconnectedMount(&anonfs.vfsfs, nil, &MountOptions{Internal: true})
 	vfs.anonMount = anonMount
 
 	return nil
@@ -1230,6 +1230,42 @@ func (vfs *VirtualFilesystem) unlockMounts(ctx context.Context) {
 			rc.DecRef(ctx)
 		}
 	}
+}
+
+// DeferredDecRefs holds references that the holder drops after it releases
+// its filesystem locks. Dropping the last reference on a Mount or Dentry may
+// acquire filesystem locks, so code that may hold such locks hands references
+// to a DeferredDecRefs instead of dropping them.
+//
+// The zero value of DeferredDecRefs is empty.
+type DeferredDecRefs struct {
+	refs []refs.RefCounter
+}
+
+// add hands one reference on rc to d.
+func (d *DeferredDecRefs) add(rc refs.RefCounter) {
+	d.refs = append(d.refs, rc)
+}
+
+// decRef hands one reference on rc to d. If d is nil, decRef drops the
+// reference at once.
+func (d *DeferredDecRefs) decRef(ctx context.Context, rc refs.RefCounter) {
+	if d == nil {
+		rc.DecRef(ctx)
+		return
+	}
+	d.add(rc)
+}
+
+// Release drops all references held by d.
+//
+// Preconditions: The caller holds no filesystem locks.
+func (d *DeferredDecRefs) Release(ctx context.Context) {
+	for i, rc := range d.refs {
+		rc.DecRef(ctx)
+		d.refs[i] = nil
+	}
+	d.refs = d.refs[:0]
 }
 
 // A VirtualDentry represents a node in a VFS tree, by combining a Dentry

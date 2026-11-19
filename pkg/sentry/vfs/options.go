@@ -117,6 +117,14 @@ type MountOptions struct {
 	// normal user processes.
 	Locked bool
 
+	// Internal marks the mount as holding only sentry-internal files: Landlock
+	// checks allow all access to files reached through it, and Landlock rules
+	// cannot name them. Mounts cloned from an internal mount, such as bind
+	// mounts, are not internal. Internal is unrelated to
+	// GetFilesystemOptions.InternalMount, which lets the sentry create
+	// filesystems of types that applications cannot mount.
+	Internal bool
+
 	lockReadOnly bool
 }
 

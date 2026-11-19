@@ -142,6 +142,9 @@ type Mount struct {
 	// namespace. It is analogous to MNT_LOCKED in Linux.
 	locked bool
 
+	// internal is MountOptions.Internal at creation. internal is immutable.
+	internal bool
+
 	// lockedFlags contains the flags that RemountAt may not clear. lockedFlags
 	// is protected by VirtualFilesystem.mountMu.
 	lockedFlags mountLockFlags
@@ -162,6 +165,7 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 		root:     root,
 		ns:       mntns,
 		locked:   opts.Locked,
+		internal: opts.Internal,
 		isShared: false,
 		refs:     atomicbitops.FromInt64(1),
 	}
@@ -672,6 +676,12 @@ func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountO
 			Flags:    mnt.flags,
 			ReadOnly: mnt.ReadOnlyLocked(),
 		}
+	}
+	if opts.Internal {
+		// Clones of a mount are never internal.
+		o := *opts
+		o.Internal = false
+		opts = &o
 	}
 	clone := vfs.NewDisconnectedMount(mnt.fs, root, opts)
 	if cloneType&(makeFollowerClone|makePrivateClone|sharedToFollowerClone) != 0 {
@@ -1481,10 +1491,14 @@ func (vfs *VirtualFilesystem) getMountpoint(ctx context.Context, creds *auth.Cre
 // mnt. It takes a reference on the returned VirtualDentry. If no such mount
 // point exists (i.e. mnt is a root mount), getMountpointAt returns (nil, nil).
 //
+// getMountpointAt drops the references that it takes on intermediate mounts and
+// mount points. If deferred is not nil, getMountpointAt hands them to deferred
+// instead of dropping them.
+//
 // Preconditions:
 //   - References are held on mnt and root.
 //   - vfsroot is not (mnt, mnt.root).
-func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry) VirtualDentry {
+func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry, deferred *DeferredDecRefs) VirtualDentry {
 	// The first mount is special-cased:
 	//
 	//	- The caller must have already checked mnt against vfsroot.
@@ -1508,12 +1522,12 @@ retryFirst:
 	if !point.TryIncRef() {
 		// Since Mount holds a reference on Mount.key.point, this can only
 		// happen due to a racing change to Mount.key.
-		parent.DecRef(ctx)
+		deferred.decRef(ctx, parent)
 		goto retryFirst
 	}
 	if !vfs.mounts.seq.ReadOk(epoch) {
-		point.DecRef(ctx)
-		parent.DecRef(ctx)
+		deferred.decRef(ctx, point)
+		deferred.decRef(ctx, parent)
 		goto retryFirst
 	}
 	mnt = parent
@@ -1535,16 +1549,16 @@ retryFirst:
 		if !point.TryIncRef() {
 			// Since Mount holds a reference on Mount.key.point, this can
 			// only happen due to a racing change to Mount.key.
-			parent.DecRef(ctx)
+			deferred.decRef(ctx, parent)
 			goto retryNotFirst
 		}
 		if !vfs.mounts.seq.ReadOk(epoch) {
-			point.DecRef(ctx)
-			parent.DecRef(ctx)
+			deferred.decRef(ctx, point)
+			deferred.decRef(ctx, parent)
 			goto retryNotFirst
 		}
-		d.DecRef(ctx)
-		mnt.DecRef(ctx)
+		deferred.decRef(ctx, d)
+		deferred.decRef(ctx, mnt)
 		mnt = parent
 		d = point
 	}
@@ -1742,6 +1756,11 @@ func (mnt *Mount) countSubmountsLocked() uint32 {
 // Dentry.
 func (mnt *Mount) Root() *Dentry {
 	return mnt.root
+}
+
+// IsInternal reports whether mnt was created with MountOptions.Internal.
+func (mnt *Mount) IsInternal() bool {
+	return mnt.internal
 }
 
 // GenerateProcMounts emits the contents of /proc/[pid]/mounts for vfs to buf.

@@ -223,6 +223,10 @@ inline ChildResult TryReadOpen(const std::string& path) {
   return errno == EACCES ? kDenied : kOther;
 }
 
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+
 inline sockaddr_in LoopbackAddr(uint16_t port) {
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
