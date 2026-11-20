@@ -174,6 +174,11 @@ type VirtualFilesystem struct {
 	// The low 32 bits store the number of currently in-progress renames
 	// VFS-wide.
 	renameState atomicbitops.Uint64
+
+	// landlockLive is the number of Landlock rulesets and domains that have
+	// not been released. Checkpoints fail while it is not zero, since their
+	// state cannot be saved.
+	landlockLive atomicbitops.Int64 `state:"nosave"`
 }
 
 const renameInProgressMask = 1<<32 - 1
@@ -394,6 +399,10 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
 			return err
 		}
+		if err := rp.checkLandlockGate(LandlockOpLink, landlockMakeAccessFS); err != nil {
+			oldVD.DecRef(ctx)
+			return err
+		}
 		err := rp.mount.fs.impl.LinkAt(ctx, rp, oldVD)
 		if err == nil {
 			oldVD.DecRef(ctx)
@@ -440,6 +449,9 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
 			return err
 		}
+		if err := rp.checkLandlockGate(LandlockOpMkdir, linux.LANDLOCK_ACCESS_FS_MAKE_DIR); err != nil {
+			return err
+		}
 		err := rp.mount.fs.impl.MkdirAt(ctx, rp, *opts)
 		if err == nil {
 			return nil
@@ -480,6 +492,9 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 	defer rp.Release(ctx)
 	for {
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
+			return err
+		}
+		if err := rp.checkLandlockGate(LandlockOpMknod, landlockMknodAccessFS(opts.Mode)); err != nil {
 			return err
 		}
 		err := rp.mount.fs.impl.MknodAt(ctx, rp, *opts)
@@ -549,6 +564,9 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 	}
 	for {
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
+			return nil, err
+		}
+		if err := rp.checkLandlockGate(LandlockOpOpen, landlockOpenAccessFS); err != nil {
 			return nil, err
 		}
 		fd, err := rp.mount.fs.impl.OpenAt(ctx, rp, *opts)
@@ -668,6 +686,10 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
 			return err
 		}
+		if err := rp.checkLandlockGate(LandlockOpRename, landlockMakeAccessFS|landlockRemoveAccessFS); err != nil {
+			oldParentVD.DecRef(ctx)
+			return err
+		}
 		err := rp.mount.fs.impl.RenameAt(ctx, rp, oldParentVD, oldName, renameOpts)
 		if err == nil {
 			oldParentVD.DecRef(ctx)
@@ -709,6 +731,9 @@ func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentia
 	defer rp.Release(ctx)
 	for {
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
+			return err
+		}
+		if err := rp.checkLandlockGate(LandlockOpRmdir, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR); err != nil {
 			return err
 		}
 		err := rp.mount.fs.impl.RmdirAt(ctx, rp)
@@ -827,6 +852,9 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
 			return err
 		}
+		if err := rp.checkLandlockGate(LandlockOpSymlink, linux.LANDLOCK_ACCESS_FS_MAKE_SYM); err != nil {
+			return err
+		}
 		err := rp.mount.fs.impl.SymlinkAt(ctx, rp, target)
 		if err == nil {
 			return nil
@@ -866,6 +894,9 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
 	defer rp.Release(ctx)
 	for {
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
+			return err
+		}
+		if err := rp.checkLandlockGate(LandlockOpUnlink, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
 			return err
 		}
 		err := rp.mount.fs.impl.UnlinkAt(ctx, rp)

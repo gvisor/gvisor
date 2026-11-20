@@ -227,6 +227,11 @@ type createCredsKey struct {
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+	// The layers of an overlay that a task restricted by Landlock creates
+	// would escape its domain, so such a task may not create overlays.
+	if vfs.LandlockDomainOf(creds) != nil {
+		return nil, nil, linuxerr.EPERM
+	}
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsoptsRaw := opts.InternalData
 	fsopts, ok := fsoptsRaw.(FilesystemOptions)

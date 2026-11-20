@@ -32,6 +32,11 @@ import (
 //
 // +stateify savable
 type LandlockRuleset struct {
+	// vfs is the VirtualFilesystem that counts the ruleset among its live
+	// Landlock rulesets and domains (see VirtualFilesystem.landlockLive), until
+	// Release. vfs is immutable.
+	vfs *VirtualFilesystem
+
 	// handledAccessFS is the set of filesystem rights that the ruleset
 	// handles. handledAccessFS is immutable.
 	handledAccessFS uint64
@@ -47,8 +52,10 @@ type LandlockRuleset struct {
 
 // NewLandlockRuleset creates a new LandlockRuleset handling the filesystem
 // rights in handledAccessFS.
-func NewLandlockRuleset(handledAccessFS uint64) *LandlockRuleset {
+func (vfs *VirtualFilesystem) NewLandlockRuleset(handledAccessFS uint64) *LandlockRuleset {
+	vfs.landlockLive.Add(1)
 	return &LandlockRuleset{
+		vfs:             vfs,
 		handledAccessFS: handledAccessFS,
 		rules:           make(map[*LandlockObject]uint64),
 	}
@@ -82,6 +89,7 @@ func (r *LandlockRuleset) Release(ctx context.Context) {
 	for obj := range rules {
 		obj.DecRef(ctx)
 	}
+	r.vfs.landlockLive.Add(-1)
 }
 
 // LandlockRulesetFD implements FileDescriptionImpl for an anonymous
@@ -99,15 +107,14 @@ type LandlockRulesetFD struct {
 
 // NewLandlockRulesetFD wraps ruleset in an anonymous "[landlock-ruleset]"
 // FileDescription opened read-write. On error, ruleset is not released.
-func (vfs *VirtualFilesystem) NewLandlockRulesetFD(ctx context.Context, creds *auth.Credentials, ruleset *LandlockRuleset, flags uint32) (*FileDescription, error) {
+func (vfs *VirtualFilesystem) NewLandlockRulesetFD(ctx context.Context, creds *auth.Credentials, ruleset *LandlockRuleset) (*FileDescription, error) {
 	vd := vfs.NewAnonVirtualDentry("[landlock-ruleset]")
 	defer vd.DecRef(ctx)
 
 	fd := &LandlockRulesetFD{
 		ruleset: ruleset,
 	}
-	openFlags := uint32(linux.O_RDWR) | (flags & linux.O_CLOEXEC)
-	if err := fd.vfsfd.Init(fd, openFlags, creds, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{
+	if err := fd.vfsfd.Init(fd, linux.O_RDWR, creds, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{
 		UseDentryMetadata: true,
 		DenyPRead:         true,
 		DenyPWrite:        true,

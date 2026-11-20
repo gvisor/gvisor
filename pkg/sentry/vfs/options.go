@@ -125,6 +125,14 @@ type MountOptions struct {
 	// filesystems of types that applications cannot mount.
 	Internal bool
 
+	// LandlockUnnameable marks the mount as one whose files Landlock rules
+	// cannot name: landlock_add_rule(2) refuses them. Unlike for Internal
+	// mounts, Landlock still checks access to files reached through the
+	// mount. For example, the mount that mq_open(2) opens queues on is
+	// LandlockUnnameable, while an mqueue filesystem mounted at a path is not.
+	// Mounts cloned from a LandlockUnnameable mount are not LandlockUnnameable.
+	LandlockUnnameable bool
+
 	lockReadOnly bool
 }
 

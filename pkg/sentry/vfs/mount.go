@@ -145,6 +145,10 @@ type Mount struct {
 	// internal is MountOptions.Internal at creation. internal is immutable.
 	internal bool
 
+	// landlockUnnameable is MountOptions.LandlockUnnameable at creation.
+	// landlockUnnameable is immutable.
+	landlockUnnameable bool
+
 	// lockedFlags contains the flags that RemountAt may not clear. lockedFlags
 	// is protected by VirtualFilesystem.mountMu.
 	lockedFlags mountLockFlags
@@ -168,6 +172,8 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 		internal: opts.Internal,
 		isShared: false,
 		refs:     atomicbitops.FromInt64(1),
+
+		landlockUnnameable: opts.LandlockUnnameable,
 	}
 	if opts.ReadOnly {
 		mnt.setReadOnlyLocked(true)
@@ -677,10 +683,11 @@ func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountO
 			ReadOnly: mnt.ReadOnlyLocked(),
 		}
 	}
-	if opts.Internal {
-		// Clones of a mount are never internal.
+	if opts.Internal || opts.LandlockUnnameable {
+		// Clones of a mount are never internal or LandlockUnnameable.
 		o := *opts
 		o.Internal = false
+		o.LandlockUnnameable = false
 		opts = &o
 	}
 	clone := vfs.NewDisconnectedMount(mnt.fs, root, opts)
@@ -1756,6 +1763,13 @@ func (mnt *Mount) countSubmountsLocked() uint32 {
 // Dentry.
 func (mnt *Mount) Root() *Dentry {
 	return mnt.root
+}
+
+// LandlockNameable reports whether Landlock rules can name files reached
+// through mnt: mnt was created with neither MountOptions.Internal nor
+// MountOptions.LandlockUnnameable.
+func (mnt *Mount) LandlockNameable() bool {
+	return !mnt.internal && !mnt.landlockUnnameable
 }
 
 // IsInternal reports whether mnt was created with MountOptions.Internal.

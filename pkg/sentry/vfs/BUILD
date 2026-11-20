@@ -164,6 +164,7 @@ go_library(
         "inotify_event_mutex.go",
         "inotify_mutex.go",
         "landlock_domain.go",
+        "landlock_gate.go",
         "landlock_key_atomicptrmap_unsafe.go",
         "landlock_object.go",
         "landlock_ruleset.go",
