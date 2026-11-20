@@ -237,8 +237,14 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			Root:  childVD,
 			Start: childVD,
 		}
+		// The link count of the topmost lower file decides
+		// child.landlockLinked. Not all layers report it.
+		statMask := mask
+		if topLookupLayer == lookupLayerNone && !isUpper && fs.opts.UpperRoot.Ok() {
+			statMask |= linux.STATX_NLINK
+		}
 		stat, err := vfsObj.StatAt(ctx, fs.creds, childPop, &vfs.StatOptions{
-			Mask: mask,
+			Mask: statMask,
 		})
 		if err != nil {
 			lookupErr = err
@@ -302,6 +308,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			child.devMajor = atomicbitops.FromUint32(stat.DevMajor)
 			child.devMinor = atomicbitops.FromUint32(stat.DevMinor)
 			child.ino = atomicbitops.FromUint64(stat.Ino)
+			child.landlockLinked = statMask&linux.STATX_NLINK != 0 && !isDir && stat.Mask&linux.STATX_NLINK != 0 && stat.Nlink > 1
 		}
 
 		// For non-directory files, only the topmost layer that contains a file

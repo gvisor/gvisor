@@ -178,6 +178,29 @@ func (fs *Filesystem) installLandlockObjectLocked(obj *LandlockObject, slot Land
 	slot.storeLocked(obj)
 }
 
+// ShareLandlockObject makes to hold the live LandlockObject that from holds,
+// if any, in addition to the slots that already hold it; then it calls
+// publish, which typically makes the file's dentries use to instead of from.
+// Both steps happen with landlockMu locked, so Filesystem.LandlockObject for
+// the file runs entirely before or entirely after them, and the file keeps its
+// object when it moves to a new slot. from keeps holding the object, so other
+// names of the file that still use from keep finding it. publish must not
+// acquire locks.
+//
+// Preconditions: from and to locate objects of files on fs, if not nil.
+func (fs *Filesystem) ShareLandlockObject(from, to LandlockSlot, publish func()) {
+	fs.landlockMu.Lock()
+	defer fs.landlockMu.Unlock()
+	if from != nil && to != nil {
+		// from holds an object only while the object is attached, since
+		// release and detach remove it from every slot under landlockMu.
+		if obj := from.lookup(); obj != nil {
+			fs.installLandlockObjectLocked(obj, to)
+		}
+	}
+	publish()
+}
+
 // detachLandlockObjects detaches every LandlockObject belonging to fs and
 // drops its dentry reference before fs.impl.Release runs.
 func (fs *Filesystem) detachLandlockObjects(ctx context.Context) {
@@ -204,13 +227,12 @@ func (fs *Filesystem) detachLandlockObjects(ctx context.Context) {
 //
 // Preconditions: d is a dentry of fs. The caller holds a reference on d.
 func (fs *Filesystem) LandlockObject(d *Dentry) (*LandlockObject, error) {
-	slot := d.impl.LandlockSlot()
-	if slot == nil {
-		return nil, linuxerr.EBADFD
-	}
 	fs.landlockMu.Lock()
 	defer fs.landlockMu.Unlock()
-	if fs.landlockDetached {
+	// Get the slot with landlockMu locked, so that a concurrent
+	// ShareLandlockObject for the file runs entirely before or after this.
+	slot := d.impl.LandlockSlot()
+	if slot == nil || fs.landlockDetached {
 		return nil, linuxerr.EBADFD
 	}
 	// An object whose last reference has been dropped is replaced, never
@@ -272,16 +294,14 @@ func (s *LandlockFileSlot) removeLocked(obj *LandlockObject) {
 	s.ptr.CompareAndSwap(obj, nil)
 }
 
-// LandlockKey identifies a file whose Landlock identity outlives the state
-// that its filesystem keeps for it.
-type LandlockKey struct {
-	Lo uint64
-	Hi uint64
-}
-
-// LandlockKeyMap maps LandlockKeys to LandlockObjects on a filesystem.
-// Lookups take no locks. Storing and removing an object costs time
-// independent of the number of objects in the map.
+// LandlockKeyMap maps keys to the LandlockObjects of files on a filesystem.
+// Filesystems use it when a file's identity is not tied to the state they
+// keep for the file. For example, FUSE keys a file by the server's node ID and
+// generation, so that its identity outlives the inode; overlay keys a file by
+// the layer file that its identity follows. A key may be of any comparable
+// type, and keys of different types never match. Lookups take no locks.
+// Storing and removing an object costs time independent of the number of
+// objects in the map.
 //
 // +stateify savable
 type LandlockKeyMap struct {
@@ -289,19 +309,18 @@ type LandlockKeyMap struct {
 }
 
 // Slot returns a LandlockKeySlot that locates the LandlockObject for key in
-// m.
-func (m *LandlockKeyMap) Slot(key LandlockKey) LandlockKeySlot {
+// m. key must be comparable.
+func (m *LandlockKeyMap) Slot(key any) LandlockKeySlot {
 	return LandlockKeySlot{m: m, key: key}
 }
 
 // LandlockKeySlot is a LandlockSlot that locates the LandlockObject of a file
-// in a LandlockKeyMap. Filesystems use it when a file's identity outlives the
-// state they keep for the file.
+// in a LandlockKeyMap under one key. LandlockKeySlot is immutable.
 //
 // +stateify savable
 type LandlockKeySlot struct {
 	m   *LandlockKeyMap
-	key LandlockKey
+	key any
 }
 
 // lookup implements LandlockSlot.lookup.

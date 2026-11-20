@@ -128,7 +128,7 @@ go_template_instance(
     prefix = "landlockKey",
     template = "//pkg/sync/atomicptrmap:generic_atomicptrmap",
     types = {
-        "Key": "LandlockKey",
+        "Key": "any",
         "Value": "LandlockObject",
     },
 )
