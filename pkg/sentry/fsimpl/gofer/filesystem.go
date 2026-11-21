@@ -1136,18 +1136,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
-	if err := vfs.CheckOpenFileType(linux.FileMode(d.inode.fileType()), opts); err != nil {
-		return nil, err
-	}
-	if ats.MayWrite() {
-		// Reject writes to a file that is currently being executed, as Linux
-		// does in fs/namei.c:may_open() and fs/open.c:handle_truncate(). This
-		// covers O_TRUNC, which AccessTypesForOpenFlags folds into MayWrite.
-		if err := d.inode.writeCount.CheckWrite(); err != nil {
-			return nil, err
-		}
-	}
-	if err := rp.CheckLandlockOpen(ctx, &d.vfsd, d.isDir(), opts); err != nil {
+	if err := rp.CheckOpenExistingFile(ctx, &d.vfsd, linux.FileMode(d.inode.fileType()), false /* copiesUpForWrite */, opts); err != nil {
 		return nil, err
 	}
 	if d.inode.fileType() == linux.S_IFSOCK && !d.inode.isSynthetic() {

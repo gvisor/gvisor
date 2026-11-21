@@ -1983,6 +1983,52 @@ TEST(ExecTest, RunningBinaryIsNotWritable) {
   EXPECT_NO_ERRNO(Open(path, O_WRONLY));
 }
 
+TEST(ExecTest, RunningBinaryOnReadOnlyBindMount) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const std::string blob =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(RunfilePath(kEtxtbsyWorkload)));
+  const TempPath dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(GetAbsoluteTestTmpdir()));
+  const TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(dir.path(), blob, 0755));
+  const std::string path = binary.path();
+  ASSERT_THAT(
+      mount(dir.path().c_str(), dir.path().c_str(), nullptr, MS_BIND, nullptr),
+      SyscallSucceeds());
+  auto unmount = Cleanup([&] {
+    EXPECT_THAT(umount2(dir.path().c_str(), MNT_DETACH), SyscallSucceeds());
+  });
+  ASSERT_THAT(mount(nullptr, dir.path().c_str(), nullptr,
+                    MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr),
+              SyscallSucceeds());
+
+  int fds[2];
+  ASSERT_THAT(pipe(fds), SyscallSucceeds());
+  FileDescriptor rd(fds[0]);
+  FileDescriptor wr(fds[1]);
+  pid_t child;
+  int execve_errno;
+  const int wfd = wr.get();
+  Cleanup kill_child = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      path, {path}, {}, [wfd] { dup2(wfd, STDOUT_FILENO); }, &child,
+      &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+  wr.reset();
+  char c;
+  ASSERT_THAT(RetryEINTR(read)(rd.get(), &c, 1), SyscallSucceedsWithValue(1));
+
+  EXPECT_THAT(open(path.c_str(), O_WRONLY), SyscallFailsWithErrno(ETXTBSY));
+  EXPECT_THAT(open(path.c_str(), O_RDWR), SyscallFailsWithErrno(ETXTBSY));
+  EXPECT_THAT(open(path.c_str(), O_WRONLY | O_TRUNC),
+              SyscallFailsWithErrno(EROFS));
+  EXPECT_THAT(open(path.c_str(), O_RDONLY | O_TRUNC),
+              SyscallFailsWithErrno(EROFS));
+
+  kill_child.Release()();
+  EXPECT_THAT(open(path.c_str(), O_WRONLY), SyscallFailsWithErrno(EROFS));
+}
+
 }  // namespace
 
 }  // namespace testing

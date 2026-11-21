@@ -2937,6 +2937,32 @@ TEST(MountTest, BindMountNamespaceFileInTree) {
   EXPECT_EQ(st.st_ino, uts_st.st_ino);
 }
 
+TEST(MountTest, ReadOnlyBindMountAllowsIoctlOnlyOpen) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string file = JoinPath(dir.path(), "file");
+  const std::string target = JoinPath(mnt.path(), "file");
+  const auto rest = [&] {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_REC | MS_PRIVATE, nullptr));
+    TEST_CHECK_SUCCESS(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, nullptr));
+    int created = open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    TEST_PCHECK(created >= 0);
+    TEST_CHECK_SUCCESS(close(created));
+    TEST_CHECK_SUCCESS(mount(dir.path().c_str(), mnt.path().c_str(), nullptr,
+                             MS_BIND, nullptr));
+    TEST_CHECK_SUCCESS(mount(nullptr, mnt.path().c_str(), nullptr,
+                             MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr));
+    int fd = open(target.c_str(), 3);
+    TEST_PCHECK(fd >= 0);
+    TEST_CHECK_SUCCESS(close(fd));
+    TEST_CHECK(open(target.c_str(), O_WRONLY) < 0 && errno == EROFS);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
 TEST(MountTest, MountNamespacePropagation) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 

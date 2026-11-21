@@ -830,6 +830,37 @@ TEST(LandlockV1Test, ExecveatOfOpathDescriptorRequiresExecute) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, WriteOpenOnReadOnlyMountIsErofsBeforeLandlock) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  ASSERT_THAT(
+      mount(dir.path().c_str(), dir.path().c_str(), nullptr, MS_BIND, nullptr),
+      SyscallSucceeds());
+  auto unmount = Cleanup([&] { umount2(dir.path().c_str(), MNT_DETACH); });
+  ASSERT_THAT(mount(nullptr, dir.path().c_str(), nullptr,
+                    MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr),
+              SyscallSucceeds());
+  static std::string target;
+  target = file.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_WRITE_FILE);
+    _exit(ClassifyErrno(open(target.c_str(), O_WRONLY)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrRofs)
+      << "exit status " << status;
+  status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_READ_FILE);
+    _exit(ClassifyErrno(open(target.c_str(), O_RDONLY | O_TRUNC)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrRofs)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, BindMountedNamespaceFileIsCheckedLikeAnyFile) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));

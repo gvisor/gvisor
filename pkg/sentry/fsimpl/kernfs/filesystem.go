@@ -612,18 +612,6 @@ func (d *Dentry) mayOpen(ctx context.Context, creds *auth.Credentials, opts vfs.
 	return nil
 }
 
-// checkOpen checks an open with opts of the existing file d, after the
-// permission and exec checks: first the file type, then the Landlock domain of
-// rp's credentials.
-//
-// Preconditions: d is a dentry of rp.Mount()'s filesystem. d.fs.mu is locked.
-func (d *Dentry) checkOpen(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) error {
-	if err := vfs.CheckOpenFileType(d.inode.Mode(), opts); err != nil {
-		return err
-	}
-	return rp.CheckLandlockOpen(ctx, d.VFSDentry(), d.isDir(), opts)
-}
-
 // OpenAt implements vfs.FilesystemImpl.OpenAt.
 func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	trunc := opts.Flags&linux.O_TRUNC != 0
@@ -642,7 +630,7 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			fs.mu.RUnlock()
 			return nil, err
 		}
-		if err := d.checkOpen(ctx, rp, &opts); err != nil {
+		if err := rp.CheckOpenExistingFile(ctx, d.VFSDentry(), d.inode.Mode(), false /* copiesUpForWrite */, &opts); err != nil {
 			fs.mu.RUnlock()
 			return nil, err
 		}
@@ -688,7 +676,7 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		if err := start.mayOpen(ctx, rp.Credentials(), opts); err != nil {
 			return nil, err
 		}
-		if err := start.checkOpen(ctx, rp, &opts); err != nil {
+		if err := rp.CheckOpenExistingFile(ctx, start.VFSDentry(), start.inode.Mode(), false /* copiesUpForWrite */, &opts); err != nil {
 			return nil, err
 		}
 		if trunc && start.isRegular() {
@@ -789,7 +777,7 @@ afterTrailingSymlink:
 	if err := child.mayOpen(ctx, rp.Credentials(), opts); err != nil {
 		return nil, err
 	}
-	if err := child.checkOpen(ctx, rp, &opts); err != nil {
+	if err := rp.CheckOpenExistingFile(ctx, child.VFSDentry(), child.inode.Mode(), false /* copiesUpForWrite */, &opts); err != nil {
 		return nil, err
 	}
 	if trunc && child.isRegular() {

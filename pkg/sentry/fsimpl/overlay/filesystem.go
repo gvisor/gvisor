@@ -931,20 +931,11 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return err
 	}
-	if err := vfs.CheckOpenFileType(linux.FileMode(d.mode.Load()), opts); err != nil {
-		return err
-	}
-	if ats.MayWrite() {
-		// Reject writes to a file that is currently being executed, as Linux
-		// does in fs/namei.c:may_open() and fs/open.c:handle_truncate(). This
-		// must happen before copy-up, since copying up would otherwise create
-		// a fresh upper file with a zero write count and silently bypass the
-		// check.
-		if err := d.writeCount.CheckWrite(); err != nil {
-			return err
-		}
-	}
-	if err := rp.CheckLandlockOpen(ctx, &d.vfsd, d.isDir(), opts); err != nil {
+	// CheckOpenExistingFile rejects writes to a file that is currently being
+	// executed. This must happen before copy-up, since copying up would
+	// otherwise create a fresh upper file with a zero write count and silently
+	// bypass the check.
+	if err := rp.CheckOpenExistingFile(ctx, &d.vfsd, linux.FileMode(d.mode.Load()), true /* copiesUpForWrite */, opts); err != nil {
 		return err
 	}
 	if d.isDir() {

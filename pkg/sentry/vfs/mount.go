@@ -1698,6 +1698,18 @@ func (mnt *Mount) EndWrite() {
 	mnt.writers.Add(-1)
 }
 
+// checkWritable returns EROFS if mnt is read-only, and nil otherwise. Unlike
+// CheckBeginWrite, it does not keep mnt writable after it returns. A
+// concurrent change of mnt to read-only fails with EBUSY if it observes the
+// check, as it does for any writer.
+func (mnt *Mount) checkWritable() error {
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	mnt.EndWrite()
+	return nil
+}
+
 // Preconditions: VirtualFilesystem.mountMu must be locked.
 func (mnt *Mount) setReadOnlyLocked(ro bool) error {
 	if oldRO := mnt.writers.Load() < 0; oldRO == ro {
