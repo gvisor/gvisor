@@ -168,6 +168,20 @@ func (c *Credentials) Fork() *Credentials {
 	return nc
 }
 
+// WithoutLandlockDomain returns credentials equal to c but without a Landlock
+// domain: c itself if c has no domain, and otherwise a copy of c whose
+// LandlockDomain is nil. They let the sentry perform an operation that is not
+// the task's own, such as undoing part of a failed syscall, without checking it
+// against the task's domain.
+func (c *Credentials) WithoutLandlockDomain() *Credentials {
+	if c.LandlockDomain == nil {
+		return c
+	}
+	nc := c.Fork()
+	nc.LandlockDomain = nil
+	return nc
+}
+
 // ForkIntoUserNamespace returns a copy of c after its caller has entered user
 // namespace ns.
 func (c *Credentials) ForkIntoUserNamespace(ns *UserNamespace) *Credentials {

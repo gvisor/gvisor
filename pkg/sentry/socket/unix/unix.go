@@ -249,6 +249,10 @@ func (s *Socket) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 
 	// See net/unix/af_unix.c:unix_bind_bsd().
 	path := fspath.Parse(p)
+	if !path.HasComponents() {
+		// The path names the root directory, which exists.
+		return syserr.ErrAddressInUse
+	}
 	root := t.FSContext().RootDirectory()
 	defer root.DecRef(t)
 	start := root
@@ -257,16 +261,31 @@ func (s *Socket) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 		start = t.FSContext().WorkingDirectory()
 		defer start.DecRef(t)
 	}
-	pop := vfs.PathOperation{
-		Root:  root,
-		Start: start,
-		Path:  path,
-	}
 	stat, err := s.vfsfd.Stat(t, vfs.StatOptions{Mask: linux.STATX_MODE})
 	if err != nil {
 		return syserr.FromError(err)
 	}
-	err = t.Kernel().VFS().MknodAt(t, t.Credentials(), &pop, &vfs.MknodOptions{
+	// Resolve the parent directory once, so that a failed bind removes the
+	// socket file from the directory where it was created, even if the path
+	// changes in between.
+	vfsObj := t.Kernel().VFS()
+	parent, name, err := vfsObj.GetParentDirAndName(t, t.Credentials(), &vfs.PathOperation{
+		Root:  root,
+		Start: start,
+		Path:  path,
+	})
+	if err != nil {
+		return syserr.FromError(err)
+	}
+	defer parent.DecRef(t)
+	namePath := fspath.Parse(name)
+	// A trailing slash still requires the new file to be a directory.
+	namePath.Dir = path.Dir
+	err = vfsObj.MknodAt(t, t.Credentials(), &vfs.PathOperation{
+		Root:  root,
+		Start: parent,
+		Path:  namePath,
+	}, &vfs.MknodOptions{
 		Mode:     linux.FileMode(linux.S_IFSOCK | uint(stat.Mode)&^t.FSContext().Umask()),
 		Endpoint: bep,
 	})
@@ -277,7 +296,14 @@ func (s *Socket) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 		return syserr.FromError(err)
 	}
 	if err := s.ep.Bind(transport.Address{Addr: p}); err != nil {
-		if unlinkErr := t.Kernel().VFS().UnlinkAt(t, t.Credentials(), &pop); unlinkErr != nil {
+		// Removing the socket file undoes part of the failed bind; it is not
+		// an operation of the task, so the task's Landlock domain does not
+		// restrict it.
+		if unlinkErr := vfsObj.UnlinkAt(t, t.Credentials().WithoutLandlockDomain(), &vfs.PathOperation{
+			Root:  root,
+			Start: parent,
+			Path:  fspath.Parse(name),
+		}); unlinkErr != nil {
 			log.Warningf("failed to unlink socket file created for bind(%q): %v", p, unlinkErr)
 		}
 		return err

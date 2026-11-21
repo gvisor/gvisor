@@ -333,8 +333,13 @@ func (vfs *VirtualFilesystem) GetDentryAt(ctx context.Context, creds *auth.Crede
 	}
 }
 
+// GetParentDirAndName resolves the parent directory of the file at the given
+// path, and returns the directory, with a reference taken on it, and the last
+// component of the path. For example, for "a/b/c", it returns the directory
+// "a/b" and "c". The last component itself is not resolved.
+//
 // Preconditions: pop.Path.Begin.Ok().
-func (vfs *VirtualFilesystem) getParentDirAndName(ctx context.Context, creds *auth.Credentials, pop *PathOperation) (VirtualDentry, string, error) {
+func (vfs *VirtualFilesystem) GetParentDirAndName(ctx context.Context, creds *auth.Credentials, pop *PathOperation) (VirtualDentry, string, error) {
 	if pop.scoped() {
 		// This method does not support scoped path resolution.
 		return VirtualDentry{}, "", linuxerr.EINVAL
@@ -686,7 +691,7 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 		return linuxerr.EINVAL
 	}
 
-	oldParentVD, oldName, err := vfs.getParentDirAndName(ctx, creds, oldpop)
+	oldParentVD, oldName, err := vfs.GetParentDirAndName(ctx, creds, oldpop)
 	if err != nil {
 		return err
 	}

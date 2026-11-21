@@ -293,6 +293,81 @@ TEST(LandlockV1Test, DeniedTruncatingOpenLeavesFileIntact) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, UnixBindRequiresMakeSock) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  static std::string allowed;
+  allowed = dir.path();
+
+  auto bind_at = [](const std::string& name) -> ChildResult {
+    if (chdir(allowed.c_str()) != 0) {
+      return kSetup;
+    }
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+      return kSetup;
+    }
+    sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, name.c_str(), name.size() + 1);
+    int rc = bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    int err = errno;
+    close(sock);
+    if (rc == 0) {
+      return kAllowed;
+    }
+    return err == EACCES ? kDenied : kOther;
+  };
+
+  int denied = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_SOCK);
+    _exit(bind_at("denied.sock"));
+  }));
+  EXPECT_TRUE(WIFEXITED(denied) && WEXITSTATUS(denied) == kDenied)
+      << "exit status " << denied;
+
+  int granted = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SOCK, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SOCK);
+    _exit(bind_at("granted.sock"));
+  }));
+  EXPECT_TRUE(WIFEXITED(granted) && WEXITSTATUS(granted) == kAllowed)
+      << "exit status " << granted;
+}
+
+TEST(LandlockV1Test, FailedUnixBindRemovesSocketFileWithoutRemoveFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  static std::string allowed;
+  allowed = dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    TEST_PCHECK(chdir(allowed.c_str()) == 0);
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    TEST_PCHECK(sock >= 0);
+    auto bind_to = [sock](const std::string& name) {
+      sockaddr_un addr = {};
+      addr.sun_family = AF_UNIX;
+      memcpy(addr.sun_path, name.c_str(), name.size() + 1);
+      return bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    };
+    TEST_PCHECK(bind_to("first.sock") == 0);
+
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_SOCK);
+    if (bind_to("second.sock") == 0 || errno != EINVAL) {
+      _exit(kSetup);
+    }
+    struct stat st;
+    _exit(lstat("second.sock", &st) != 0 && errno == ENOENT ? kAllowed
+                                                            : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, MkdirOnReadOnlyProcMountReportsEnoentNotEacces) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
@@ -1057,6 +1132,75 @@ TEST(LandlockV1Test, WriteOpenOnReadOnlyMountIsErofsBeforeLandlock) {
       << "exit status " << status;
 }
 
+int RunFailedUnixBindRace(const std::string& root, bool landlocked) {
+  TEST_PCHECK(chdir(root.c_str()) == 0);
+  TEST_PCHECK(mkdir("scratch", 0755) == 0);
+  TEST_PCHECK(mkdir("scratch/allowed", 0755) == 0);
+  TEST_PCHECK(mkdir("protected", 0755) == 0);
+  int fd = open("protected/victim", O_CREAT | O_WRONLY, 0644);
+  TEST_PCHECK(fd >= 0);
+  close(fd);
+  const std::string protected_dir = JoinPath(root, "protected");
+  TEST_PCHECK(symlink("allowed", "scratch/link") == 0);
+  TEST_PCHECK(symlink(protected_dir.c_str(), "scratch/other") == 0);
+
+  int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+  TEST_PCHECK(sock >= 0);
+  sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  const std::string abstract =
+      absl::StrCat("landlock_bind_rollback_", getpid());
+  memcpy(addr.sun_path + 1, abstract.c_str(), abstract.size());
+  TEST_PCHECK(bind(sock, reinterpret_cast<sockaddr*>(&addr),
+                   offsetof(sockaddr_un, sun_path) + 1 + abstract.size()) == 0);
+
+  struct stat st;
+  if (landlocked) {
+    ApplyFsPolicy(
+        LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+            LANDLOCK_ACCESS_FS_MAKE_SYM,
+        JoinPath(root, "scratch"),
+        LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+            LANDLOCK_ACCESS_FS_MAKE_SYM);
+    if (unlink("protected/victim") == 0 || errno != EACCES) {
+      return kSetup;
+    }
+  }
+
+  std::atomic<bool> done(false);
+  ScopedThread swapper([&] {
+    while (!done.load()) {
+      syscall(SYS_renameat2, AT_FDCWD, "scratch/link", AT_FDCWD,
+              "scratch/other", RENAME_EXCHANGE);
+    }
+  });
+  sockaddr_un path_addr = {};
+  path_addr.sun_family = AF_UNIX;
+  constexpr char kPath[] = "scratch/link/victim";
+  memcpy(path_addr.sun_path, kPath, sizeof(kPath));
+  const absl::Time deadline = absl::Now() + absl::Seconds(3);
+  int result = kAllowed;
+  while (absl::Now() < deadline) {
+    int rc =
+        bind(sock, reinterpret_cast<sockaddr*>(&path_addr), sizeof(path_addr));
+    if (rc == 0 || (errno != EINVAL && errno != EADDRINUSE)) {
+      result = kOther;
+      break;
+    }
+    if (lstat("protected/victim", &st) != 0) {
+      result = kDenied;
+      break;
+    }
+    if (lstat("scratch/allowed/victim", &st) == 0) {
+      result = kDenied;
+      break;
+    }
+  }
+  done.store(true);
+  swapper.Join();
+  return result;
+}
+
 TEST(LandlockV1Test, TiocgptpeerWithOPathReturnsOPathFile) {
   SKIP_IF(LandlockAbiVersion() < 1);
   int master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
@@ -1089,6 +1233,64 @@ TEST(LandlockV1Test, TiocgptpeerWithOPathReturnsOPathFile) {
     }));
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
         << "flags " << flags << ": exit status " << status;
+  }
+}
+
+TEST(LandlockV1Test, FailedUnixBindByUnrestrictedTaskRemovesOnlyItsFile) {
+  const DisableSave ds;
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess(
+      [&] { _exit(RunFailedUnixBindRace(root.path(), false)); }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, FailedUnixBindRemovesSocketFileWithoutWritePermission) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0777), SyscallSucceeds());
+  constexpr uid_t kNobody = 65534;
+
+  for (bool landlocked : {false, true}) {
+    const std::string path =
+        JoinPath(dir.path(), landlocked ? "landlocked" : "unrestricted");
+    ASSERT_LT(path.size(), sizeof(sockaddr_un::sun_path));
+    int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+      if (landlocked) {
+        ApplyFsPolicy(
+            LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+            dir.path(), LANDLOCK_ACCESS_FS_MAKE_SOCK);
+      }
+      if (syscall(SYS_setresuid, kNobody, kNobody, kNobody) != 0) {
+        _exit(kUnsupported);
+      }
+      umask(0222);
+      int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+      TEST_PCHECK(sock >= 0);
+      sockaddr_un addr = {};
+      addr.sun_family = AF_UNIX;
+      const std::string abstract =
+          absl::StrCat("landlock_bind_umask_", getpid());
+      memcpy(addr.sun_path + 1, abstract.c_str(), abstract.size());
+      TEST_PCHECK(bind(sock, reinterpret_cast<sockaddr*>(&addr),
+                       offsetof(sockaddr_un, sun_path) + 1 + abstract.size()) ==
+                  0);
+      sockaddr_un path_addr = {};
+      path_addr.sun_family = AF_UNIX;
+      memcpy(path_addr.sun_path, path.c_str(), path.size());
+      int rc = bind(sock, reinterpret_cast<sockaddr*>(&path_addr),
+                    sizeof(path_addr));
+      if (rc == 0 || errno != EINVAL) {
+        _exit(kOther);
+      }
+      struct stat st;
+      _exit(lstat(path.c_str(), &st) == 0 ? kDenied : kAllowed);
+    }));
+    SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+        << (landlocked ? "landlocked" : "unrestricted") << ": exit status "
+        << status;
   }
 }
 
