@@ -924,6 +924,60 @@ TEST(LandlockV1Test, ChildRestrictionDoesNotAffectParent) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, MknodDeviceWithoutCapabilityIsEaccesUnderLandlock) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0777), SyscallSucceeds());
+  constexpr uid_t kNobody = 65534;
+  static std::string target;
+  target = JoinPath(dir.path(), "null");
+
+  int control = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    if (syscall(SYS_setresuid, kNobody, kNobody, kNobody) != 0) {
+      _exit(kSetup);
+    }
+    _exit(ClassifyErrno(mknod(target.c_str(), S_IFCHR | 0600, makedev(1, 3))));
+  }));
+  SKIP_IF(!WIFEXITED(control) || WEXITSTATUS(control) != kErrPerm);
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    if (syscall(SYS_setresuid, kNobody, kNobody, kNobody) != 0) {
+      _exit(kSetup);
+    }
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_CHAR);
+    _exit(ClassifyErrno(mknod(target.c_str(), S_IFCHR | 0600, makedev(1, 3))));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrAcces)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MknodSocketRequiresMakeSock) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath denied_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  static std::string allowed;
+  static std::string allowed_sock;
+  static std::string denied_sock;
+  allowed = allowed_dir.path();
+  allowed_sock = JoinPath(allowed_dir.path(), "sock");
+  denied_sock = JoinPath(denied_dir.path(), "sock");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SOCK, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SOCK);
+    if (mknod(allowed_sock.c_str(), S_IFSOCK | 0600, 0) != 0) {
+      _exit(kOther);
+    }
+    _exit(ClassifyFs(mknod(denied_sock.c_str(), S_IFSOCK | 0600, 0)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+  EXPECT_THAT(unlink(allowed_sock.c_str()), SyscallSucceeds());
+}
+
 TEST(LandlockV1Test, OpenCreatOfExistingFileNeedsNoMakeReg) {
   SKIP_IF(LandlockAbiVersion() < 1);
 
@@ -1062,6 +1116,27 @@ TEST(LandlockV1Test, BindMountedNamespaceFileIsCheckedLikeAnyFile) {
   }));
   SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, DeviceMknodIntoUnwritableDirIsEaccesBeforeCapability) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds());
+  constexpr uid_t kNobody = 65534;
+  const std::string node = JoinPath(dir.path(), "null");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_CHAR, dir.path(),
+                  LANDLOCK_ACCESS_FS_MAKE_CHAR);
+    if (syscall(SYS_setresuid, kNobody, kNobody, kNobody) != 0) {
+      _exit(kUnsupported);
+    }
+    _exit(ClassifyErrno(mknod(node.c_str(), S_IFCHR | 0600, makedev(1, 3))));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrAcces)
       << "exit status " << status;
 }
 

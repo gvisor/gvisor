@@ -427,14 +427,15 @@ func (fs *filesystem) resolveLocked(ctx context.Context, vfsRP *vfs.ResolvingPat
 
 // doCreateAt checks that creating a file at rp is permitted, then invokes
 // createInRemoteDir (if the parent directory is a real remote directory) or
-// createInSyntheticDir (if the parent directory is synthetic) to do so. For a
-// directory, the checks end with the Landlock check of rp's credentials, which
-// reports EEXIST rather than its denial if the name exists.
+// createInSyntheticDir (if the parent directory is synthetic) to do so. If
+// checkLandlock is not nil, the checks end with checkLandlock(parent), which
+// makes the Landlock check of the creation; if it fails and the name exists,
+// doCreateAt reports EEXIST rather than its error.
 //
 // Preconditions:
 //   - !rp.Done().
 //   - For the final path component in rp, !rp.ShouldFollowSymlink().
-func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, createInRemoteDir func(parent *dentry, name string, ds **[]*dentry) (*dentry, error), createInSyntheticDir func(parent *dentry, name string) (*dentry, error)) error {
+func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, checkLandlock func(parent *dentry) error, createInRemoteDir func(parent *dentry, name string, ds **[]*dentry) (*dentry, error), createInSyntheticDir func(parent *dentry, name string) (*dentry, error)) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
@@ -511,8 +512,8 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if !dir && rp.MustBeDir() {
 		return linuxerr.ENOENT
 	}
-	if dir {
-		if err := rp.CheckLandlockCreate(ctx, &parent.vfsd, linux.ModeDirectory); err != nil {
+	if checkLandlock != nil {
+		if err := checkLandlock(parent); err != nil {
 			// Existence check takes precedence.
 			if existenceErr := checkExistence(); existenceErr != nil {
 				return existenceErr
@@ -848,7 +849,7 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	err := fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
+	err := fs.doCreateAt(ctx, rp, false /* dir */, nil /* checkLandlock */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		if rp.Mount() != vd.Mount() {
 			return nil, linuxerr.EXDEV
 		}
@@ -885,7 +886,9 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 // MkdirAt implements vfs.FilesystemImpl.MkdirAt.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	creds := rp.Credentials()
-	return fs.doCreateAt(ctx, rp, true /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
+	return fs.doCreateAt(ctx, rp, true /* dir */, func(parent *dentry) error {
+		return rp.CheckLandlockCreate(ctx, &parent.vfsd, linux.ModeDirectory)
+	}, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		// If the parent is a setgid directory, use the parent's GID
 		// rather than the caller's and enable setgid.
 		kgid := creds.FilesystemKGID
@@ -936,7 +939,9 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 
 // MknodAt implements vfs.FilesystemImpl.MknodAt.
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
+	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry) error {
+		return rp.CheckLandlockMknod(ctx, &parent.vfsd, &opts)
+	}, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		creds := rp.Credentials()
 		if child, err := parent.mknod(ctx, name, creds, &opts); err == nil {
 			return child, nil
@@ -1846,7 +1851,7 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
+	return fs.doCreateAt(ctx, rp, false /* dir */, nil /* checkLandlock */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		child, err := parent.symlink(ctx, name, target, rp.Credentials())
 		if err != nil {
 			return nil, err
@@ -1991,7 +1996,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

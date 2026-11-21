@@ -2937,6 +2937,25 @@ TEST(MountTest, BindMountNamespaceFileInTree) {
   EXPECT_EQ(st.st_ino, uts_st.st_ino);
 }
 
+TEST(MountTest, DevtmpfsWithoutCapMknod) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(InInitialUserNamespace()));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string null_path = JoinPath(dir.path(), "null");
+  const auto rest = [&] {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_REC | MS_PRIVATE, nullptr));
+    TEST_CHECK_NO_ERRNO(SetCapability(CAP_MKNOD, false));
+    TEST_CHECK_SUCCESS(
+        mount("none", dir.path().c_str(), "devtmpfs", 0, nullptr));
+    struct stat st;
+    TEST_CHECK_SUCCESS(stat(null_path.c_str(), &st));
+    TEST_CHECK(S_ISCHR(st.st_mode));
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
 TEST(MountTest, ReadOnlyBindMountAllowsIoctlOnlyOpen) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 

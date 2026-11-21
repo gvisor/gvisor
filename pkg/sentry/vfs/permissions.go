@@ -209,6 +209,22 @@ func CheckOpenFileType(ftype linux.FileMode, opts *OpenOptions) error {
 	return nil
 }
 
+// CheckMknodCapability returns EPERM if creds may not create a file with opts
+// for lack of capabilities, and nil otherwise. Creating a character or block
+// device needs CAP_MKNOD in the root user namespace, except for a character
+// device with device number 0:0, an overlay whiteout. This matches Linux's
+// fs/namei.c:vfs_mknod().
+func CheckMknodCapability(creds *auth.Credentials, opts *MknodOptions) error {
+	switch ft := opts.Mode.FileType(); ft {
+	case linux.ModeCharacterDevice, linux.ModeBlockDevice:
+		isWhiteout := ft == linux.ModeCharacterDevice && opts.DevMajor == 0 && opts.DevMinor == 0
+		if !isWhiteout && !creds.HasRootCapability(linux.CAP_MKNOD) {
+			return linuxerr.EPERM
+		}
+	}
+	return nil
+}
+
 // MayReadFileWithOpenFlags returns true if a file with the given open flags
 // should be readable.
 func MayReadFileWithOpenFlags(flags uint32) bool {

@@ -515,13 +515,14 @@ const (
 )
 
 // doCreateAt checks that creating a file at rp is permitted, then invokes
-// create to do so. For a directory, the checks end with the Landlock check of
-// rp's credentials, before the parent directory is copied up.
+// create to do so. If checkLandlock is not nil, the checks end with
+// checkLandlock(parent), which makes the Landlock check of the creation,
+// before the parent directory is copied up.
 //
 // Preconditions:
 //   - !rp.Done().
 //   - For the final path component in rp, !rp.ShouldFollowSymlink().
-func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct createType, create func(parent *dentry, name string, haveUpperWhiteout bool, ds **[]*dentry) error) error {
+func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct createType, checkLandlock func(parent *dentry) error, create func(parent *dentry, name string, haveUpperWhiteout bool, ds **[]*dentry) error) error {
 	var ds *[]*dentry
 	fs.renameMu.NestedRLock(fs.renameLockIndex())
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
@@ -573,8 +574,8 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	if ct != createNonDirectory {
-		if err := rp.CheckLandlockCreate(ctx, &parent.vfsd, linux.ModeDirectory); err != nil {
+	if checkLandlock != nil {
+		if err := checkLandlock(parent); err != nil {
 			return err
 		}
 	}
@@ -701,7 +702,7 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, nil /* checkLandlock */, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
 		if rp.Mount() != vd.Mount() {
 			return linuxerr.EXDEV
 		}
@@ -744,7 +745,9 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	if opts.ForSyntheticMountpoint {
 		ct = createSyntheticMountpoint
 	}
-	return fs.doCreateAt(ctx, rp, ct, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
+	return fs.doCreateAt(ctx, rp, ct, func(parent *dentry) error {
+		return rp.CheckLandlockCreate(ctx, &parent.vfsd, linux.ModeDirectory)
+	}, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
 		vfsObj := fs.vfsfs.VirtualFilesystem()
 		pop := vfs.PathOperation{
 			Root:  parent.upperVD,
@@ -803,7 +806,9 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 
 // MknodAt implements vfs.FilesystemImpl.MknodAt.
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
-	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry) error {
+		return rp.CheckLandlockMknod(ctx, &parent.vfsd, &opts)
+	}, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
 		// Disallow attempts to create whiteouts.
 		if opts.Mode&linux.S_IFMT == linux.S_IFCHR && opts.DevMajor == 0 && opts.DevMinor == 0 {
 			return linuxerr.EPERM
@@ -1786,7 +1791,7 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
-	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, nil /* checkLandlock */, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
 		vfsObj := fs.vfsfs.VirtualFilesystem()
 		pop := vfs.PathOperation{
 			Root:  parent.upperVD,
@@ -2224,7 +2229,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

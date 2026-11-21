@@ -471,6 +471,11 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 
 // MknodAt creates a file of the given mode at the given path. It returns an
 // error from the linuxerr package.
+//
+// The caller checks CheckMknodCapability for creds without a Landlock domain.
+// For creds with a domain, the FilesystemImpl checks it, in
+// ResolvingPath.CheckLandlockMknod; MknodAt fails with EPERM, without calling
+// a FilesystemImpl that makes no such check, if creds lack the capability.
 func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *MknodOptions) error {
 	if pop.scoped() {
 		// This method does not support scoped path resolution.
@@ -490,6 +495,12 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 		return linuxerr.EINVAL
 	}
 
+	// capErr is the capability error of a caller with a Landlock domain, which
+	// the FilesystemImpl reports in ResolvingPath.CheckLandlockMknod.
+	var capErr error
+	if LandlockDomainOf(creds) != nil {
+		capErr = CheckMknodCapability(creds, opts)
+	}
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	for {
@@ -499,8 +510,16 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 		if err := rp.checkLandlockGate(LandlockOpMknod, landlockAccessFSForCreate(opts.Mode)); err != nil {
 			return err
 		}
+		if capErr != nil && !rp.landlockChecksOp(LandlockOpMknod) {
+			return capErr
+		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.MknodAt(ctx, rp, *opts)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "MknodAt")
+			if capErr != nil {
+				rp.warnLandlock(ctx, fmt.Sprintf("%T.MknodAt created a file without the caller's capability: %v", rp.mount.fs.impl, capErr))
+			}
 			return nil
 		}
 		if checkInvariants {

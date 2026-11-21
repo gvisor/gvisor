@@ -586,6 +586,9 @@ func (fs *Filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	if err := rp.CheckLandlockMknod(ctx, parent.VFSDentry(), &opts); err != nil {
+		return err
+	}
 	newI, err := parent.inode.NewNode(ctx, pc, opts)
 	if err != nil {
 		return err
@@ -1373,7 +1376,7 @@ func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*Filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

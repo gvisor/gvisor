@@ -120,11 +120,16 @@ func landlockAccessFSForCreate(mode linux.FileMode) uint64 {
 // does not check opens itself, even beneath a rule that allows reading it.
 func (rp *ResolvingPath) checkLandlockGate(op LandlockOps, accessFS uint64) error {
 	dom := LandlockDomainOf(rp.creds)
-	if dom == nil || dom.HandledAccessFS()&accessFS == 0 || rp.mount.IsInternal() {
-		return nil
-	}
-	if c, ok := rp.mount.fs.impl.(LandlockCheckingFilesystemImpl); ok && c.LandlockCheckedOps()&op != 0 {
+	if dom == nil || dom.HandledAccessFS()&accessFS == 0 || rp.mount.IsInternal() || rp.landlockChecksOp(op) {
 		return nil
 	}
 	return linuxerr.EACCES
+}
+
+// landlockChecksOp returns true if the filesystem of rp.Mount() checks the
+// access of path operation op against Landlock domains itself (see
+// LandlockCheckingFilesystemImpl).
+func (rp *ResolvingPath) landlockChecksOp(op LandlockOps) bool {
+	c, ok := rp.mount.fs.impl.(LandlockCheckingFilesystemImpl)
+	return ok && c.LandlockCheckedOps()&op != 0
 }

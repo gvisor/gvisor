@@ -1319,6 +1319,30 @@ TEST(LandlockV1Test, ExecuteInsideAllowedTreeDeniedWithoutExecuteGrant) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, MknodTypesRequireMatchingMakeRights) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  static std::string allowed;
+  allowed = dir.path();
+  static std::string fifo_path;
+  fifo_path = JoinPath(allowed, "fifo");
+  static std::string reg_path;
+  reg_path = JoinPath(allowed, "reg");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_REG,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_FIFO);
+    if (mkfifo(fifo_path.c_str(), 0644) != 0) {
+      _exit(kOther);
+    }
+    int rc = mknod(reg_path.c_str(), S_IFREG | 0644, 0);
+    _exit(rc < 0 && errno == EACCES ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, MakeRegOutsideAllowedTreeDenied) {
   SKIP_IF(LandlockAbiVersion() < 1);
 

@@ -359,6 +359,33 @@ func (rp *ResolvingPath) CheckLandlockCreate(ctx context.Context, parent *Dentry
 	return rp.checkLandlock(ctx, dom, parent, landlockAccessFSForCreate(ftype))
 }
 
+// CheckLandlockMknod makes the checks of mknod(2) with opts in directory
+// parent that a caller with a Landlock domain gets from the filesystem, in
+// this order, and returns the error of the first that fails:
+//
+//  1. The Landlock check of CheckLandlockCreate for the type of the new file,
+//     which fails with EACCES. For example, a socket file needs
+//     LANDLOCK_ACCESS_FS_MAKE_SOCK.
+//  2. The capability check of CheckMknodCapability, which fails with EPERM.
+//
+// A caller without a Landlock domain gets the capability check before path
+// resolution instead, and CheckLandlockMknod makes no check for it. So a
+// caller with a domain that may not create a device node gets EACCES if its
+// domain or the permissions of parent deny it, and EPERM only otherwise.
+//
+// Preconditions: parent is a dentry of rp.Mount()'s filesystem. The caller
+// holds a reference on parent.
+func (rp *ResolvingPath) CheckLandlockMknod(ctx context.Context, parent *Dentry, opts *MknodOptions) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	if err := rp.checkLandlock(ctx, dom, parent, landlockAccessFSForCreate(opts.Mode)); err != nil {
+		return err
+	}
+	return CheckMknodCapability(rp.creds, opts)
+}
+
 // warnIfLandlockUnchecked logs a warning, or panics if invariant checking is
 // enabled, if rp's credentials have a Landlock domain and the FilesystemImpl
 // made no Landlock check while it performed the mutation op through rp.
@@ -366,7 +393,12 @@ func (rp *ResolvingPath) warnIfLandlockUnchecked(ctx context.Context, op string)
 	if rp.flags&rpflagsLandlockChecked != 0 || LandlockDomainOf(rp.creds) == nil {
 		return
 	}
-	msg := fmt.Sprintf("%T.%s succeeded without checking the caller's Landlock domain", rp.mount.fs.impl, op)
+	rp.warnLandlock(ctx, fmt.Sprintf("%T.%s succeeded without checking the caller's Landlock domain", rp.mount.fs.impl, op))
+}
+
+// warnLandlock logs msg as a warning, or panics with msg if invariant checking
+// is enabled.
+func (rp *ResolvingPath) warnLandlock(ctx context.Context, msg string) {
 	if checkInvariants {
 		panic(msg)
 	}

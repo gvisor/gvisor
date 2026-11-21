@@ -326,6 +326,14 @@ func (fs *anonFilesystem) WalkAncestors(d *Dentry, visit func(*Dentry) bool) {
 	visit(d)
 }
 
+// LandlockCheckedOps implements LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+// anonfs performs none of the path operations that Landlock checks, so it
+// declares all of them.
+func (fs *anonFilesystem) LandlockCheckedOps() LandlockOps {
+	return LandlockOpOpen | LandlockOpMkdir | LandlockOpMknod | LandlockOpSymlink |
+		LandlockOpUnlink | LandlockOpRmdir | LandlockOpLink | LandlockOpRename
+}
+
 // PrependPath implements FilesystemImpl.PrependPath.
 func (fs *anonFilesystem) PrependPath(ctx context.Context, vfsroot, vd VirtualDentry, b *fspath.Builder) error {
 	b.PrependComponent(fmt.Sprintf("anon_inode:%s", vd.dentry.impl.(*anonDentry).name))
