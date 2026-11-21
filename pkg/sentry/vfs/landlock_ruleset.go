@@ -32,11 +32,6 @@ import (
 //
 // +stateify savable
 type LandlockRuleset struct {
-	// vfs is the VirtualFilesystem that counts the ruleset among its live
-	// Landlock rulesets and domains (see VirtualFilesystem.landlockLive), until
-	// Release. vfs is immutable.
-	vfs *VirtualFilesystem
-
 	// handledAccessFS is the set of filesystem rights that the ruleset
 	// handles. handledAccessFS is immutable.
 	handledAccessFS uint64
@@ -52,10 +47,8 @@ type LandlockRuleset struct {
 
 // NewLandlockRuleset creates a new LandlockRuleset handling the filesystem
 // rights in handledAccessFS.
-func (vfs *VirtualFilesystem) NewLandlockRuleset(handledAccessFS uint64) *LandlockRuleset {
-	vfs.landlockLive.Add(1)
+func (*VirtualFilesystem) NewLandlockRuleset(handledAccessFS uint64) *LandlockRuleset {
 	return &LandlockRuleset{
-		vfs:             vfs,
 		handledAccessFS: handledAccessFS,
 		rules:           make(map[*LandlockObject]uint64),
 	}
@@ -89,7 +82,6 @@ func (r *LandlockRuleset) Release(ctx context.Context) {
 	for obj := range rules {
 		obj.DecRef(ctx)
 	}
-	r.vfs.landlockLive.Add(-1)
 }
 
 // LandlockRulesetFD implements FileDescriptionImpl for an anonymous

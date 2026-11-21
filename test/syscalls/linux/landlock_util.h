@@ -35,6 +35,8 @@
 #include <cstring>
 #include <string>
 
+#include "test/util/save_util.h"
+
 namespace gvisor {
 namespace testing {
 
@@ -192,6 +194,7 @@ inline void EnforceOrDie(int ruleset_fd) {
     _exit(kSetup);
   }
   close(ruleset_fd);
+  MaybeSave();
 }
 
 inline void ApplyFsPolicy(uint64_t handled_access,

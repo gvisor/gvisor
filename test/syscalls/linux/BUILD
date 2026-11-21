@@ -1500,6 +1500,7 @@ cc_library(
     name = "landlock_util",
     testonly = 1,
     hdrs = ["landlock_util.h"],
+    deps = ["//test/util:save_util"],
 )
 
 cc_binary(
@@ -1527,6 +1528,24 @@ cc_binary(
         "//test/util:thread_util",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+    ],
+)
+
+cc_binary(
+    name = "landlock_v1_fuse_test",
+    testonly = 1,
+    srcs = ["landlock_v1_fuse.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:fs_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:save_util",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
     ],
 )
 

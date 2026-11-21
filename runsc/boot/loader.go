@@ -860,7 +860,6 @@ func New(args Args) (*Loader, error) {
 		NvidiaDriverVersion: args.NvidiaDriverVersion,
 		AllowSUID:           args.Conf.AllowSUID,
 		IOUringEnabled:      args.Conf.IOUring,
-		LandlockEnabled:     args.Conf.Landlock == config.LandlockEnabled,
 	}
 
 	// Create memory file.

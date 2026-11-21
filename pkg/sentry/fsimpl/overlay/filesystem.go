@@ -2296,6 +2296,15 @@ func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
 		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink | vfs.LandlockOpRename
 }
 
+// LandlockDetachDeletedOnSave implements
+// vfs.LandlockDetachingFilesystemImpl.LandlockDetachDeletedOnSave. An overlay
+// file keeps its layer files alive, so an overlay cannot save a deleted file
+// if any of its layers cannot. For example, the root filesystem overlay of a
+// container, whose lower layer is a gofer filesystem, returns true.
+func (fs *filesystem) LandlockDetachDeletedOnSave() bool {
+	return fs.landlockDetachDeleted
+}
+
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
 func (fs *filesystem) WalkAncestors(d *vfs.Dentry, visit func(*vfs.Dentry) bool) {
 	genericWalkAncestors(fs, d.Impl().(*dentry), visit)

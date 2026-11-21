@@ -2042,6 +2042,14 @@ func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
 		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink | vfs.LandlockOpRename
 }
 
+// LandlockDetachDeletedOnSave implements
+// vfs.LandlockDetachingFilesystemImpl.LandlockDetachDeletedOnSave. A gofer
+// filesystem can save a deleted file only while an open file description
+// keeps it alive.
+func (*filesystem) LandlockDetachDeletedOnSave() bool {
+	return true
+}
+
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
 func (fs *filesystem) WalkAncestors(d *vfs.Dentry, visit func(*vfs.Dentry) bool) {
 	genericWalkAncestors(fs, d.Impl().(*dentry), visit)

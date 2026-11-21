@@ -174,11 +174,6 @@ type VirtualFilesystem struct {
 	// The low 32 bits store the number of currently in-progress renames
 	// VFS-wide.
 	renameState atomicbitops.Uint64
-
-	// landlockLive is the number of Landlock rulesets and domains that have
-	// not been released. Checkpoints fail while it is not zero, since their
-	// state cannot be saved.
-	landlockLive atomicbitops.Int64 `state:"nosave"`
 }
 
 const renameInProgressMask = 1<<32 - 1

@@ -176,6 +176,11 @@ type filesystem struct {
 	// copyUpWriteDir. The filesystem holds a reference on landlockWorkDir if
 	// landlockWorkDir.Ok(). landlockWorkDir is immutable.
 	landlockWorkDir vfs.VirtualDentry
+
+	// landlockDetachDeleted is the result of LandlockDetachDeletedOnSave: true
+	// if the filesystem of any layer detaches the LandlockObjects of deleted
+	// files before a checkpoint. landlockDetachDeleted is immutable.
+	landlockDetachDeleted bool
 }
 
 func layerStackDepth(vd vfs.VirtualDentry) int {
@@ -474,6 +479,12 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		maxFilenameLen:  linux.NAME_MAX,
 		stackDepth:      stackDepth,
 		creatorLandlock: creatorLandlock,
+	}
+	if fsopts.UpperRoot.Ok() {
+		fs.landlockDetachDeleted = layerDetachesDeleted(fsopts.UpperRoot)
+	}
+	for _, lowerRoot := range fsopts.LowerRoots {
+		fs.landlockDetachDeleted = fs.landlockDetachDeleted || layerDetachesDeleted(lowerRoot)
 	}
 	if creatorLandlock != nil {
 		creatorLandlock.IncRef()
@@ -1086,6 +1097,14 @@ func layerIdentifiesFilesByInode(layer vfs.VirtualDentry) bool {
 	default:
 		return false
 	}
+}
+
+// layerDetachesDeleted returns true if the filesystem of layer detaches the
+// LandlockObjects of deleted files before a checkpoint; see
+// vfs.LandlockDetachingFilesystemImpl.
+func layerDetachesDeleted(layer vfs.VirtualDentry) bool {
+	ext, ok := layer.Mount().Filesystem().Impl().(vfs.LandlockDetachingFilesystemImpl)
+	return ok && ext.LandlockDetachDeletedOnSave()
 }
 
 // checkLayerAccess returns nil if fs.creatorLandlock allows the filesystem

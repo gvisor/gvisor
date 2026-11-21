@@ -49,11 +49,6 @@ type LandlockDomain struct {
 	// increases again after that.
 	refs atomicbitops.Int64
 
-	// vfs is the VirtualFilesystem that counts the domain among its live
-	// Landlock rulesets and domains (see VirtualFilesystem.landlockLive),
-	// until refs reaches zero. vfs is immutable.
-	vfs *VirtualFilesystem
-
 	// parent is the domain that this domain was stacked onto, or nil. Only
 	// parent's identity is used, for ptrace scoping (CanPtrace); parent may
 	// have been released, and holds no references on its objects then.
@@ -122,10 +117,8 @@ func StackLandlockDomain(parent *LandlockDomain, ruleset *LandlockRuleset) (*Lan
 		})
 	}
 
-	ruleset.vfs.landlockLive.Add(1)
 	return &LandlockDomain{
 		refs:            atomicbitops.FromInt64(1),
-		vfs:             ruleset.vfs,
 		parent:          parent,
 		handledAccessFS: handled,
 		rules:           rules,
@@ -174,7 +167,6 @@ func (d *LandlockDomain) DecRef(ctx context.Context) {
 	for obj := range d.rules {
 		obj.DecRef(ctx)
 	}
-	d.vfs.landlockLive.Add(-1)
 }
 
 // CheckMountChange returns EPERM if d does not allow its task to change the

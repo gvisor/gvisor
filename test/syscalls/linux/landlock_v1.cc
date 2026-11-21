@@ -1830,6 +1830,32 @@ TEST(LandlockV1Test, OverlayOfLandlockedCreatorIsNotCheckedInItsLayers) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, RuleOnUnlinkedTmpfsFileSurvivesCheckpoint) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const TempPath mnt_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", mnt_dir.path().c_str(), "tmpfs", 0, nullptr) ==
+                0);
+    const std::string target = JoinPath(mnt_dir.path(), "f");
+    int fd = open(target.c_str(), O_CREAT | O_RDWR, 0644);
+    TEST_PCHECK(fd >= 0);
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
+                  target,
+                  LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE);
+    TEST_PCHECK(unlink(target.c_str()) == 0);
+    MaybeSave();
+    const std::string proc_path = "/proc/self/fd/" + std::to_string(fd);
+    _exit(ClassifyFs(open(proc_path.c_str(), O_RDWR)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, ExecveatOfOpathDescriptorRequiresExecute) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(access("/bin/sh", X_OK) != 0);
@@ -2944,6 +2970,30 @@ TEST(LandlockV1Test, BindMountsOfOneNamespaceFileAreOneFile) {
     _exit(TryReadOpen(second.path()));
   }));
   SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RuleOnHardLinkSurvivesCheckpointAfterOtherLinkRemoved) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  static std::string first;
+  first = file.release();
+  static std::string second;
+  second = JoinPath(dir.path(), "second");
+  ASSERT_THAT(link(first.c_str(), second.c_str()), SyscallSucceeds());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, second,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    if (unlink(first.c_str()) != 0) {
+      _exit(kSetup);
+    }
+    MaybeSave();
+    _exit(TryReadOpen(second));
+  }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }

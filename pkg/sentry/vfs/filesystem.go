@@ -45,16 +45,17 @@ type Filesystem struct {
 	fsType FilesystemType
 
 	// landlockMu serializes creating, releasing and detaching the
-	// LandlockObjects of files on this filesystem.
+	// LandlockObjects of files on this filesystem. Dentry.mu may be locked
+	// with landlockMu locked.
 	landlockMu sync.Mutex `state:"nosave"`
 
 	// landlockObjects contains every live LandlockObject of a file on this
 	// filesystem. landlockObjects is protected by landlockMu.
-	landlockObjects map[*LandlockObject]struct{} `state:"nosave"`
+	landlockObjects map[*LandlockObject]struct{}
 
 	// landlockDetached is true once detachLandlockObjects has run.
 	// landlockDetached is protected by landlockMu.
-	landlockDetached bool `state:"nosave"`
+	landlockDetached bool
 
 	// impl is the FilesystemImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in Dentry.

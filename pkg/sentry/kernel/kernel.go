@@ -482,10 +482,6 @@ type Kernel struct {
 	// IOUringEnabled determines if io_uring is enabled.
 	IOUringEnabled bool
 
-	// LandlockEnabled determines if the Landlock syscalls are available. If
-	// false, they fail with ENOSYS. LandlockEnabled is immutable.
-	LandlockEnabled bool
-
 	// MaxKeySetSize is the maximum number of keys in a key set.
 	MaxKeySetSize atomicbitops.Int32
 

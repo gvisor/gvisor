@@ -898,6 +898,7 @@ TEST(LandlockV1Test, RulesAddedAfterEnforcementNeverWiden) {
           landlock_restrict_self(fd, 0) != 0) {
         _exit(kSetup);
       }
+      MaybeSave();
     };
     auto check = [&l] {
       ExpectOpen(l.file1_s1d1, O_WRONLY, EACCES);
