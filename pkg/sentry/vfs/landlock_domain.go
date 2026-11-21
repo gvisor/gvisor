@@ -390,6 +390,55 @@ func (rp *ResolvingPath) CheckLandlockLink(ctx context.Context, newParent *Dentr
 	return nil
 }
 
+// CheckLandlockRename checks the rename of a file of renamedType's type from
+// directory oldParent to directory newParent against the Landlock domain of
+// rp's credentials, and returns EACCES if the domain denies it. replacedType
+// is the type of the file at the new name, which the rename replaces, or
+// exchanges with if flags contains RENAME_EXCHANGE; it is 0 if the new name is
+// free.
+//
+// Without RENAME_EXCHANGE, oldParent needs the right to remove the renamed
+// file, and newParent needs the right to create it and, if a file is replaced,
+// the right to remove that file. With RENAME_EXCHANGE, each parent needs the
+// rights to remove the file that leaves it and to create the file that enters
+// it. If oldParent is newParent, the union of these rights is checked on it.
+//
+// As for CheckLandlockLink, Landlock ABI v1 has no right that allows a file to
+// change its parent directory: if oldParent is not newParent, the rename fails
+// with EXDEV for every caller with a domain, once both parents grant their
+// rights. For example, renaming a regular file within one directory needs
+// LANDLOCK_ACCESS_FS_REMOVE_FILE and LANDLOCK_ACCESS_FS_MAKE_REG on it, while
+// moving it into another directory fails with EACCES if either right is
+// denied, and with EXDEV otherwise.
+//
+// Preconditions: oldParent and newParent are dentries of rp.Mount()'s
+// filesystem. The caller holds references on them. flags does not contain
+// RENAME_EXCHANGE if replacedType is 0.
+func (rp *ResolvingPath) CheckLandlockRename(ctx context.Context, oldParent, newParent *Dentry, renamedType, replacedType linux.FileMode, flags uint32) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	oldAccessFS := landlockAccessFSForRemove(renamedType)
+	newAccessFS := landlockAccessFSForCreate(renamedType)
+	if replacedType != 0 {
+		newAccessFS |= landlockAccessFSForRemove(replacedType)
+		if flags&linux.RENAME_EXCHANGE != 0 {
+			oldAccessFS |= landlockAccessFSForCreate(replacedType)
+		}
+	}
+	if oldParent == newParent {
+		return rp.checkLandlock(ctx, dom, oldParent, oldAccessFS|newAccessFS)
+	}
+	if err := rp.checkLandlock(ctx, dom, oldParent, oldAccessFS); err != nil {
+		return err
+	}
+	if err := rp.checkLandlock(ctx, dom, newParent, newAccessFS); err != nil {
+		return err
+	}
+	return linuxerr.EXDEV
+}
+
 // CheckLandlockMknod makes the checks of mknod(2) with opts in directory
 // parent that a caller with a Landlock domain gets from the filesystem, in
 // this order, and returns the error of the first that fails:

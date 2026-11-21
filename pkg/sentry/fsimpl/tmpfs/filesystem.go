@@ -649,10 +649,21 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 	replaced, ok := newParentDir.childMap[newName]
+	if ok && opts.Flags&linux.RENAME_NOREPLACE != 0 {
+		return linuxerr.EEXIST
+	}
+	if !ok && exchange {
+		// RENAME_EXCHANGE requires that the target file exist.
+		return linuxerr.ENOENT
+	}
+	var replacedType linux.FileMode
 	if ok {
-		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
-			return linuxerr.EEXIST
-		}
+		replacedType = linux.FileMode(replaced.inode.mode.Load())
+	}
+	if err := rp.CheckLandlockRename(ctx, &oldParentDir.dentry.vfsd, &newParentDir.dentry.vfsd, linux.FileMode(renamed.inode.mode.Load()), replacedType, opts.Flags); err != nil {
+		return err
+	}
+	if ok {
 		if err := newParentDir.mayDelete(rp.Credentials(), replaced); err != nil {
 			return err
 		}
@@ -697,14 +708,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 				return linuxerr.ENOTDIR
 			}
 		}
-	} else {
-		if exchange {
-			// RENAME_EXCHANGE requires that the target file exist.
-			return linuxerr.ENOENT
-		}
-		if renamed.inode.isDir() && newParentDir.inode.nlink.Load() == maxLinks {
-			return linuxerr.EMLINK
-		}
+	} else if renamed.inode.isDir() && newParentDir.inode.nlink.Load() == maxLinks {
+		return linuxerr.EMLINK
 	}
 	// tmpfs never calls VFS.InvalidateDentry(), so oldParentDir.dentry and
 	// newParentDir.dentry can only be dead if they were deleted.
@@ -1142,7 +1147,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
 	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
-		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink | vfs.LandlockOpRename
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

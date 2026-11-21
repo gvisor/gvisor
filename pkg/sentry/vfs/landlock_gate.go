@@ -105,6 +105,16 @@ func landlockAccessFSForCreate(mode linux.FileMode) uint64 {
 	}
 }
 
+// landlockAccessFSForRemove returns the filesystem right that removing a file
+// of mode's type from its directory needs: LANDLOCK_ACCESS_FS_REMOVE_DIR for a
+// directory, and LANDLOCK_ACCESS_FS_REMOVE_FILE for any other file.
+func landlockAccessFSForRemove(mode linux.FileMode) uint64 {
+	if mode.FileType() == linux.ModeDirectory {
+		return linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
+	}
+	return linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
+}
+
 // checkLandlockGate returns EACCES if VFS must refuse to hand path operation
 // op, which may need the filesystem rights in accessFS, to the filesystem of
 // rp.Mount(), and nil otherwise. VFS refuses it if rp's Landlock domain

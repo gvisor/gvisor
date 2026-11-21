@@ -927,6 +927,19 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if dst == nil {
 			panic(fmt.Sprintf("Child %q for parent Dentry %+v disappeared inside atomic section?", newName, dstDir))
 		}
+	default:
+		return err
+	}
+
+	var dstType linux.FileMode
+	if dst != nil {
+		dstType = dst.inode.Mode()
+	}
+	if err := rp.CheckLandlockRename(ctx, srcDirVFSD, dstDir.VFSDentry(), src.inode.Mode(), dstType, opts.Flags); err != nil {
+		return err
+	}
+
+	if dst != nil {
 		if fs.NoNegativeDentries {
 			// vfs_rename succeeds for the same inode before may_delete.
 			if src.inode == dst.inode {
@@ -948,8 +961,6 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		); err != nil {
 			return err
 		}
-	default:
-		return err
 	}
 
 	if srcDir == dstDir && oldName == newName {
@@ -1419,7 +1430,7 @@ func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*Filesystem) LandlockCheckedOps() vfs.LandlockOps {
 	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
-		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink | vfs.LandlockOpRename
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

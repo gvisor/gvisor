@@ -1601,11 +1601,22 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
 		return err
 	}
+	if replaced != nil && opts.Flags&linux.RENAME_NOREPLACE != 0 {
+		return linuxerr.EEXIST
+	}
+	if replaced == nil && exchange {
+		// RENAME_EXCHANGE requires that the target file exist.
+		return linuxerr.ENOENT
+	}
+	var replacedType linux.FileMode
+	if replaced != nil {
+		replacedType = linux.FileMode(replaced.inode.fileType())
+	}
+	if err := rp.CheckLandlockRename(ctx, &oldParent.vfsd, &newParent.vfsd, linux.FileMode(renamed.inode.fileType()), replacedType, opts.Flags); err != nil {
+		return err
+	}
 	var replacedVFSD *vfs.Dentry
 	if replaced != nil {
-		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
-			return linuxerr.EEXIST
-		}
 		if err := newParent.mayDelete(creds, replaced); err != nil {
 			return err
 		}
@@ -1640,11 +1651,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			if rp.MustBeDir() || renamed.isDir() {
 				return linuxerr.ENOTDIR
 			}
-		}
-	} else { // replaced == nil
-		if exchange {
-			// RENAME_EXCHANGE requires that the target file exist.
-			return linuxerr.ENOENT
 		}
 	}
 
@@ -2023,7 +2029,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
 	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
-		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink | vfs.LandlockOpRename
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

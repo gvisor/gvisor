@@ -729,8 +729,10 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 			oldParentVD.DecRef(ctx)
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.RenameAt(ctx, rp, oldParentVD, oldName, renameOpts)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "RenameAt")
 			oldParentVD.DecRef(ctx)
 			return nil
 		}
