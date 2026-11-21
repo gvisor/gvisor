@@ -1590,6 +1590,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		if err != nil {
 			return err
 		}
+		if conf.CPUNum > 0 {
+			cpuNum = conf.CPUNum
+		}
 		cmd.Args = append(cmd.Args, "--cpu-num", strconv.Itoa(cpuNum))
 		if s.CPULimits != nil {
 			cmd.Args = append(cmd.Args, "--lifecycle-cpu-num", strconv.Itoa(s.CPULimits.lifecycleCPUNum(cgCPUNum)))
@@ -1609,6 +1612,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		if memLimit < mem {
 			mem = memLimit
 		}
+	} else if conf.CPUNum > 0 {
+		cmd.Args = append(cmd.Args, "--cpu-num", strconv.Itoa(conf.CPUNum))
 	}
 	cmd.Args = append(cmd.Args, "--total-memory", strconv.FormatUint(mem, 10))
 
