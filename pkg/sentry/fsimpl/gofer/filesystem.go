@@ -427,10 +427,12 @@ func (fs *filesystem) resolveLocked(ctx context.Context, vfsRP *vfs.ResolvingPat
 
 // doCreateAt checks that creating a file at rp is permitted, then invokes
 // createInRemoteDir (if the parent directory is a real remote directory) or
-// createInSyntheticDir (if the parent directory is synthetic) to do so. If
-// checkLandlock is not nil, the checks end with checkLandlock(parent), which
-// makes the Landlock check of the creation; if it fails and the name exists,
-// doCreateAt reports EEXIST rather than its error.
+// createInSyntheticDir (if the parent directory is synthetic) to do so. The
+// checks end with checkLandlock(parent), which makes the last checks of the
+// creation, such as its Landlock check; if it fails and the name exists,
+// doCreateAt reports EEXIST rather than its error, for every caller. For
+// example, a link onto an existing name fails with EEXIST rather than with
+// the EPERM of the protected-hard-link check.
 //
 // Preconditions:
 //   - !rp.Done().
@@ -512,14 +514,12 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if !dir && rp.MustBeDir() {
 		return linuxerr.ENOENT
 	}
-	if checkLandlock != nil {
-		if err := checkLandlock(parent); err != nil {
-			// Existence check takes precedence.
-			if existenceErr := checkExistence(); existenceErr != nil {
-				return existenceErr
-			}
-			return err
+	if err := checkLandlock(parent); err != nil {
+		// Existence check takes precedence.
+		if existenceErr := checkExistence(); existenceErr != nil {
+			return existenceErr
 		}
+		return err
 	}
 	if parent.inode.isSynthetic() {
 		if createInSyntheticDir == nil {
@@ -867,25 +867,18 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	mayLink := func(d *dentry) error {
-		gid := auth.KGID(d.inode.gid.Load())
-		uid := auth.KUID(d.inode.uid.Load())
-		mode := linux.FileMode(d.inode.mode.Load())
-		return vfs.MayLink(rp.Credentials(), mode, nil, uid, gid)
-	}
 	err := fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry) error {
-		// Paths on different mounts fail with EXDEV below, without a
-		// Landlock check. A caller without a Landlock domain gets the
-		// protected-hard-link check below, where EEXIST does not take
-		// precedence over it.
-		if rp.Mount() != vd.Mount() || vfs.LandlockDomainOf(rp.Credentials()) == nil {
+		// Paths on different mounts fail with EXDEV below, without these
+		// checks.
+		if rp.Mount() != vd.Mount() {
 			return nil
 		}
 		d := vd.Dentry().Impl().(*dentry)
-		if err := mayLink(d); err != nil {
+		mode := linux.FileMode(d.inode.mode.Load())
+		if err := vfs.MayLink(rp.Credentials(), mode, nil, auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load())); err != nil {
 			return err
 		}
-		return rp.CheckLandlockLink(ctx, &parent.vfsd, linux.FileMode(d.inode.mode.Load()), d.parent.Load() == parent)
+		return rp.CheckLandlockLink(ctx, &parent.vfsd, mode, d.parent.Load() == parent)
 	}, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		if rp.Mount() != vd.Mount() {
 			return nil, linuxerr.EXDEV
@@ -893,9 +886,6 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		d := vd.Dentry().Impl().(*dentry)
 		if d.isDir() {
 			return nil, linuxerr.EPERM
-		}
-		if err := mayLink(d); err != nil {
-			return nil, err
 		}
 		if d.inode.nlink.Load() == 0 {
 			return nil, linuxerr.ENOENT

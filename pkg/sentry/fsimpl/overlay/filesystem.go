@@ -515,9 +515,9 @@ const (
 )
 
 // doCreateAt checks that creating a file at rp is permitted, then invokes
-// create to do so. If checkLandlock is not nil, the checks end with
-// checkLandlock(parent), which makes the Landlock check of the creation,
-// before the parent directory is copied up.
+// create to do so. The checks end with checkLandlock(parent), which makes the
+// last checks of the creation, such as its Landlock check, before the parent
+// directory is copied up.
 //
 // Preconditions:
 //   - !rp.Done().
@@ -574,10 +574,8 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	if checkLandlock != nil {
-		if err := checkLandlock(parent); err != nil {
-			return err
-		}
+	if err := checkLandlock(parent); err != nil {
+		return err
 	}
 	// Ensure that the parent directory is copied-up so that we can create the
 	// new file in the upper layer.

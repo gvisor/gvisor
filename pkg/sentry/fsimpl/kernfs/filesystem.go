@@ -497,9 +497,6 @@ func (fs *Filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 	}
 	d := vd.Dentry().Impl().(*Dentry)
 	inode := d.Inode()
-	if inode.Mode().IsDir() {
-		return linuxerr.EPERM
-	}
 	if err := vfs.MayLink(rp.Credentials(), inode.Mode(), nil, inode.UID(), inode.GID()); err != nil {
 		return err
 	}
@@ -518,6 +515,9 @@ func (fs *Filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 	defer rp.Mount().EndWrite()
 	if err := rp.CheckLandlockLink(ctx, parent.VFSDentry(), inode.Mode(), d.parent.Load() == parent); err != nil {
 		return err
+	}
+	if inode.Mode().IsDir() {
+		return linuxerr.EPERM
 	}
 
 	childI, err := parent.inode.NewLink(ctx, pc, inode)

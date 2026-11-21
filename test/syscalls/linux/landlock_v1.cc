@@ -1315,6 +1315,22 @@ TEST(LandlockV1Test, UnlinkKernfsTrailingSlashReportsEisdirNotEacces) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, LinkOfProcDirectoryUnderDomainIsExdevNotEperm) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const int control =
+      ClassifyErrno(link("/proc/self/task", "/proc/landlock_test_link"));
+  SKIP_IF(control != kErrPerm && control != kErrNoent);
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyErrno(link("/proc/self/task", "/proc/landlock_test_link")));
+  }));
+  const int want = control == kErrNoent ? kErrNoent : kErrExdev;
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == want)
+      << "exit status " << status << " want " << want;
+}
+
 TEST(LandlockV1Test, UnlinkOnReadOnlyMountReportsErofsNotEacces) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
