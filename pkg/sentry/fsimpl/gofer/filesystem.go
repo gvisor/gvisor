@@ -649,6 +649,22 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		return linuxerr.ENOTDIR
 	}
 
+	if vfs.LandlockDomainOf(rp.Credentials()) != nil {
+		// Look the child up before the Landlock check, so that a missing
+		// child fails with ENOENT rather than with the denial. Callers
+		// without a domain do not pay for the lookup.
+		if _, err := fs.getChildLocked(ctx, parent, name, &ds); err != nil {
+			return err
+		}
+		removeAccessFS := uint64(linux.LANDLOCK_ACCESS_FS_REMOVE_FILE)
+		if dir {
+			removeAccessFS = linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
+		}
+		if err := rp.CheckLandlock(ctx, &parent.vfsd, removeAccessFS); err != nil {
+			return err
+		}
+	}
+
 	// Load child if sticky bit is set because we need to determine whether
 	// deletion is allowed.
 	var child *dentry
@@ -1998,7 +2014,8 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

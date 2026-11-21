@@ -1167,6 +1167,34 @@ TEST(LandlockV1Test, RuleOnBindMountRootReachesDisconnectedDirectory) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, RuleDiesWithTheFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  static std::string target;
+  target = file.release();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, target,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    if (TryReadOpen(target) != kAllowed) {
+      _exit(kSetup);
+    }
+    if (unlink(target.c_str()) != 0) {
+      _exit(kSetup);
+    }
+    int fd = open(target.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    close(fd);
+    _exit(TryReadOpen(target));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, RelativePathsAreEnforced) {
   SKIP_IF(LandlockAbiVersion() < 1);
 
@@ -1316,6 +1344,86 @@ TEST(LandlockV1Test, ExecuteInsideAllowedTreeDeniedWithoutExecuteGrant) {
     _exit(errno == EACCES ? kDenied : kOther);
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveDirOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    _exit(ClassifyFs(rmdir(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveDirInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath inside_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(allowed_dir.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside_dir.release();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    _exit(ClassifyFs(rmdir(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveFileOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyFs(unlink(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveFileInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath inside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed_dir.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.release();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyFs(unlink(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }
 

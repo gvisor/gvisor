@@ -1530,16 +1530,20 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	parent.dirMu.NestedLock(parentDirIdx)
 	defer parent.dirMu.NestedUnlock(parentDirIdx)
 
-	// Ensure that parent is copied-up before potentially holding child.copyMu
-	// below.
-	if err := parent.copyUpLocked(ctx); err != nil {
+	// We need a dentry representing the child directory being removed in order
+	// to verify that it's empty. Look it up before copying the parent up, so
+	// that a failed removal does not copy it up.
+	child, _, err := fs.getChildLocked(ctx, parent, name, &ds)
+	if err != nil {
+		return err
+	}
+	if err := rp.CheckLandlock(ctx, &parent.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR); err != nil {
 		return err
 	}
 
-	// We need a dentry representing the child directory being removed in order
-	// to verify that it's empty.
-	child, _, err := fs.getChildLocked(ctx, parent, name, &ds)
-	if err != nil {
+	// Ensure that parent is copied-up before potentially holding child.copyMu
+	// below.
+	if err := parent.copyUpLocked(ctx); err != nil {
 		return err
 	}
 	if !child.isDir() {
@@ -1867,16 +1871,20 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return linuxerr.ENOTDIR
 	}
 
-	// Ensure that parent is copied-up before potentially holding child.copyMu
-	// below.
-	if err := parent.copyUpLocked(ctx); err != nil {
+	// We need a dentry representing the child being removed in order to verify
+	// that it's not a directory. Look it up before copying the parent up, so
+	// that a failed removal does not copy it up.
+	child, _, err := fs.getChildLocked(ctx, parent, name, &ds)
+	if err != nil {
+		return err
+	}
+	if err := rp.CheckLandlock(ctx, &parent.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
 		return err
 	}
 
-	// We need a dentry representing the child being removed in order to verify
-	// that it's not a directory.
-	child, _, err := fs.getChildLocked(ctx, parent, name, &ds)
-	if err != nil {
+	// Ensure that parent is copied-up before potentially holding child.copyMu
+	// below.
+	if err := parent.copyUpLocked(ctx); err != nil {
 		return err
 	}
 	if child.isDir() {
@@ -2231,7 +2239,8 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

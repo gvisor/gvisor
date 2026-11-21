@@ -773,8 +773,10 @@ func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentia
 		if err := rp.checkLandlockGate(LandlockOpRmdir, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.RmdirAt(ctx, rp)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "RmdirAt")
 			return nil
 		}
 		if checkInvariants {
@@ -938,8 +940,10 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
 		if err := rp.checkLandlockGate(LandlockOpUnlink, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.UnlinkAt(ctx, rp)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "UnlinkAt")
 			return nil
 		}
 		if checkInvariants {

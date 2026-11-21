@@ -517,8 +517,10 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	// erofs is read-only, so it never performs mkdir, mknod or symlink.
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink
+	// erofs is read-only, so it never performs mkdir, mknod, symlink, unlink
+	// or rmdir.
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

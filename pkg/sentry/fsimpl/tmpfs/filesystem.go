@@ -818,6 +818,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if !ok {
 		return linuxerr.ENOENT
 	}
+	if err := rp.CheckLandlock(ctx, &parentDir.dentry.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR); err != nil {
+		return err
+	}
 	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
 		return err
 	}
@@ -954,6 +957,9 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	child, ok := parentDir.childMap[name]
 	if !ok {
 		return linuxerr.ENOENT
+	}
+	if err := rp.CheckLandlock(ctx, &parentDir.dentry.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
+		return err
 	}
 	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
 		return err
@@ -1128,7 +1134,8 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
