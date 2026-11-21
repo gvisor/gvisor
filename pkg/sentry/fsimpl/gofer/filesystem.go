@@ -427,7 +427,9 @@ func (fs *filesystem) resolveLocked(ctx context.Context, vfsRP *vfs.ResolvingPat
 
 // doCreateAt checks that creating a file at rp is permitted, then invokes
 // createInRemoteDir (if the parent directory is a real remote directory) or
-// createInSyntheticDir (if the parent directory is synthetic) to do so.
+// createInSyntheticDir (if the parent directory is synthetic) to do so. For a
+// directory, the checks end with the Landlock check of rp's credentials, which
+// reports EEXIST rather than its denial if the name exists.
 //
 // Preconditions:
 //   - !rp.Done().
@@ -508,6 +510,15 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	}
 	if !dir && rp.MustBeDir() {
 		return linuxerr.ENOENT
+	}
+	if dir {
+		if err := rp.CheckLandlockCreate(ctx, &parent.vfsd, linux.ModeDirectory); err != nil {
+			// Existence check takes precedence.
+			if existenceErr := checkExistence(); existenceErr != nil {
+				return existenceErr
+			}
+			return err
+		}
 	}
 	if parent.inode.isSynthetic() {
 		if createInSyntheticDir == nil {
@@ -1980,7 +1991,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

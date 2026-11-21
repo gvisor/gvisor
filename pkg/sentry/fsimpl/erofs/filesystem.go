@@ -517,7 +517,8 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen
+	// erofs is read-only, so it never performs mkdir.
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

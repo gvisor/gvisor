@@ -452,8 +452,10 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 		if err := rp.checkLandlockGate(LandlockOpMkdir, linux.LANDLOCK_ACCESS_FS_MAKE_DIR); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.MkdirAt(ctx, rp, *opts)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "MkdirAt")
 			return nil
 		}
 		if checkInvariants {
@@ -494,7 +496,7 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
 			return err
 		}
-		if err := rp.checkLandlockGate(LandlockOpMknod, landlockMknodAccessFS(opts.Mode)); err != nil {
+		if err := rp.checkLandlockGate(LandlockOpMknod, landlockAccessFSForCreate(opts.Mode)); err != nil {
 			return err
 		}
 		err := rp.mount.fs.impl.MknodAt(ctx, rp, *opts)

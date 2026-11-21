@@ -15,6 +15,8 @@
 package vfs
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -325,7 +327,8 @@ func (d *LandlockDomain) CheckParentlessFileAccessFS(ctx context.Context, file *
 // If rp's credentials have a Landlock domain, CheckLandlock also records in rp
 // that the FilesystemImpl made a Landlock check, whatever its result. VFS
 // refuses an open that succeeds without such a check (see
-// VirtualFilesystem.OpenAt).
+// VirtualFilesystem.OpenAt), and warns about a checked mutation, such as
+// mkdir, that succeeds without one (see warnIfLandlockUnchecked).
 //
 // Preconditions: d is a dentry of rp.Mount()'s filesystem. The caller holds a
 // reference on d.
@@ -335,6 +338,39 @@ func (rp *ResolvingPath) CheckLandlock(ctx context.Context, d *Dentry, reqAccess
 		return nil
 	}
 	return rp.checkLandlock(ctx, dom, d, reqAccessFS)
+}
+
+// CheckLandlockCreate checks the creation of a file of ftype's type in
+// directory parent against the Landlock domain of rp's credentials, as
+// ResolvingPath.CheckLandlock does. The creation needs the right for the new
+// file's type on parent: for example, LANDLOCK_ACCESS_FS_MAKE_DIR for a
+// directory. It returns EACCES if the domain denies the creation.
+//
+// The check must pass before the file is created, while the name is known to
+// be free, so that a denied creation creates nothing.
+//
+// Preconditions: parent is a dentry of rp.Mount()'s filesystem. The caller
+// holds a reference on parent.
+func (rp *ResolvingPath) CheckLandlockCreate(ctx context.Context, parent *Dentry, ftype linux.FileMode) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	return rp.checkLandlock(ctx, dom, parent, landlockAccessFSForCreate(ftype))
+}
+
+// warnIfLandlockUnchecked logs a warning, or panics if invariant checking is
+// enabled, if rp's credentials have a Landlock domain and the FilesystemImpl
+// made no Landlock check while it performed the mutation op through rp.
+func (rp *ResolvingPath) warnIfLandlockUnchecked(ctx context.Context, op string) {
+	if rp.flags&rpflagsLandlockChecked != 0 || LandlockDomainOf(rp.creds) == nil {
+		return
+	}
+	msg := fmt.Sprintf("%T.%s succeeded without checking the caller's Landlock domain", rp.mount.fs.impl, op)
+	if checkInvariants {
+		panic(msg)
+	}
+	ctx.Warningf("%s", msg)
 }
 
 // checkLandlock is CheckLandlock for rp's Landlock domain dom.

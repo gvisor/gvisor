@@ -515,7 +515,8 @@ const (
 )
 
 // doCreateAt checks that creating a file at rp is permitted, then invokes
-// create to do so.
+// create to do so. For a directory, the checks end with the Landlock check of
+// rp's credentials, before the parent directory is copied up.
 //
 // Preconditions:
 //   - !rp.Done().
@@ -571,6 +572,11 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	defer mnt.EndWrite()
 	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
+	}
+	if ct != createNonDirectory {
+		if err := rp.CheckLandlockCreate(ctx, &parent.vfsd, linux.ModeDirectory); err != nil {
+			return err
+		}
 	}
 	// Ensure that the parent directory is copied-up so that we can create the
 	// new file in the upper layer.
@@ -2218,7 +2224,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

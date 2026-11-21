@@ -302,6 +302,9 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 // MkdirAt implements vfs.FilesystemImpl.MkdirAt.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	return fs.doCreateAt(ctx, rp, true /* dir */, func(parentDir *directory, name string) error {
+		if err := rp.CheckLandlockCreate(ctx, &parentDir.dentry.vfsd, linux.ModeDirectory); err != nil {
+			return err
+		}
 		creds := rp.Credentials()
 		if parentDir.inode.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
@@ -1119,7 +1122,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

@@ -71,26 +71,6 @@ namespace testing {
 
 namespace {
 
-TEST(LandlockV1Test, MakeDirOutsideAllowedTreeDenied) {
-  SKIP_IF(IsRunningOnGvisor());
-  SKIP_IF(LandlockAbiVersion() < 1);
-
-  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  const TempPath allowed_dir =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
-  const std::string allowed = allowed_dir.path();
-  static std::string target;
-  target = JoinPath(root.path(), "new_dir");
-
-  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
-    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_DIR, allowed,
-                  LANDLOCK_ACCESS_FS_MAKE_DIR);
-    _exit(ClassifyFs(mkdir(target.c_str(), 0700)));
-  }));
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
-      << "exit status " << status;
-}
-
 TEST(LandlockV1Test, RemoveFileOutsideAllowedTreeDenied) {
   SKIP_IF(IsRunningOnGvisor());
   SKIP_IF(LandlockAbiVersion() < 1);
@@ -271,6 +251,23 @@ TEST(LandlockV1Test, IoctlOnlyOpenRequiresNoRights) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, MkdirOverExistingFileReportsEexistNotEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath existing =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  static std::string target;
+  target = existing.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_DIR);
+    _exit(ClassifyErrno(mkdir(target.c_str(), 0755)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrExist)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, DeniedTruncatingOpenLeavesFileIntact) {
   SKIP_IF(LandlockAbiVersion() < 1);
 
@@ -293,6 +290,29 @@ TEST(LandlockV1Test, DeniedTruncatingOpenLeavesFileIntact) {
     _exit(st.st_size == 8 ? kDenied : kOther);
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MkdirOnReadOnlyProcMountReportsEnoentNotEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string root = base.path();
+  const std::string target = JoinPath(root, "newdir");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    if (mount("proc", root.c_str(), "proc", MS_RDONLY, nullptr) != 0) {
+      _exit(kUnsupported);
+    }
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_DIR);
+    _exit(ClassifyErrno(mkdir(target.c_str(), 0755)));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrNoent)
       << "exit status " << status;
 }
 

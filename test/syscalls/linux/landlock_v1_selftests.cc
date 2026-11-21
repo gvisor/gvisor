@@ -1363,6 +1363,25 @@ TEST(LandlockV1Test, MakeRegInsideAllowedTreeAllowed) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, MakeDirOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(root.path(), "new_dir");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_DIR);
+    _exit(ClassifyFs(mkdir(target.c_str(), 0700)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, MagicLinkReopenCannotWidenAccess) {
   SKIP_IF(LandlockAbiVersion() < 1);
 

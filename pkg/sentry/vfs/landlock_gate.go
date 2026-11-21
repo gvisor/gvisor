@@ -83,10 +83,10 @@ const (
 		linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
 )
 
-// landlockMknodAccessFS returns the filesystem right that creating a file of
-// mode's type needs. A type that is not a creatable file type needs
+// landlockAccessFSForCreate returns the filesystem right that creating a file
+// of mode's type needs. A type that is not a creatable file type needs
 // LANDLOCK_ACCESS_FS_MAKE_REG, like a regular file.
-func landlockMknodAccessFS(mode linux.FileMode) uint64 {
+func landlockAccessFSForCreate(mode linux.FileMode) uint64 {
 	switch mode.FileType() {
 	case linux.ModeDirectory:
 		return linux.LANDLOCK_ACCESS_FS_MAKE_DIR

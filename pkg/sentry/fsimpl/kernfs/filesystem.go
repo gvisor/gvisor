@@ -543,6 +543,9 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	if err := rp.CheckLandlockCreate(ctx, parent.VFSDentry(), linux.ModeDirectory); err != nil {
+		return err
+	}
 	childI, err := parent.inode.NewDir(ctx, pc, opts)
 	if err != nil {
 		if !opts.ForSyntheticMountpoint || linuxerr.Equals(linuxerr.EEXIST, err) {
@@ -1370,7 +1373,7 @@ func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*Filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
