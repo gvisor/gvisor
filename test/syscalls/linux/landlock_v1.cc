@@ -1710,6 +1710,52 @@ TEST(LandlockV1Test, WriteOpenOnReadOnlyMountIsErofsBeforeLandlock) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, RenameOntoAncestorIsEnotemptyBeforeLandlock) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath a =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  const TempPath b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  static std::string src;
+  static std::string dst;
+  src = b.path();
+  dst = a.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_DIR |
+                            LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    _exit(ClassifyErrno(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrNotempty)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ExchangeWithOwnAncestorIsEinvalBeforeLandlock) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string sub = JoinPath(dir.path(), "sub");
+  ASSERT_THAT(mkdir(sub.c_str(), 0755), SyscallSucceeds());
+  const std::string file = JoinPath(sub, "file");
+  ASSERT_NO_ERRNO(Open(file, O_WRONLY | O_CREAT, 0644));
+  auto cleanup = Cleanup([&] {
+    unlink(file.c_str());
+    rmdir(sub.c_str());
+  });
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kFsAccessV1, dir.path(), kFsAccessV1);
+    int rc = syscall(SYS_renameat2, AT_FDCWD, file.c_str(), AT_FDCWD,
+                     sub.c_str(), RENAME_EXCHANGE);
+    if (rc == 0) {
+      _exit(kAllowed);
+    }
+    _exit(errno == EINVAL ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 int RunFailedUnixBindRace(const std::string& root, bool landlocked) {
   TEST_PCHECK(chdir(root.c_str()) == 0);
   TEST_PCHECK(mkdir("scratch", 0755) == 0);

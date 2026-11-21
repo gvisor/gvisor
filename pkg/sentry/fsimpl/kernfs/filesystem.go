@@ -288,13 +288,28 @@ func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string
 	return parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite)
 }
 
-// checkDeleteLocked checks that the file represented by vfsd may be deleted.
-// If checkLandlock is not nil, checkDeleteLocked calls checkLandlock(parent),
-// which makes the Landlock check of the removal, before it checks the
-// permissions on d's parent.
+// checkDeleteLocked checks that the file represented by d may be deleted. It
+// makes the checks of checkDeletableLocked, then calls checkLandlock(parent),
+// which makes the Landlock check of the removal, and then makes the checks of
+// checkDeletePermissionsLocked.
 //
 // Preconditions: Filesystem.mu must be locked for at least reading.
 func checkDeleteLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry, checkLandlock func(parent *Dentry) error) error {
+	if err := checkDeletableLocked(d); err != nil {
+		return err
+	}
+	if err := checkLandlock(d.parent.Load()); err != nil {
+		return err
+	}
+	return checkDeletePermissionsLocked(ctx, rp.Credentials(), d)
+}
+
+// checkDeletableLocked checks that the file represented by d can be removed
+// from its parent directory, without regard to permissions. For example, it
+// returns EBUSY if d is the root of its filesystem.
+//
+// Preconditions: Filesystem.mu must be locked for at least reading.
+func checkDeletableLocked(d *Dentry) error {
 	parent := d.parent.Load()
 	if parent == nil {
 		return linuxerr.EBUSY
@@ -311,24 +326,30 @@ func checkDeleteLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry, ch
 		// node). See Linux, fs/namei.c:do_rmdir().
 		return linuxerr.EINVAL
 	}
-	if checkLandlock != nil {
-		if err := checkLandlock(parent); err != nil {
-			return err
-		}
-	}
-	if err := parent.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	return nil
+}
+
+// checkDeletePermissionsLocked checks that creds may remove the file
+// represented by d from its parent directory: creds needs write and search
+// permission on the parent, and, if the parent is sticky, must own the parent
+// or d. For example, it returns EPERM if another user's file is removed from
+// /tmp.
+//
+// Preconditions:
+//   - Filesystem.mu must be locked for at least reading.
+//   - checkDeletableLocked(d) has succeeded.
+func checkDeletePermissionsLocked(ctx context.Context, creds *auth.Credentials, d *Dentry) error {
+	parent := d.parent.Load()
+	if err := parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	if err := vfs.CheckDeleteSticky(
-		rp.Credentials(),
+	return vfs.CheckDeleteSticky(
+		creds,
 		linux.FileMode(parent.inode.Mode()),
 		auth.KUID(parent.inode.UID()),
 		auth.KUID(d.inode.UID()),
 		auth.KGID(d.inode.GID()),
-	); err != nil {
-		return err
-	}
-	return nil
+	)
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -849,9 +870,8 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	// Only RENAME_NOREPLACE is supported.
-	if opts.Flags&^linux.RENAME_NOREPLACE != 0 {
-		return linuxerr.EINVAL
+	if err := vfs.CheckRenameFlags(opts.Flags); err != nil {
+		return err
 	}
 	noReplace := opts.Flags&linux.RENAME_NOREPLACE != 0
 
@@ -888,7 +908,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	if !fs.NoNegativeDentries {
-		if err := checkDeleteLocked(ctx, rp, src, nil /* checkLandlock */); err != nil {
+		if err := checkDeletableLocked(src); err != nil {
 			return err
 		}
 	}
@@ -918,7 +938,11 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}()
 	switch {
 	case err == nil:
-		// Ok, continue with rename as replacement.
+		// Ok, continue with rename to a new name.
+		if opts.Flags&linux.RENAME_EXCHANGE != 0 {
+			// RENAME_EXCHANGE requires that the target file exist.
+			return linuxerr.ENOENT
+		}
 	case linuxerr.Equals(linuxerr.EEXIST, err):
 		if noReplace {
 			// Won't overwrite existing node since RENAME_NOREPLACE was requested.
@@ -938,16 +962,27 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := rp.CheckLandlockRename(ctx, srcDirVFSD, dstDir.VFSDentry(), src.inode.Mode(), dstType, opts.Flags); err != nil {
 		return err
 	}
+	if opts.Flags&(linux.RENAME_EXCHANGE|linux.RENAME_WHITEOUT) != 0 {
+		// Only RENAME_NOREPLACE is supported.
+		return linuxerr.EINVAL
+	}
 
+	if fs.NoNegativeDentries {
+		// checkCreateLocked found dst, since it returns EEXIST for an existing
+		// name and the lookup's error otherwise. vfs_rename succeeds for the
+		// same inode before may_delete.
+		if src.inode == dst.inode {
+			return nil
+		}
+		if err := checkDeletableLocked(src); err != nil {
+			return err
+		}
+	}
+	if err := checkDeletePermissionsLocked(ctx, rp.Credentials(), src); err != nil {
+		return err
+	}
 	if dst != nil {
 		if fs.NoNegativeDentries {
-			// vfs_rename succeeds for the same inode before may_delete.
-			if src.inode == dst.inode {
-				return nil
-			}
-			if err := checkDeleteLocked(ctx, rp, src, nil /* checkLandlock */); err != nil {
-				return err
-			}
 			if err := dstDir.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
 				return err
 			}

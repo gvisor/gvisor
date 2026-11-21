@@ -699,6 +699,93 @@ TEST(Renameat2Test, ExchangeConcurrentWithGetcwd) {
   }
 }
 
+TEST(Renameat2Test, IntoUnsearchableDirectoryRevealsNoNames) {
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+
+  const TempPath src = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileIn(GetAbsoluteTestTmpdir()));
+  const TempPath dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(GetAbsoluteTestTmpdir()));
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  const TempPath subdir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0), SyscallSucceeds());
+  auto restore = Cleanup(
+      [&] { EXPECT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds()); });
+
+  const std::string missing = JoinPath(dir.path(), "missing");
+  for (const std::string& dst : {file.path(), subdir.path(), missing}) {
+    EXPECT_THAT(renameat2(AT_FDCWD, src.path().c_str(), AT_FDCWD, dst.c_str(),
+                          RENAME_NOREPLACE),
+                SyscallFailsWithErrno(AnyOf(Eq(EACCES), Eq(EINVAL))))
+        << dst;
+  }
+  SKIP_IF(!RenameExchangeSupported());
+  for (const std::string& dst :
+       {file.path(), subdir.path(), missing, file.path() + "/",
+        subdir.path() + "/", missing + "/"}) {
+    EXPECT_THAT(renameat2(AT_FDCWD, src.path().c_str(), AT_FDCWD, dst.c_str(),
+                          RENAME_EXCHANGE),
+                SyscallFailsWithErrno(EACCES))
+        << dst;
+  }
+  for (const std::string& dst : {file.path(), subdir.path(), missing}) {
+    EXPECT_THAT(rename(src.path().c_str(), dst.c_str()),
+                SyscallFailsWithErrno(EACCES))
+        << dst;
+  }
+}
+
+#ifndef RENAME_WHITEOUT
+#define RENAME_WHITEOUT (1 << 2)
+#endif
+
+TEST(Renameat2Test, MissingNameIntoUnsearchableDirectoryIsEacces) {
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+
+  const TempPath dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(GetAbsoluteTestTmpdir()));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0), SyscallSucceeds());
+  auto restore = Cleanup(
+      [&] { EXPECT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds()); });
+
+  const std::string missing = JoinPath(GetAbsoluteTestTmpdir(), "missing");
+  EXPECT_THAT(rename(missing.c_str(), JoinPath(dir.path(), "x").c_str()),
+              SyscallFailsWithErrno(EACCES));
+}
+
+TEST(Renameat2Test, ExchangeWithWhiteoutIsEinvalBeforeLookups) {
+  const TempPath src = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileIn(GetAbsoluteTestTmpdir()));
+  const std::string missing = JoinPath(GetAbsoluteTestTmpdir(), "missing");
+  EXPECT_THAT(renameat2(AT_FDCWD, src.path().c_str(), AT_FDCWD, missing.c_str(),
+                        RENAME_EXCHANGE | RENAME_WHITEOUT),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(Renameat2Test, ExchangeWithOwnAncestorIsEinvalBeforePermissionChecks) {
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+
+  const TempPath dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(GetAbsoluteTestTmpdir()));
+  const TempPath sub =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(sub.path()));
+  SKIP_IF(!RenameExchangeSupported());
+  ASSERT_THAT(chmod(dir.path().c_str(), 0555), SyscallSucceeds());
+  auto restore = Cleanup(
+      [&] { EXPECT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds()); });
+
+  EXPECT_THAT(renameat2(AT_FDCWD, file.path().c_str(), AT_FDCWD,
+                        sub.path().c_str(), RENAME_EXCHANGE),
+              SyscallFailsWithErrno(EINVAL));
+}
+
 }  // namespace
 
 }  // namespace testing

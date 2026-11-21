@@ -1153,11 +1153,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	if opts.Flags&^(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) != 0 {
-		return linuxerr.EINVAL
-	}
-	if opts.Flags&(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) == linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE {
-		return linuxerr.EINVAL
+	if err := vfs.CheckRenameFlags(opts.Flags); err != nil {
+		return err
 	}
 	exchange := opts.Flags&linux.RENAME_EXCHANGE != 0
 
@@ -1188,6 +1185,14 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := oldParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
+	if oldParent != newParent {
+		// Check search permission before either name is looked up, so that a
+		// rename into a directory that the caller cannot search reveals
+		// nothing about the names in it.
+		if err := newParent.checkPermissions(creds, vfs.MayExec); err != nil {
+			return err
+		}
+	}
 	// We need a dentry representing the renamed file since, if it's a
 	// directory, we need to check for write permission on it.
 	oldDirIdx := oldParent.dirLockIndex(dirLockD1)
@@ -1197,17 +1202,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err != nil {
 		return err
 	}
-	if err := oldParent.mayDelete(creds, renamed); err != nil {
-		return err
-	}
 	if renamed.isDir() {
 		if renamed == newParent || genericIsAncestorDentry(fs, renamed, newParent) {
 			return linuxerr.EINVAL
-		}
-		if oldParent != newParent {
-			if err := renamed.checkPermissions(creds, vfs.MayWrite); err != nil {
-				return err
-			}
 		}
 	} else {
 		if !exchange && (opts.MustBeDir || rp.MustBeDir()) {
@@ -1216,9 +1213,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	if oldParent != newParent {
-		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
-			return err
-		}
 		newDirIdx := newParent.dirLockIndex(dirLockD1New)
 		newParent.dirMu.NestedLock(newDirIdx)
 		defer newParent.dirMu.NestedUnlock(newDirIdx)
@@ -1245,10 +1239,46 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	var replacedType linux.FileMode
 	if replaced != nil {
+		// Exchanging a file with an ancestor directory would disconnect the
+		// latter from the tree, and replacing an ancestor directory would
+		// replace a directory that is not empty.
+		if genericIsAncestorDentry(fs, replaced, renamed) {
+			if exchange {
+				return linuxerr.EINVAL
+			}
+			return linuxerr.ENOTEMPTY
+		}
+		if exchange {
+			// The exchanged files may differ in type, but a trailing slash
+			// on either name requires a directory on that side.
+			if rp.MustBeDir() && !replaced.isDir() {
+				return linuxerr.ENOTDIR
+			}
+			if opts.MustBeDir && !renamed.isDir() {
+				return linuxerr.ENOTDIR
+			}
+		}
 		replacedType = linux.FileMode(replaced.mode.Load())
 	}
 	if err := rp.CheckLandlockRename(ctx, &oldParent.vfsd, &newParent.vfsd, linux.FileMode(renamed.mode.Load()), replacedType, opts.Flags); err != nil {
 		return err
+	}
+	if opts.Flags&linux.RENAME_WHITEOUT != 0 {
+		return linuxerr.EINVAL
+	}
+	if err := oldParent.mayDelete(creds, renamed); err != nil {
+		return err
+	}
+	if oldParent != newParent {
+		if renamed.isDir() {
+			// Writability is needed to change renamed's "..".
+			if err := renamed.checkPermissions(creds, vfs.MayWrite); err != nil {
+				return err
+			}
+		}
+		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+			return err
+		}
 	}
 	if replaced != nil {
 		if err := newParent.mayDelete(creds, replaced); err != nil {
@@ -1256,18 +1286,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 		replacedVFSD = &replaced.vfsd
 		if exchange {
-			// The exchanged files may differ in type, and a directory being
-			// exchanged may be non-empty; but exchanging a file with an
-			// ancestor directory would disconnect the latter from the tree.
-			if genericIsAncestorDentry(fs, replaced, renamed) {
-				return linuxerr.EINVAL
-			}
-			if rp.MustBeDir() && !replaced.isDir() {
-				return linuxerr.ENOTDIR
-			}
-			if opts.MustBeDir && !renamed.isDir() {
-				return linuxerr.ENOTDIR
-			}
 			if oldParent != newParent && replaced.isDir() {
 				// Writability is needed to change replaced's "..".
 				if err := replaced.checkPermissions(creds, vfs.MayWrite); err != nil {
@@ -1277,9 +1295,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		} else if replaced.isDir() {
 			if !renamed.isDir() {
 				return linuxerr.EISDIR
-			}
-			if genericIsAncestorDentry(fs, replaced, renamed) {
-				return linuxerr.ENOTEMPTY
 			}
 			replacedDirIdx := replaced.dirLockIndex(dirLockD1Replaced)
 			replaced.dirMu.NestedLock(replacedDirIdx)

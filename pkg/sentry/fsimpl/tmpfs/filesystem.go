@@ -587,12 +587,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	if opts.Flags&^(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) != 0 {
-		// TODO(b/145974740): Support RENAME_WHITEOUT.
-		return linuxerr.EINVAL
-	}
-	if opts.Flags&(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) == linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE {
-		return linuxerr.EINVAL
+	if err := vfs.CheckRenameFlags(opts.Flags); err != nil {
+		return err
 	}
 	exchange := opts.Flags&linux.RENAME_EXCHANGE != 0
 
@@ -619,12 +615,17 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := oldParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
+	if oldParentDir != newParentDir {
+		// Check search permission before either name is looked up, so that a
+		// rename into a directory that the caller cannot search reveals
+		// nothing about the names in it.
+		if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+			return err
+		}
+	}
 	renamed, ok := oldParentDir.childMap[oldName]
 	if !ok {
 		return linuxerr.ENOENT
-	}
-	if err := oldParentDir.mayDelete(rp.Credentials(), renamed); err != nil {
-		return err
 	}
 	// Note that we don't need to call rp.CheckMount(), since if renamed is a
 	// mount point then we want to rename the mount point, not anything in the
@@ -633,21 +634,12 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if renamed == &newParentDir.dentry || genericIsAncestorDentry(fs, renamed, &newParentDir.dentry) {
 			return linuxerr.EINVAL
 		}
-		if oldParentDir != newParentDir {
-			// Writability is needed to change renamed's "..".
-			if err := renamed.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
-				return err
-			}
-		}
 	} else {
 		if !exchange && (opts.MustBeDir || rp.MustBeDir()) {
 			return linuxerr.ENOTDIR
 		}
 	}
 
-	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
-		return err
-	}
 	replaced, ok := newParentDir.childMap[newName]
 	if ok && opts.Flags&linux.RENAME_NOREPLACE != 0 {
 		return linuxerr.EEXIST
@@ -658,9 +650,44 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	var replacedType linux.FileMode
 	if ok {
+		// Exchanging a file with an ancestor directory would disconnect the
+		// latter from the tree, and replacing an ancestor directory would
+		// replace a directory that is not empty.
+		if genericIsAncestorDentry(fs, replaced, renamed) {
+			if exchange {
+				return linuxerr.EINVAL
+			}
+			return linuxerr.ENOTEMPTY
+		}
+		if exchange {
+			// The exchanged files may differ in type, but a trailing slash
+			// on either name requires a directory on that side.
+			if rp.MustBeDir() && !replaced.inode.isDir() {
+				return linuxerr.ENOTDIR
+			}
+			if opts.MustBeDir && !renamed.inode.isDir() {
+				return linuxerr.ENOTDIR
+			}
+		}
 		replacedType = linux.FileMode(replaced.inode.mode.Load())
 	}
 	if err := rp.CheckLandlockRename(ctx, &oldParentDir.dentry.vfsd, &newParentDir.dentry.vfsd, linux.FileMode(renamed.inode.mode.Load()), replacedType, opts.Flags); err != nil {
+		return err
+	}
+	if opts.Flags&linux.RENAME_WHITEOUT != 0 {
+		// TODO(b/145974740): Support RENAME_WHITEOUT.
+		return linuxerr.EINVAL
+	}
+	if err := oldParentDir.mayDelete(rp.Credentials(), renamed); err != nil {
+		return err
+	}
+	if renamed.inode.isDir() && oldParentDir != newParentDir {
+		// Writability is needed to change renamed's "..".
+		if err := renamed.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+			return err
+		}
+	}
+	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	if ok {
@@ -668,18 +695,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			return err
 		}
 		if exchange {
-			// The exchanged files may differ in type, and a directory being
-			// exchanged may be non-empty; but exchanging a file with an
-			// ancestor directory would disconnect the latter from the tree.
-			if genericIsAncestorDentry(fs, replaced, renamed) {
-				return linuxerr.EINVAL
-			}
-			if rp.MustBeDir() && !replaced.inode.isDir() {
-				return linuxerr.ENOTDIR
-			}
-			if opts.MustBeDir && !renamed.inode.isDir() {
-				return linuxerr.ENOTDIR
-			}
 			if oldParentDir != newParentDir {
 				if replaced.inode.isDir() {
 					// Writability is needed to change replaced's "..".
