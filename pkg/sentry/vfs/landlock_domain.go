@@ -322,10 +322,28 @@ func (d *LandlockDomain) CheckParentlessFileAccessFS(ctx context.Context, file *
 // walk takes, and drops them in rp.Release, so FilesystemImpl methods may call
 // CheckLandlock with filesystem locks held.
 //
+// If rp's credentials have a Landlock domain, CheckLandlock also records in rp
+// that the FilesystemImpl made a Landlock check, whatever its result. VFS
+// refuses an open that succeeds without such a check (see
+// VirtualFilesystem.OpenAt).
+//
 // Preconditions: d is a dentry of rp.Mount()'s filesystem. The caller holds a
 // reference on d.
 func (rp *ResolvingPath) CheckLandlock(ctx context.Context, d *Dentry, reqAccessFS uint64) error {
-	return LandlockDomainOf(rp.creds).CheckAccessFS(ctx, VirtualDentry{mount: rp.mount, dentry: d}, reqAccessFS, &rp.deferred)
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	return rp.checkLandlock(ctx, dom, d, reqAccessFS)
+}
+
+// checkLandlock is CheckLandlock for rp's Landlock domain dom.
+//
+// Preconditions: dom == LandlockDomainOf(rp.Credentials()) != nil. d is a
+// dentry of rp.Mount()'s filesystem. The caller holds a reference on d.
+func (rp *ResolvingPath) checkLandlock(ctx context.Context, dom *LandlockDomain, d *Dentry, reqAccessFS uint64) error {
+	rp.flags |= rpflagsLandlockChecked
+	return dom.CheckAccessFS(ctx, VirtualDentry{mount: rp.mount, dentry: d}, reqAccessFS, &rp.deferred)
 }
 
 // walkLandlockMounts runs the ancestor walk from d reached through mnt and

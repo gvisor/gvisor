@@ -931,13 +931,23 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return err
 	}
+	if err := vfs.CheckOpenFileType(linux.FileMode(d.mode.Load()), opts); err != nil {
+		return err
+	}
+	if ats.MayWrite() {
+		// Reject writes to a file that is currently being executed, as Linux
+		// does in fs/namei.c:may_open() and fs/open.c:handle_truncate(). This
+		// must happen before copy-up, since copying up would otherwise create
+		// a fresh upper file with a zero write count and silently bypass the
+		// check.
+		if err := d.writeCount.CheckWrite(); err != nil {
+			return err
+		}
+	}
+	if err := rp.CheckLandlockOpen(ctx, &d.vfsd, d.isDir(), opts); err != nil {
+		return err
+	}
 	if d.isDir() {
-		if ats.MayWrite() {
-			return linuxerr.EISDIR
-		}
-		if opts.Flags&linux.O_CREAT != 0 {
-			return linuxerr.EISDIR
-		}
 		if opts.Flags&linux.O_DIRECT != 0 {
 			return linuxerr.EINVAL
 		}
@@ -946,13 +956,6 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 
 	if !ats.MayWrite() {
 		return nil
-	}
-	// Reject writes to a file that is currently being executed, as Linux does
-	// in fs/namei.c:may_open() and fs/open.c:handle_truncate(). This must
-	// happen before copy-up, since copying up would otherwise create a fresh
-	// upper file with a zero write count and silently bypass the check.
-	if err := d.writeCount.CheckWrite(); err != nil {
-		return err
 	}
 	// copyMu may not be held, so read the atomic copied-up flag rather than upperVD.
 	if !d.isCopiedUp() && !d.canBeCopiedUp() {
@@ -1034,6 +1037,9 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 		return nil, err
 	}
 	defer mnt.EndWrite()
+	if err := rp.CheckLandlockCreateOpen(ctx, &parent.vfsd, opts); err != nil {
+		return nil, err
+	}
 
 	if err := parent.copyUpLocked(ctx); err != nil {
 		return nil, err
@@ -2217,6 +2223,11 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
+// LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
+	return vfs.LandlockOpOpen
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

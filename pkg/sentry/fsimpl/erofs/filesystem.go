@@ -515,6 +515,11 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
 }
 
+// LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
+	return vfs.LandlockOpOpen
+}
+
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
 func (fs *filesystem) WalkAncestors(d *vfs.Dentry, visit func(*vfs.Dentry) bool) {
 	genericWalkAncestors(fs, d.Impl().(*dentry), visit)

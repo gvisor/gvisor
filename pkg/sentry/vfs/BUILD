@@ -167,6 +167,7 @@ go_library(
         "landlock_gate.go",
         "landlock_key_atomicptrmap_unsafe.go",
         "landlock_object.go",
+        "landlock_open.go",
         "landlock_ruleset.go",
         "lock.go",
         "mount.go",

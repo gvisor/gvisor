@@ -432,6 +432,9 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		defer rp.Mount().EndWrite()
+		if err := rp.CheckLandlockCreateOpen(ctx, &parentDir.dentry.vfsd, &opts); err != nil {
+			return nil, err
+		}
 		// Create and open the child.
 		creds := rp.Credentials()
 		childInode, err := fs.newRegularFile(creds.FilesystemKUID, creds.FilesystemKGID, opts.Mode, parentDir)
@@ -486,6 +489,9 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {
 			return nil, err
 		}
+		if err := vfs.CheckOpenFileType(linux.FileMode(d.inode.mode.Load()), opts); err != nil {
+			return nil, err
+		}
 		if ats.MayWrite() {
 			// Reject writes to a file that is currently being executed, as
 			// Linux does in fs/namei.c:may_open() and
@@ -494,6 +500,9 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			if err := d.inode.writeCount.CheckWrite(); err != nil {
 				return nil, err
 			}
+		}
+		if err := rp.CheckLandlockOpen(ctx, &d.vfsd, d.inode.isDir(), opts); err != nil {
+			return nil, err
 		}
 	}
 	switch impl := d.inode.impl.(type) {
@@ -524,14 +533,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		}
 		return &fd.vfsfd, nil
 	case *directory:
-		// Can't open directories with O_CREAT.
-		if opts.Flags&linux.O_CREAT != 0 {
-			return nil, linuxerr.EISDIR
-		}
-		// Can't open directories writably.
-		if ats&vfs.MayWrite != 0 {
-			return nil, linuxerr.EISDIR
-		}
 		if opts.Flags&linux.O_DIRECT != 0 {
 			return nil, linuxerr.EINVAL
 		}
@@ -1126,6 +1127,11 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
+// LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
+	return vfs.LandlockOpOpen
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

@@ -612,6 +612,18 @@ func (d *Dentry) mayOpen(ctx context.Context, creds *auth.Credentials, opts vfs.
 	return nil
 }
 
+// checkOpen checks an open with opts of the existing file d, after the
+// permission and exec checks: first the file type, then the Landlock domain of
+// rp's credentials.
+//
+// Preconditions: d is a dentry of rp.Mount()'s filesystem. d.fs.mu is locked.
+func (d *Dentry) checkOpen(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) error {
+	if err := vfs.CheckOpenFileType(d.inode.Mode(), opts); err != nil {
+		return err
+	}
+	return rp.CheckLandlockOpen(ctx, d.VFSDentry(), d.isDir(), opts)
+}
+
 // OpenAt implements vfs.FilesystemImpl.OpenAt.
 func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	trunc := opts.Flags&linux.O_TRUNC != 0
@@ -627,6 +639,10 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			return nil, err
 		}
 		if err := d.mayOpen(ctx, rp.Credentials(), opts); err != nil {
+			fs.mu.RUnlock()
+			return nil, err
+		}
+		if err := d.checkOpen(ctx, rp, &opts); err != nil {
 			fs.mu.RUnlock()
 			return nil, err
 		}
@@ -670,6 +686,9 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			return nil, linuxerr.EEXIST
 		}
 		if err := start.mayOpen(ctx, rp.Credentials(), opts); err != nil {
+			return nil, err
+		}
+		if err := start.checkOpen(ctx, rp, &opts); err != nil {
 			return nil, err
 		}
 		if trunc && start.isRegular() {
@@ -733,6 +752,9 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		defer mnt.EndWrite()
+		if err := rp.CheckLandlockCreateOpen(ctx, parent.VFSDentry(), &opts); err != nil {
+			return nil, err
+		}
 		// Create and open the child.
 		childI, err := parent.inode.NewFile(ctx, pc, opts)
 		if err != nil {
@@ -765,6 +787,9 @@ afterTrailingSymlink:
 		return nil, linuxerr.ENOTDIR
 	}
 	if err := child.mayOpen(ctx, rp.Credentials(), opts); err != nil {
+		return nil, err
+	}
+	if err := child.checkOpen(ctx, rp, &opts); err != nil {
 		return nil, err
 	}
 	if trunc && child.isRegular() {
@@ -1353,6 +1378,11 @@ func (fs *Filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*Dentry))
+}
+
+// LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+func (*Filesystem) LandlockCheckedOps() vfs.LandlockOps {
+	return vfs.LandlockOpOpen
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

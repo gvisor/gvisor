@@ -514,6 +514,11 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 
 // OpenAt returns a FileDescription providing access to the file at the given
 // path. A reference is taken on the returned FileDescription.
+//
+// If creds have a Landlock domain, OpenAt fails with EACCES, and closes the
+// new file, when the FilesystemImpl opens a file without checking the open
+// against the domain (see ResolvingPath.CheckLandlockOpen and
+// ResolvingPath.CheckLandlockCreateOpen).
 func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *OpenOptions) (*FileDescription, error) {
 	fsmetric.Opens.Increment()
 
@@ -569,8 +574,14 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 		if err := rp.checkLandlockGate(LandlockOpOpen, landlockOpenAccessFS); err != nil {
 			return nil, err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		fd, err := rp.mount.fs.impl.OpenAt(ctx, rp, *opts)
 		if err == nil {
+			if rp.flags&rpflagsLandlockChecked == 0 && LandlockDomainOf(creds) != nil {
+				ctx.Warningf("%T.OpenAt opened a file without checking it against the caller's Landlock domain", rp.mount.fs.impl)
+				fd.DecRef(ctx)
+				return nil, linuxerr.EACCES
+			}
 			fdCleanup := cleanup.Make(func() {
 				fd.DecRef(ctx)
 			})

@@ -1066,24 +1066,34 @@ afterTrailingSymlink:
 		// created by another goroutine since we checked for existence
 		// a few lines ago. We must handle that case.
 		parent.opMu.Lock()
-		fd, createErr := parent.createAndOpenChildLocked(ctx, rp, &opts, &ds)
-		if !linuxerr.Equals(linuxerr.EEXIST, createErr) {
+		fd, landlockDenied, createErr := parent.createAndOpenChildLocked(ctx, rp, &opts, &ds)
+		if landlockDenied {
+			// Landlock denies creating the file, but the file may exist on
+			// the host although the lookup above did not find it, as in
+			// shared interop mode. Look it up again: if it exists, open it
+			// as an existing file, which needs no LANDLOCK_ACCESS_FS_MAKE_REG.
+			child, _, err = fs.stepLocked(ctx, resolvingPathFull(rp), parent, false /* mayFollowSymlinks */, &ds)
+			parent.opMu.Unlock()
+			if linuxerr.Equals(linuxerr.ENOENT, err) {
+				return nil, createErr
+			}
+		} else if !linuxerr.Equals(linuxerr.EEXIST, createErr) {
 			// Either the creation was a success, or we got an
 			// unexpected error. Either way we can return here.
 			parent.opMu.Unlock()
 			return fd, createErr
-		}
+		} else {
+			// We raced, and now the file exists.
+			if mustCreate {
+				parent.opMu.Unlock()
+				return nil, linuxerr.EEXIST
+			}
 
-		// We raced, and now the file exists.
-		if mustCreate {
+			// Step to the file again. Since we still hold opMu for
+			// writing, there can't be a race here.
+			child, _, err = fs.stepLocked(ctx, resolvingPathFull(rp), parent, false /* mayFollowSymlinks */, &ds)
 			parent.opMu.Unlock()
-			return nil, linuxerr.EEXIST
 		}
-
-		// Step to the file again. Since we still hold opMu for
-		// writing, there can't be a race here.
-		child, _, err = fs.stepLocked(ctx, resolvingPathFull(rp), parent, false /* mayFollowSymlinks */, &ds)
-		parent.opMu.Unlock()
 	}
 	if err != nil {
 		return nil, err
@@ -1126,6 +1136,9 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
+	if err := vfs.CheckOpenFileType(linux.FileMode(d.inode.fileType()), opts); err != nil {
+		return nil, err
+	}
 	if ats.MayWrite() {
 		// Reject writes to a file that is currently being executed, as Linux
 		// does in fs/namei.c:may_open() and fs/open.c:handle_truncate(). This
@@ -1133,6 +1146,9 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		if err := d.inode.writeCount.CheckWrite(); err != nil {
 			return nil, err
 		}
+	}
+	if err := rp.CheckLandlockOpen(ctx, &d.vfsd, d.isDir(), opts); err != nil {
+		return nil, err
 	}
 	if d.inode.fileType() == linux.S_IFSOCK && !d.inode.isSynthetic() {
 		// d.connect(), called by d.openSocketByConnecting(), requires renameMu.
@@ -1171,14 +1187,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			vfd = &fd.vfsfd
 		}
 	case linux.S_IFDIR:
-		// Can't open directories with O_CREAT.
-		if opts.Flags&linux.O_CREAT != 0 {
-			return nil, linuxerr.EISDIR
-		}
-		// Can't open directories writably.
-		if ats&vfs.MayWrite != 0 {
-			return nil, linuxerr.EISDIR
-		}
 		if opts.Flags&linux.O_DIRECT != 0 {
 			return nil, linuxerr.EINVAL
 		}
@@ -1341,24 +1349,31 @@ retry:
 	return &fd.vfsfd, nil
 }
 
+// createAndOpenChildLocked creates a regular file named rp.Component() in d and
+// opens it. If the Landlock domain of rp's credentials denies creating the
+// file, it returns true and the denial, and creates nothing.
+//
 // Preconditions:
 //   - d.inode.fs.renameMu must be locked.
 //   - d.opMu must be locked for writing.
 //   - !d.inode.isSynthetic().
 //
 // +checklocks:d.opMu
-func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, ds **[]*dentry) (*vfs.FileDescription, error) {
+func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, ds **[]*dentry) (*vfs.FileDescription, bool, error) {
 	if err := d.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if d.isDeleted() {
-		return nil, linuxerr.ENOENT
+		return nil, false, linuxerr.ENOENT
 	}
 	mnt := rp.Mount()
 	if err := mnt.CheckBeginWrite(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer mnt.EndWrite()
+	if err := rp.CheckLandlockCreateOpen(ctx, &d.vfsd, opts); err != nil {
+		return nil, true, err
+	}
 
 	creds := rp.Credentials()
 	name := rp.Component()
@@ -1371,7 +1386,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 
 	child, h, err := d.openCreate(ctx, name, opts.Flags&linux.O_ACCMODE, opts.Mode, creds.FilesystemKUID, kgid, true /* createDentry */)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Incorporate the fid that was opened by lcreate.
@@ -1411,20 +1426,20 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	if useRegularFileFD {
 		fd, err := newRegularFileFD(mnt, child, opts.Flags, creds)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		childVFSFD = &fd.vfsfd
 	} else {
 		fd, err := newSpecialFileFD(h, mnt, child, opts.Flags, creds)
 		if err != nil {
 			h.close(ctx)
-			return nil, err
+			return nil, false, err
 		}
 		childVFSFD = &fd.vfsfd
 	}
 	d.inode.watches.Notify(withCheckCachingList(ctx, ds), name, linux.IN_CREATE, 0, vfs.PathEvent, false /* unlinked */)
 	childVFSFD.SetCreated()
-	return childVFSFD, nil
+	return childVFSFD, false, nil
 }
 
 // ReadlinkAt implements vfs.FilesystemImpl.ReadlinkAt.
@@ -1972,6 +1987,11 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
+// LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
+	return vfs.LandlockOpOpen
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

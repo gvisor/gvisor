@@ -3745,6 +3745,42 @@ TEST(MountTest, MountInfoAfterUnshare) {
   }
 }
 
+TEST(MountTest, OverlayOpenFailingFileTypeCheckDoesNotCopyUp) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const auto rest = [&] {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_REC | MS_PRIVATE, nullptr));
+    TEST_CHECK_SUCCESS(
+        mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr));
+    const std::string lower = JoinPath(root.path(), "lower");
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    const std::string merged = JoinPath(root.path(), "merged");
+    for (const std::string& dir :
+         {lower, upper, work, merged, JoinPath(lower, "d")}) {
+      TEST_CHECK_SUCCESS(mkdir(dir.c_str(), 0755));
+    }
+    int fd = open(JoinPath(lower, "f").c_str(), O_WRONLY | O_CREAT, 0644);
+    TEST_PCHECK(fd >= 0);
+    TEST_CHECK_SUCCESS(close(fd));
+    TEST_CHECK_SUCCESS(symlink("f", JoinPath(lower, "s").c_str()));
+    const std::string opts = absl::StrCat(
+        "lowerdir=", lower, ",upperdir=", upper, ",workdir=", work);
+    TEST_CHECK_SUCCESS(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
+    TEST_CHECK(open(JoinPath(merged, "s").c_str(), O_WRONLY | O_NOFOLLOW) < 0 &&
+               errno == ELOOP);
+    TEST_CHECK(open(JoinPath(merged, "d").c_str(), O_WRONLY) < 0 &&
+               errno == EISDIR);
+    struct stat st;
+    TEST_CHECK(lstat(JoinPath(upper, "s").c_str(), &st) < 0 && errno == ENOENT);
+    TEST_CHECK(lstat(JoinPath(upper, "d").c_str(), &st) < 0 && errno == ENOENT);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
 }  // namespace
 
 }  // namespace testing

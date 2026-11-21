@@ -189,6 +189,26 @@ func AccessTypesForOpenFlags(opts *OpenOptions) AccessTypes {
 	}
 }
 
+// CheckOpenFileType returns the error that opening a file of type ftype with
+// opts reports because of the file's type, or nil if its type allows the open:
+//
+//   - ELOOP for a symlink, which is opened rather than followed only with
+//     O_NOFOLLOW. (O_PATH opens do not reach FilesystemImpls.)
+//
+//   - EISDIR for a directory opened with O_CREAT, or with an access mode or
+//     O_TRUNC that needs write access.
+func CheckOpenFileType(ftype linux.FileMode, opts *OpenOptions) error {
+	switch ftype.FileType() {
+	case linux.ModeSymlink:
+		return linuxerr.ELOOP
+	case linux.ModeDirectory:
+		if opts.Flags&linux.O_CREAT != 0 || AccessTypesForOpenFlags(opts).MayWrite() {
+			return linuxerr.EISDIR
+		}
+	}
+	return nil
+}
+
 // MayReadFileWithOpenFlags returns true if a file with the given open flags
 // should be readable.
 func MayReadFileWithOpenFlags(flags uint32) bool {

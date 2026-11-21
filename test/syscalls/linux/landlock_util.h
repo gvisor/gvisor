@@ -136,6 +136,15 @@ inline int LandlockAbiVersion() {
   return landlock_create_ruleset(nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
 }
 
+inline bool LandlockErratumFixed(int number) {
+  int errata =
+      landlock_create_ruleset(nullptr, 0, LANDLOCK_CREATE_RULESET_ERRATA);
+  if (errata < 0) {
+    return false;
+  }
+  return (errata & (1 << (number - 1))) != 0;
+}
+
 inline int CreateRuleset(uint64_t handled_fs, uint64_t handled_net = 0,
                          uint64_t scoped = 0) {
   landlock_ruleset_attr attr = {};
@@ -227,6 +236,69 @@ inline ChildResult TryReadOpen(const std::string& path) {
     return kAllowed;
   }
   return errno == EACCES ? kDenied : kOther;
+}
+
+inline int OpenErrno(const std::string& path, int flags) {
+  int fd = open(path.c_str(), flags | O_CLOEXEC);
+  if (fd < 0) {
+    return errno;
+  }
+  close(fd);
+  return 0;
+}
+
+inline void ExpectOpen(const std::string& path, int flags, int want) {
+  int got = OpenErrno(path, flags);
+  if (got != want) {
+    fprintf(stderr, "open(%s, %#x): got errno %d, want %d\n", path.c_str(),
+            flags, got, want);
+    _exit(kOther);
+  }
+}
+
+enum ErrnoResult {
+  kErrOk = 0,
+  kErrRofs = 110,
+  kErrNoent = 111,
+  kErrAcces = 112,
+  kErrPerm = 113,
+  kErrIsdir = 114,
+  kErrNotdir = 115,
+  kErrNotempty = 116,
+  kErrInval = 117,
+  kErrExist = 118,
+  kErrUnexpected = 119,
+  kErrExdev = 120,
+};
+
+inline int ClassifyErrno(int rc) {
+  if (rc >= 0) {
+    return kErrOk;
+  }
+  switch (errno) {
+    case EROFS:
+      return kErrRofs;
+    case ENOENT:
+      return kErrNoent;
+    case EACCES:
+      return kErrAcces;
+    case EPERM:
+      return kErrPerm;
+    case EISDIR:
+      return kErrIsdir;
+    case ENOTDIR:
+      return kErrNotdir;
+    case ENOTEMPTY:
+      return kErrNotempty;
+    case EINVAL:
+      return kErrInval;
+    case EEXIST:
+      return kErrExist;
+    case EXDEV:
+      return kErrExdev;
+    default:
+      return kErrUnexpected;
+  }
 }
 
 #ifndef SYS_move_mount
