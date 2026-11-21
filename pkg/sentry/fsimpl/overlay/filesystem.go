@@ -1540,16 +1540,16 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if err := rp.CheckLandlock(ctx, &parent.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR); err != nil {
 		return err
 	}
-
-	// Ensure that parent is copied-up before potentially holding child.copyMu
-	// below.
-	if err := parent.copyUpLocked(ctx); err != nil {
+	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
 		return err
 	}
 	if !child.isDir() {
 		return linuxerr.ENOTDIR
 	}
-	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
+
+	// Ensure that parent is copied-up before potentially holding child.copyMu
+	// below.
+	if err := parent.copyUpLocked(ctx); err != nil {
 		return err
 	}
 	childDirIdx := child.dirLockIndex(dirLockD1Child)
@@ -1881,16 +1881,16 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if err := rp.CheckLandlock(ctx, &parent.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
 		return err
 	}
-
-	// Ensure that parent is copied-up before potentially holding child.copyMu
-	// below.
-	if err := parent.copyUpLocked(ctx); err != nil {
+	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
 		return err
 	}
 	if child.isDir() {
 		return linuxerr.EISDIR
 	}
-	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
+
+	// Ensure that parent is copied-up before potentially holding child.copyMu
+	// below.
+	if err := parent.copyUpLocked(ctx); err != nil {
 		return err
 	}
 	// Hold child.copyMu to prevent it from being copied-up during

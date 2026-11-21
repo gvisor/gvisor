@@ -1184,7 +1184,7 @@ func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	defer fs.processDeferredDecRefs(ctx)
 	defer fs.mu.Unlock()
 
-	d, err := fs.walkExistingLocked(ctx, rp)
+	parent, err := fs.walkParentDirLocked(ctx, rp, rp.Start().Impl().(*Dentry))
 	if err != nil {
 		return err
 	}
@@ -1192,6 +1192,29 @@ func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	pc := rp.Component()
+	if pc == "." || pc == ".." {
+		return linuxerr.EISDIR
+	}
+	if err := parent.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayExec); err != nil {
+		return err
+	}
+	if len(pc) > linux.NAME_MAX && !fs.NoNegativeDentries {
+		return linuxerr.ENAMETOOLONG
+	}
+	// Look the child up in parent, without crossing into a filesystem mounted
+	// on it, so that a mount point fails with EBUSY below.
+	d, err := fs.revalidateChildLocked(ctx, rp.VirtualFilesystem(), parent, pc)
+	if err != nil {
+		return err
+	}
+	if rp.MustBeDir() {
+		// A trailing slash makes the unlink fail whatever the child is.
+		if d.isDir() {
+			return linuxerr.EISDIR
+		}
+		return linuxerr.ENOTDIR
+	}
 	if err := checkDeleteLocked(ctx, rp, d, func(parent *Dentry) error {
 		return rp.CheckLandlock(ctx, parent.VFSDentry(), linux.LANDLOCK_ACCESS_FS_REMOVE_FILE)
 	}); err != nil {

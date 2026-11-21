@@ -264,6 +264,34 @@ TEST(StickyTest, StickyBitCapFOWNER) {
     EXPECT_THAT(unlinkat(parent_fd.get(), "link", 0), SyscallSucceeds());
   });
 }
+
+TEST(StickyTest, StickyBitPermDeniedPrecedesTypeErrors) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  const TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  EXPECT_THAT(chmod(parent.path().c_str(), 0777 | S_ISVTX), SyscallSucceeds());
+
+  const FileDescriptor parent_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent.path(), O_DIRECTORY));
+  ASSERT_THAT(openat(parent_fd.get(), "file", O_CREAT), SyscallSucceeds());
+  ASSERT_THAT(mkdirat(parent_fd.get(), "dir", 0777), SyscallSucceeds());
+
+  ScopedThread([&] {
+    AutoCapability cap(CAP_FOWNER, false);
+
+    EXPECT_THAT(
+        syscall(SYS_setresgid, -1, absl::GetFlag(FLAGS_scratch_gid), -1),
+        SyscallSucceeds());
+    EXPECT_THAT(
+        syscall(SYS_setresuid, -1, absl::GetFlag(FLAGS_scratch_uid), -1),
+        SyscallSucceeds());
+
+    EXPECT_THAT(unlinkat(parent_fd.get(), "dir", 0),
+                SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(unlinkat(parent_fd.get(), "file", AT_REMOVEDIR),
+                SyscallFailsWithErrno(EPERM));
+  });
+}
 }  // namespace
 
 }  // namespace testing

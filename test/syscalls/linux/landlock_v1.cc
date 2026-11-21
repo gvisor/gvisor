@@ -1225,6 +1225,118 @@ TEST(LandlockV1Test, ExecveatOfOpathDescriptorRequiresExecute) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, UnlinkWithTrailingSlashReportsEisdirNotEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath victim_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  static std::string target;
+  target = victim_dir.path() + "/";
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyErrno(unlink(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrIsdir)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, UnlinkOfMountPointWithTrailingSlashReportsEisdir) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath mnt_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  static std::string from;
+  static std::string target;
+  from = src_dir.path();
+  target = mnt_dir.path() + "/";
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(from.c_str(), mnt_dir.path().c_str(), nullptr, MS_BIND,
+                      nullptr) == 0);
+    TEST_PCHECK(unlink(target.c_str()) < 0 && errno == EISDIR);
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyErrno(unlink(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrIsdir)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, UnlinkKernfsTrailingSlashReportsEisdirNotEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyErrno(unlink("/proc/sys/")));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrIsdir)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, UnlinkOnReadOnlyMountReportsErofsNotEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string root = base.path();
+  const std::string victim = JoinPath(root, "victim");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.c_str(), "tmpfs", 0, nullptr) == 0);
+    int fd = open(victim.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    TEST_PCHECK(fd >= 0);
+    TEST_PCHECK(close(fd) == 0);
+    if (mount(nullptr, root.c_str(), nullptr, MS_REMOUNT | MS_RDONLY,
+              nullptr) != 0) {
+      _exit(kUnsupported);
+    }
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyErrno(unlink(victim.c_str())));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrRofs)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, UnlinkMissingPathOnReadOnlyProcMountErrnos) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string root = base.path();
+  const std::string missing_intermediate = JoinPath(root, "nonexistent/victim");
+  const std::string missing_final = JoinPath(root, "nonexistent");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    if (mount("proc", root.c_str(), "proc", MS_RDONLY, nullptr) != 0) {
+      _exit(kUnsupported);
+    }
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    int intermediate = ClassifyErrno(unlink(missing_intermediate.c_str()));
+    if (intermediate != kErrNoent) {
+      _exit(intermediate);
+    }
+    _exit(ClassifyErrno(unlink(missing_final.c_str())));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrRofs)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, WriteOpenOnReadOnlyMountIsErofsBeforeLandlock) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));

@@ -678,7 +678,9 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 			return linuxerr.ENOENT
 		}
 	} else {
-		child, _, err = fs.stepLocked(ctx, resolvingPathFull(rp), parent, false /* mayFollowSymlinks */, &ds)
+		// Look the child up in parent, without crossing into a filesystem
+		// mounted on it, so that a mount point fails with EBUSY below.
+		child, err = fs.getChildLocked(ctx, parent, name, &ds)
 		if err != nil {
 			return err
 		}

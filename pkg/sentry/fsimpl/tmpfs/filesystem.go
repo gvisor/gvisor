@@ -814,6 +814,11 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if name == ".." {
 		return linuxerr.ENOTEMPTY
 	}
+	mnt := rp.Mount()
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
 	child, ok := parentDir.childMap[name]
 	if !ok {
 		return linuxerr.ENOENT
@@ -831,11 +836,6 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if len(childDir.childMap) != 0 {
 		return linuxerr.ENOTEMPTY
 	}
-	mnt := rp.Mount()
-	if err := mnt.CheckBeginWrite(); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
@@ -954,9 +954,21 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if name == "." || name == ".." {
 		return linuxerr.EISDIR
 	}
+	mnt := rp.Mount()
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
 	child, ok := parentDir.childMap[name]
 	if !ok {
 		return linuxerr.ENOENT
+	}
+	if rp.MustBeDir() {
+		// A trailing slash makes the unlink fail whatever the child is.
+		if child.inode.isDir() {
+			return linuxerr.EISDIR
+		}
+		return linuxerr.ENOTDIR
 	}
 	if err := rp.CheckLandlock(ctx, &parentDir.dentry.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
 		return err
@@ -967,14 +979,6 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if child.inode.isDir() {
 		return linuxerr.EISDIR
 	}
-	if rp.MustBeDir() {
-		return linuxerr.ENOTDIR
-	}
-	mnt := rp.Mount()
-	if err := mnt.CheckBeginWrite(); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
