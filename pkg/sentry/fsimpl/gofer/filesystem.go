@@ -867,7 +867,26 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	err := fs.doCreateAt(ctx, rp, false /* dir */, nil /* checkLandlock */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
+	mayLink := func(d *dentry) error {
+		gid := auth.KGID(d.inode.gid.Load())
+		uid := auth.KUID(d.inode.uid.Load())
+		mode := linux.FileMode(d.inode.mode.Load())
+		return vfs.MayLink(rp.Credentials(), mode, nil, uid, gid)
+	}
+	err := fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry) error {
+		// Paths on different mounts fail with EXDEV below, without a
+		// Landlock check. A caller without a Landlock domain gets the
+		// protected-hard-link check below, where EEXIST does not take
+		// precedence over it.
+		if rp.Mount() != vd.Mount() || vfs.LandlockDomainOf(rp.Credentials()) == nil {
+			return nil
+		}
+		d := vd.Dentry().Impl().(*dentry)
+		if err := mayLink(d); err != nil {
+			return err
+		}
+		return rp.CheckLandlockLink(ctx, &parent.vfsd, linux.FileMode(d.inode.mode.Load()), d.parent.Load() == parent)
+	}, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		if rp.Mount() != vd.Mount() {
 			return nil, linuxerr.EXDEV
 		}
@@ -875,10 +894,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if d.isDir() {
 			return nil, linuxerr.EPERM
 		}
-		gid := auth.KGID(d.inode.gid.Load())
-		uid := auth.KUID(d.inode.uid.Load())
-		mode := linux.FileMode(d.inode.mode.Load())
-		if err := vfs.MayLink(rp.Credentials(), mode, nil, uid, gid); err != nil {
+		if err := mayLink(d); err != nil {
 			return nil, err
 		}
 		if d.inode.nlink.Load() == 0 {
@@ -2017,7 +2033,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
 	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
-		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

@@ -422,6 +422,40 @@ TEST(LandlockV1Test, MkdirOnReadOnlyProcMountReportsEnoentNotEacces) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, LinkOfUnsafeSourceReportsEpermNotEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  ASSERT_THAT(chmod(src_file.path().c_str(), 0644), SyscallSucceeds());
+  ASSERT_THAT(chmod(dir.path().c_str(), 0777), SyscallSucceeds());
+  constexpr uid_t kNobody = 65534;
+  static std::string src;
+  static std::string dst;
+  src = src_file.path();
+  dst = JoinPath(dir.path(), "hardlink");
+
+  int control = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    if (syscall(SYS_setresuid, kNobody, kNobody, kNobody) != 0) {
+      _exit(kSetup);
+    }
+    _exit(ClassifyErrno(link(src.c_str(), dst.c_str())));
+  }));
+  SKIP_IF(!WIFEXITED(control) || WEXITSTATUS(control) != kErrPerm);
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    if (syscall(SYS_setresuid, kNobody, kNobody, kNobody) != 0) {
+      _exit(kSetup);
+    }
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyErrno(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrPerm)
+      << "exit status " << status;
+}
+
 void CreateFile(const std::string& path) {
   int fd = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
   ASSERT_THAT(fd, SyscallSucceeds());

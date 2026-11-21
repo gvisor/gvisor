@@ -280,11 +280,14 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		}
 		d := vd.Dentry().Impl().(*dentry)
 		i := d.inode
-		if i.isDir() {
-			return linuxerr.EPERM
-		}
 		if err := vfs.MayLink(auth.CredentialsFromContext(ctx), linux.FileMode(i.mode.Load()), i.accessACL.Load(), auth.KUID(i.uid.Load()), auth.KGID(i.gid.Load())); err != nil {
 			return err
+		}
+		if err := rp.CheckLandlockLink(ctx, &parentDir.dentry.vfsd, linux.FileMode(i.mode.Load()), d.parent.Load() == &parentDir.dentry); err != nil {
+			return err
+		}
+		if i.isDir() {
+			return linuxerr.EPERM
 		}
 		if i.nlink.Load() == 0 {
 			return linuxerr.ENOENT
@@ -1139,7 +1142,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
 	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
-		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

@@ -359,6 +359,37 @@ func (rp *ResolvingPath) CheckLandlockCreate(ctx context.Context, parent *Dentry
 	return rp.checkLandlock(ctx, dom, parent, landlockAccessFSForCreate(ftype))
 }
 
+// CheckLandlockLink checks the creation, in directory newParent, of a hard link
+// to an existing file of ftype's type against the Landlock domain of rp's
+// credentials, and returns EACCES if the domain denies it. The link needs the
+// right to create a file of ftype's type on newParent, as
+// ResolvingPath.CheckLandlockCreate checks. sameDir is true if the existing
+// file is in newParent; the root of a filesystem is in no directory.
+//
+// Landlock ABI v1 has no right that allows a file to gain a parent directory,
+// so a link into another directory fails with EXDEV for every caller with a
+// domain, once newParent grants the right; EACCES takes priority, so that the
+// caller falls back to copying the file only if the copy could succeed. For
+// example, linking a regular file within one directory needs
+// LANDLOCK_ACCESS_FS_MAKE_REG on it, while linking it into another directory
+// fails with EACCES without MAKE_REG there, and with EXDEV otherwise.
+//
+// Preconditions: newParent is a dentry of rp.Mount()'s filesystem. The caller
+// holds a reference on newParent.
+func (rp *ResolvingPath) CheckLandlockLink(ctx context.Context, newParent *Dentry, ftype linux.FileMode, sameDir bool) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	if err := rp.checkLandlock(ctx, dom, newParent, landlockAccessFSForCreate(ftype)); err != nil {
+		return err
+	}
+	if !sameDir {
+		return linuxerr.EXDEV
+	}
+	return nil
+}
+
 // CheckLandlockMknod makes the checks of mknod(2) with opts in directory
 // parent that a caller with a Landlock domain gets from the filesystem, in
 // this order, and returns the error of the first that fails:

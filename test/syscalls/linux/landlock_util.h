@@ -256,6 +256,21 @@ inline void ExpectOpen(const std::string& path, int flags, int want) {
   }
 }
 
+constexpr int kExdev = 103;
+
+inline int ClassifyRefer(int rc) {
+  if (rc == 0) {
+    return kAllowed;
+  }
+  if (errno == EACCES) {
+    return kDenied;
+  }
+  if (errno == EXDEV) {
+    return kExdev;
+  }
+  return kOther;
+}
+
 enum ErrnoResult {
   kErrOk = 0,
   kErrRofs = 110,
@@ -299,6 +314,19 @@ inline int ClassifyErrno(int rc) {
     default:
       return kErrUnexpected;
   }
+}
+
+inline void ApplyTwoDirPolicy(uint64_t handled_access, const std::string& dir1,
+                              uint64_t access1, const std::string& dir2,
+                              uint64_t access2) {
+  int fd = CreateRuleset(handled_access);
+  if (access1 != 0) {
+    AddPathRule(fd, dir1, access1);
+  }
+  if (access2 != 0) {
+    AddPathRule(fd, dir2, access2);
+  }
+  EnforceOrDie(fd);
 }
 
 #ifndef SYS_move_mount

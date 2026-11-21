@@ -408,8 +408,10 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
 			oldVD.DecRef(ctx)
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.LinkAt(ctx, rp, oldVD)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "LinkAt")
 			oldVD.DecRef(ctx)
 			return nil
 		}

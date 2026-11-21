@@ -1347,6 +1347,134 @@ TEST(LandlockV1Test, ExecuteInsideAllowedTreeDeniedWithoutExecuteGrant) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, LinkSameDirAllowedWithMakeReg) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkSameDirDeniedWithoutMakeReg) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    int fd = CreateRuleset(kFsAccessV1);
+    EnforceOrDie(fd);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkSameDirDoesNotRequireRemoveFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkAcrossDirectoriesRefusedWithExdev) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+  TempPath src_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(to, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(kFsAccessV1, from, kFsAccessV1, to, kFsAccessV1);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kExdev)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkAcrossDirectoriesWithoutRemoveFileStillReportsExdev) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from_dir.path()));
+  const std::string src = src_file.path();
+  const std::string dst = JoinPath(to_dir.path(), "linked");
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(
+        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE, from, 0,
+        to, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kExdev)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkAcrossDirectoriesWithoutMakeRegReportsEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from_dir.path()));
+  const std::string src = src_file.path();
+  const std::string dst = JoinPath(to_dir.path(), "linked");
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(LANDLOCK_ACCESS_FS_MAKE_REG, from,
+                      LANDLOCK_ACCESS_FS_MAKE_REG, to, 0);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, RemoveDirOutsideAllowedTreeDenied) {
   SKIP_IF(LandlockAbiVersion() < 1);
 

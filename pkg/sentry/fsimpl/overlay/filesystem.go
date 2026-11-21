@@ -702,7 +702,21 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	return fs.doCreateAt(ctx, rp, createNonDirectory, nil /* checkLandlock */, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry) error {
+		// Paths on different mounts fail with EXDEV below, without these
+		// checks.
+		if rp.Mount() != vd.Mount() {
+			return nil
+		}
+		old := vd.Dentry().Impl().(*dentry)
+		// Make the protected-hard-link check on the overlay file with the
+		// caller's credentials, before anything is copied up.
+		mode := linux.FileMode(old.mode.Load())
+		if err := vfs.MayLink(rp.Credentials(), mode, old.accessACL.Load(), auth.KUID(old.uid.Load()), auth.KGID(old.gid.Load())); err != nil {
+			return err
+		}
+		return rp.CheckLandlockLink(ctx, &parent.vfsd, mode, old.parent.Load() == parent)
+	}, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
 		if rp.Mount() != vd.Mount() {
 			return linuxerr.EXDEV
 		}
@@ -2240,7 +2254,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
 	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
-		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
