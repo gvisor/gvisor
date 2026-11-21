@@ -582,12 +582,15 @@ func (t *Task) ptraceUnstop(mode ptraceSyscallMode, singlestep bool, sig linux.S
 	return nil
 }
 
-// landlockMayTrace returns true if t's Landlock domain allows t to access
-// target in the ptrace sense, that is, if t has no Landlock domain. Callers
-// that allow access within the thread group do so before they call
-// landlockMayTrace.
+// landlockMayTrace returns true if Landlock allows t to access target in the
+// ptrace sense: if t has no Landlock domain, or if t's domain is target's
+// domain or one of the domains that target's domain was stacked onto. For
+// example, a landlocked task may trace a child that restricted itself further
+// after fork, but not its parent, a sibling that restricted itself
+// separately, or a task without a domain. Callers that allow access within
+// the thread group do so before they call landlockMayTrace.
 func (t *Task) landlockMayTrace(target *Task) bool {
-	return t.LandlockDomain() == nil
+	return auth.LandlockCanPtrace(t.Credentials().LandlockDomain, target.Credentials().LandlockDomain)
 }
 
 // CheckLandlockTaskAccess returns EACCES if the Landlock domain of ctx's task

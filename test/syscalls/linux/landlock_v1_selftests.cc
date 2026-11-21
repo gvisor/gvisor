@@ -2465,6 +2465,174 @@ TEST(LandlockV1Test, OverlayRuleOnLowerFileSurvivesCopyUp) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, PtraceAttachDeniedForUnsandboxedTarget) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int stop_fd;
+    pid_t tracee = ForkTracee(false, &stop_fd);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceAttachAllowedWithinSameDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    int stop_fd;
+    pid_t tracee = ForkTracee(false, &stop_fd);
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceAttachAllowedForMoreRestrictedTarget) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    int stop_fd;
+    pid_t tracee = ForkTracee(true, &stop_fd);
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceAttachDeniedBetweenSiblingDomains) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int stop_fd;
+    pid_t tracee = ForkTracee(true, &stop_fd);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceTracemeDeniedWhenParentMoreRestricted) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int go[2], result[2];
+    if (pipe(go) != 0 || pipe(result) != 0) {
+      _exit(kSetup);
+    }
+    pid_t child = fork();
+    if (child < 0) {
+      _exit(kSetup);
+    }
+    if (child == 0) {
+      close(go[1]);
+      close(result[0]);
+      char c;
+      while (read(go[0], &c, 1) == -1 && errno == EINTR) {
+      }
+      int rc = ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+      char out = rc == 0 ? kAllowed : (errno == EPERM ? kDenied : kOther);
+      write(result[1], &out, 1);
+      _exit(0);
+    }
+    close(go[0]);
+    close(result[1]);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    close(go[1]);
+
+    char out = kOther;
+    if (read(result[0], &out, 1) != 1) {
+      out = kSetup;
+    }
+    waitpid(child, nullptr, 0);
+    _exit(out);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceTracemeAllowedWithinSameDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    int result[2];
+    if (pipe(result) != 0) {
+      _exit(kSetup);
+    }
+    pid_t child = fork();
+    if (child < 0) {
+      _exit(kSetup);
+    }
+    if (child == 0) {
+      close(result[0]);
+      int rc = ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+      char out = rc == 0 ? kAllowed : (errno == EPERM ? kDenied : kOther);
+      write(result[1], &out, 1);
+      _exit(0);
+    }
+    close(result[1]);
+    char out = kOther;
+    if (read(result[0], &out, 1) != 1) {
+      out = kSetup;
+    }
+    waitpid(child, nullptr, 0);
+    _exit(out);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ProcMemOfUnsandboxedTargetIsInaccessible) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int stop_fd;
+    pid_t tracee = ForkTracee(false, &stop_fd);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+
+    const std::string path = "/proc/" + std::to_string(tracee) + "/mem";
+    ChildResult result = TryReadOpen(path);
+    close(stop_fd);
+    waitpid(tracee, nullptr, 0);
+    _exit(result);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ProcEnvironOfUnsandboxedTargetDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  static std::string environ_path;
+  environ_path = "/proc/" + std::to_string(getpid()) + "/environ";
+
+  int control = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fd = open(environ_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    char c;
+    _exit(read(fd, &c, 1) >= 0 ? kAllowed : kSetup);
+  }));
+  SKIP_IF(!(WIFEXITED(control) && WEXITSTATUS(control) == kAllowed));
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    TEST_CHECK_NO_ERRNO(SetCapabilitySets(CapSet{}));
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_BLOCK);
+    int fd = open(environ_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      _exit(errno == EACCES ? kDenied : kOther);
+    }
+    char c;
+    ssize_t n = read(fd, &c, 1);
+    if (n < 0 && errno == EACCES) {
+      _exit(kDenied);
+    }
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 }  // namespace
 }  // namespace testing
 }  // namespace gvisor

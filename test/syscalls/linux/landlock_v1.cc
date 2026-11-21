@@ -1626,6 +1626,30 @@ TEST(LandlockV1Test, ChildRestrictionDoesNotAffectParent) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, ProcessVmReadvDeniedForUnsandboxedTarget) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  static char remote_buf[8] = "watched";
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int stop_fd;
+    pid_t tracee = ForkTracee(false, &stop_fd);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+
+    char local_buf[sizeof(remote_buf)] = {};
+    struct iovec local = {local_buf, sizeof(local_buf)};
+    struct iovec remote = {remote_buf, sizeof(remote_buf)};
+    ssize_t n = process_vm_readv(tracee, &local, 1, &remote, 1, 0);
+    int err = errno;
+    ChildResult res =
+        n >= 0 ? kAllowed
+               : ((err == EPERM || err == EACCES) ? kDenied : kOther);
+    close(stop_fd);
+    waitpid(tracee, nullptr, 0);
+    _exit(res);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, MknodDeviceWithoutCapabilityIsEaccesUnderLandlock) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
@@ -2145,6 +2169,95 @@ TEST(LandlockV1Test, TiocgptpeerWithOPathReturnsOPathFile) {
   }
 }
 
+TEST(LandlockV1Test, ProcPidFilesGuardedByPtraceAccessAreScoped) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const pid_t target = getpid();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    const std::string proc = absl::StrCat("/proc/", target);
+    char buf[256];
+    for (const char* ns : {"net", "mnt"}) {
+      const std::string link = absl::StrCat(proc, "/ns/", ns);
+      TEST_PCHECK(readlink(link.c_str(), buf, sizeof(buf)) > 0);
+      int fd = open(link.c_str(), O_RDONLY);
+      TEST_PCHECK(fd >= 0);
+      close(fd);
+    }
+
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_REG));
+    const bool kernel_bug = !IsRunningOnGvisor();
+    for (const char* ns : {"net", "mnt", "user", "pid"}) {
+      const std::string link = absl::StrCat(proc, "/ns/", ns);
+      errno = 0;
+      ssize_t n = readlink(link.c_str(), buf, sizeof(buf));
+      if (!(n < 0 && errno == EACCES) && !(kernel_bug && n == 0)) {
+        fprintf(stderr, "readlink(%s): %zd, %s\n", link.c_str(), n,
+                strerror(errno));
+        _exit(kOther);
+      }
+      errno = 0;
+      int fd = open(link.c_str(), O_RDONLY);
+      if (fd >= 0) {
+        struct stat st;
+        bool ns_dir = kernel_bug && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
+        close(fd);
+        if (!ns_dir) {
+          fprintf(stderr, "open(%s) succeeded\n", link.c_str());
+          _exit(kOther);
+        }
+      } else if (errno != EACCES) {
+        fprintf(stderr, "open(%s): %s\n", link.c_str(), strerror(errno));
+        _exit(kOther);
+      }
+    }
+    const std::string fdinfo = absl::StrCat(proc, "/fdinfo");
+    if (open(fdinfo.c_str(), O_RDONLY | O_DIRECTORY) >= 0 || errno != EACCES) {
+      fprintf(stderr, "open(%s): %s\n", fdinfo.c_str(), strerror(errno));
+      _exit(kOther);
+    }
+    const std::string fdinfo0 = absl::StrCat(fdinfo, "/0");
+    if (open(fdinfo0.c_str(), O_RDONLY) >= 0 || errno != EACCES) {
+      fprintf(stderr, "open(%s): %s\n", fdinfo0.c_str(), strerror(errno));
+      _exit(kOther);
+    }
+    const std::string io = absl::StrCat(proc, "/io");
+    int fd = open(io.c_str(), O_RDONLY);
+    if (fd < 0) {
+      fprintf(stderr, "open(%s): %s\n", io.c_str(), strerror(errno));
+      _exit(kOther);
+    }
+    if (read(fd, buf, sizeof(buf)) >= 0 || errno != EACCES) {
+      fprintf(stderr, "read(%s): %s\n", io.c_str(), strerror(errno));
+      _exit(kOther);
+    }
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ProcSelfFilesGuardedByPtraceAccessStayAccessible) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_REG));
+    char buf[256];
+    TEST_PCHECK(readlink("/proc/self/ns/net", buf, sizeof(buf)) > 0);
+    int fd = open("/proc/self/ns/net", O_RDONLY);
+    TEST_PCHECK(fd >= 0);
+    close(fd);
+    fd = open("/proc/self/fdinfo/0", O_RDONLY);
+    TEST_PCHECK(fd >= 0);
+    close(fd);
+    fd = open("/proc/self/io", O_RDONLY);
+    TEST_PCHECK(fd >= 0);
+    TEST_PCHECK(read(fd, buf, sizeof(buf)) > 0);
+    close(fd);
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 enum class OverlayCreator {
   kRestrictedBeforeFsopen,
   kRestrictedBeforeCreate,
@@ -2457,6 +2570,28 @@ TEST(LandlockV1Test, DeviceMknodIntoUnwritableDirIsEaccesBeforeCapability) {
   }));
   SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrAcces)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ScopedFdinfoDirectoryCanStillBeStatted) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const pid_t target = getpid();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    const std::string fdinfo = absl::StrCat("/proc/", target, "/fdinfo");
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_REG));
+    struct stat st;
+    if (stat(fdinfo.c_str(), &st) != 0) {
+      fprintf(stderr, "stat(%s): %s\n", fdinfo.c_str(), strerror(errno));
+      _exit(kOther);
+    }
+    if (open(fdinfo.c_str(), O_RDONLY | O_DIRECTORY) >= 0 || errno != EACCES) {
+      fprintf(stderr, "open(%s): %s\n", fdinfo.c_str(), strerror(errno));
+      _exit(kOther);
+    }
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }
 
@@ -2882,6 +3017,23 @@ TEST(LandlockV1Test, ConcurrentRenamesNeverCombineGrantsFromDifferentPaths) {
       _exit(kAllowed);
     }
     _exit(kDenied);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, FdinfoEntryStaysScopedAfterAnotherTaskLooksItUp) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open("/", O_RDONLY));
+  const std::string entry =
+      absl::StrCat("/proc/", getpid(), "/fdinfo/", fd.get());
+  struct stat st;
+  ASSERT_THAT(stat(entry.c_str(), &st), SyscallSucceeds());
+  ASSERT_NO_ERRNO(Open(entry, O_RDONLY));
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_REG));
+    _exit(TryReadOpen(entry));
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
       << "exit status " << status;

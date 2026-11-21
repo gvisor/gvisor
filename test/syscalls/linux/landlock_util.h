@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -349,6 +350,52 @@ inline int MoveMount(int from_dirfd, const std::string& from, int to_dirfd,
                      const std::string& to, uint32_t flags) {
   return syscall(SYS_move_mount, from_dirfd, from.c_str(), to_dirfd, to.c_str(),
                  flags);
+}
+
+inline pid_t ForkTracee(bool extra_layer, int* stop_fd) {
+  int stop[2], ready[2];
+  if (pipe(stop) != 0 || pipe(ready) != 0) {
+    _exit(kSetup);
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    _exit(kSetup);
+  }
+  if (pid == 0) {
+    close(stop[1]);
+    close(ready[0]);
+    if (extra_layer) {
+      EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_REG));
+    }
+    close(ready[1]);
+    char c;
+    while (read(stop[0], &c, 1) == -1 && errno == EINTR) {
+    }
+    _exit(0);
+  }
+  close(stop[0]);
+  close(ready[1]);
+  char c;
+  while (read(ready[0], &c, 1) == -1 && errno == EINTR) {
+  }
+  close(ready[0]);
+  *stop_fd = stop[1];
+  return pid;
+}
+
+inline ChildResult TryAttach(pid_t tracee, int stop_fd) {
+  int rc = ptrace(PTRACE_ATTACH, tracee, nullptr, nullptr);
+  int err = errno;
+  if (rc == 0) {
+    waitpid(tracee, nullptr, 0);
+    ptrace(PTRACE_DETACH, tracee, nullptr, nullptr);
+  }
+  close(stop_fd);
+  waitpid(tracee, nullptr, 0);
+  if (rc == 0) {
+    return kAllowed;
+  }
+  return err == EPERM ? kDenied : kOther;
 }
 
 inline sockaddr_in LoopbackAddr(uint16_t port) {
