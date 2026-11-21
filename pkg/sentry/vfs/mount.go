@@ -502,15 +502,32 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 // MoveMountAt connects source's mount at the path represented by target, possibly first disconnecting source's mnt.
 // The target's mountpoint may or may not be connected.
 // The path lookups for source and target checks traversal permissions against creds.
+// MoveMountAt looks up target before source, as Linux does, so that an error
+// from target's lookup comes first. If creds has a Landlock domain,
+// MoveMountAt returns EPERM once both paths resolve.
 //
 // Roughly analogous to Linux fs/namespace.c:do_move_mount().
 func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Credentials, taskMountNs *MountNamespace, source *PathOperation, target *PathOperation) error {
+	// Lookup the target path
+	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{})
+	if err != nil {
+		return err
+	}
+	targetCleanup := cleanup.Make(func() {
+		targetVd.DecRef(ctx)
+	})
+	defer targetCleanup.Clean()
+
 	// Lookup the source path
 	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{})
 	if err != nil {
 		return err
 	}
 	defer sourceVd.DecRef(ctx)
+
+	if err := LandlockDomainOf(creds).CheckMountChange(); err != nil {
+		return err
+	}
 
 	// The source path must be the root of its mount.
 	sourceMnt := sourceVd.mount
@@ -528,16 +545,6 @@ func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Crede
 	if err != nil {
 		return err
 	}
-
-	// Lookup the target path
-	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{})
-	if err != nil {
-		return err
-	}
-	targetCleanup := cleanup.Make(func() {
-		targetVd.DecRef(ctx)
-	})
-	defer targetCleanup.Clean()
 
 	// Fetch target stat info
 	targetStat, err := vfs.StatAt(ctx, creds, &PathOperation{
@@ -1028,7 +1035,9 @@ func (vfs *VirtualFilesystem) mountHidesContent(mnt *Mount) bool {
 	return false
 }
 
-// UmountAt removes the Mount at the given path.
+// UmountAt removes the Mount at the given path. If creds has a Landlock
+// domain, UmountAt returns EPERM once the path resolves to an unlocked mount
+// point in the caller's mount namespace.
 func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *UmountOptions) error {
 	if opts.Flags&^(linux.MNT_FORCE|linux.MNT_DETACH) != 0 {
 		return linuxerr.EINVAL
@@ -1054,6 +1063,9 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 	}
 	if !vfs.validInMountNS(ctx, vd.mount) {
 		return linuxerr.EINVAL
+	}
+	if err := LandlockDomainOf(creds).CheckMountChange(); err != nil {
+		return err
 	}
 	if vd.mount == vd.mount.ns.root {
 		return linuxerr.EINVAL
@@ -1575,8 +1587,20 @@ retryFirst:
 // PivotRoot makes location pointed to by newRootPop the root of the current
 // namespace, and moves the current root to the location pointed to by
 // putOldPop. If the operation is successful, it returns virtual dentries for
-// the new root and the old root with an extra reference taken.
+// the new root and the old root with an extra reference taken. If creds has a
+// Landlock domain, PivotRoot returns EPERM once both paths resolve to
+// directories.
 func (vfs *VirtualFilesystem) PivotRoot(ctx context.Context, creds *auth.Credentials, newRootPop *PathOperation, putOldPop *PathOperation) (newRoot, oldRoot VirtualDentry, err error) {
+	if LandlockDomainOf(creds) != nil {
+		// Resolve both paths as directories, as Linux does with
+		// LOOKUP_DIRECTORY. Unlike the lookups below, this does not check
+		// search permission on the directories themselves.
+		newRootDir, putOldDir := *newRootPop, *putOldPop
+		newRootDir.Path.Dir = true
+		putOldDir.Path.Dir = true
+		err = vfs.CheckLandlockMountChangeAt(ctx, creds, &newRootDir, &putOldDir)
+		return
+	}
 	newRoot, err = vfs.GetDentryAt(ctx, creds, newRootPop, &GetDentryOptions{CheckSearchable: true})
 	if err != nil {
 		return

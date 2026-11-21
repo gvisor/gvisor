@@ -189,6 +189,28 @@ func (d *LandlockDomain) CheckMountChange() error {
 	return nil
 }
 
+// CheckLandlockMountChangeAt returns nil if creds has no Landlock domain.
+// Otherwise it resolves the paths in pops, in order, and returns the error of
+// the first that fails to resolve, or EPERM, as LandlockDomain.CheckMountChange
+// does, if all of them resolve. It resolves the paths only so that their
+// errors come before the EPERM, and does not act on the resolved files. For
+// example, a bind mount onto a missing target by a task with a domain fails
+// with ENOENT, and a bind mount onto an existing target fails with EPERM.
+func (vfs *VirtualFilesystem) CheckLandlockMountChangeAt(ctx context.Context, creds *auth.Credentials, pops ...*PathOperation) error {
+	dom := LandlockDomainOf(creds)
+	if dom == nil {
+		return nil
+	}
+	for _, pop := range pops {
+		vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
+		if err != nil {
+			return err
+		}
+		vd.DecRef(ctx)
+	}
+	return dom.CheckMountChange()
+}
+
 // CanPtrace implements auth.LandlockDomain.CanPtrace.
 func (d *LandlockDomain) CanPtrace(tracee auth.LandlockDomain) bool {
 	if d == nil {

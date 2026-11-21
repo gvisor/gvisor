@@ -257,6 +257,7 @@ inline void ExpectOpen(const std::string& path, int flags, int want) {
 }
 
 constexpr int kExdev = 103;
+constexpr int kEperm = 104;
 
 inline int ClassifyRefer(int rc) {
   if (rc == 0) {
@@ -269,6 +270,13 @@ inline int ClassifyRefer(int rc) {
     return kExdev;
   }
   return kOther;
+}
+
+inline int ClassifyMount(int rc) {
+  if (rc == 0) {
+    return kAllowed;
+  }
+  return errno == EPERM ? kEperm : kOther;
 }
 
 enum ErrnoResult {
@@ -332,6 +340,16 @@ inline void ApplyTwoDirPolicy(uint64_t handled_access, const std::string& dir1,
 #ifndef SYS_move_mount
 #define SYS_move_mount 429
 #endif
+
+inline int PivotRoot(const std::string& new_root, const std::string& put_old) {
+  return syscall(SYS_pivot_root, new_root.c_str(), put_old.c_str());
+}
+
+inline int MoveMount(int from_dirfd, const std::string& from, int to_dirfd,
+                     const std::string& to, uint32_t flags) {
+  return syscall(SYS_move_mount, from_dirfd, from.c_str(), to_dirfd, to.c_str(),
+                 flags);
+}
 
 inline sockaddr_in LoopbackAddr(uint16_t port) {
   sockaddr_in addr = {};

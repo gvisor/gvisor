@@ -37,9 +37,6 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	if !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.MountNamespace().Owner) {
 		return 0, nil, linuxerr.EPERM
 	}
-	if err := t.LandlockDomain().CheckMountChange(); err != nil {
-		return 0, nil, err
-	}
 
 	// Ignore magic value that was required before Linux 2.4.
 	if flags&linux.MS_MGC_MSK == linux.MS_MGC_VAL {
@@ -50,8 +47,9 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 
 	// Linux just allows passing any flags to mount(2) - it won't fail when
 	// unknown or unsupported flags are passed. Since we don't implement
-	// everything, we fail explicitly on flags that are unimplemented.
-	if flags&(unsupported) != 0 {
+	// everything, we fail explicitly on flags that are unimplemented. A task
+	// with a Landlock domain gets EPERM below instead, whatever its flags.
+	if flags&(unsupported) != 0 && t.LandlockDomain() == nil {
 		return 0, nil, linuxerr.EINVAL
 	}
 
@@ -94,6 +92,11 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		}
 	}
 	opts.GetFilesystemOptions.Data = data
+	// A task with a Landlock domain gets EPERM once the target resolves,
+	// before the source and the filesystem type are read.
+	if err := t.Kernel().VFS().CheckLandlockMountChangeAt(t, creds, &target.pop); err != nil {
+		return 0, nil, err
+	}
 	switch {
 	case flags&linux.MS_REMOUNT != 0:
 		// When MS_REMOUNT is specified, the flags and data should match the values used in the original mount() call,
@@ -157,9 +160,6 @@ func Umount2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	creds := t.Credentials()
 	if !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.MountNamespace().Owner) {
 		return 0, nil, linuxerr.EPERM
-	}
-	if err := t.LandlockDomain().CheckMountChange(); err != nil {
-		return 0, nil, err
 	}
 
 	const unsupported = linux.MNT_FORCE | linux.MNT_EXPIRE

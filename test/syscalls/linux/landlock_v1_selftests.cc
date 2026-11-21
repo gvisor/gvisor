@@ -1171,6 +1171,115 @@ TEST(LandlockV1Test, RuleOnBindMountRootReachesDisconnectedDirectory) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, MountDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath dst_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = src_dir.path();
+  const std::string to = dst_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(from.c_str(), to.c_str(), nullptr, MS_BIND, nullptr) ==
+                0);
+    TEST_PCHECK(umount2(to.c_str(), MNT_DETACH) == 0);
+
+    ApplyFsPolicy(kFsAccessV1, from, kFsAccessV1);
+    _exit(ClassifyMount(
+        mount(from.c_str(), to.c_str(), nullptr, MS_BIND, nullptr)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PivotRootDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath new_root_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string new_root = new_root_dir.path();
+  const std::string put_old = JoinPath(new_root, "old");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("none", new_root.c_str(), "tmpfs", 0, nullptr) == 0);
+    TEST_PCHECK(mkdir(put_old.c_str(), 0755) == 0);
+
+    ApplyFsPolicy(kFsAccessV1, new_root, kFsAccessV1);
+    _exit(ClassifyMount(PivotRoot(new_root, put_old)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MoveMountDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  MoveMount(-1, "", -1, "", 0);
+  SKIP_IF(errno == ENOSYS);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath first_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath second_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = src_dir.path();
+  const std::string first = first_dir.path();
+  const std::string second = second_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(from.c_str(), first.c_str(), nullptr, MS_BIND, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, from, kFsAccessV1);
+    _exit(ClassifyMount(MoveMount(AT_FDCWD, first, AT_FDCWD, second, 0)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, Umount2DeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath dst_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = src_dir.path();
+  const std::string to = dst_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(from.c_str(), to.c_str(), nullptr, MS_BIND, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, to, kFsAccessV1);
+    _exit(ClassifyMount(umount2(to.c_str(), MNT_DETACH)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, RuleDiesWithTheFile) {
   SKIP_IF(LandlockAbiVersion() < 1);
 

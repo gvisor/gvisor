@@ -808,6 +808,140 @@ TEST(LandlockV1Test, RuleOnCoveredDirectoryDoesNotReachMountedFilesystem) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, MountWithMissingTargetReportsEnoentNotEperm) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = src_dir.path();
+  const std::string missing = JoinPath(root.path(), "missing");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, from, kFsAccessV1);
+    _exit(ClassifyErrno(
+        mount(from.c_str(), missing.c_str(), nullptr, MS_BIND, nullptr)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrNoent)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, Umount2OfNonMountpointReportsEinvalNotEperm) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath plain_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string plain = plain_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, plain, kFsAccessV1);
+    _exit(ClassifyErrno(umount2(plain.c_str(), MNT_DETACH)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrInval)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PivotRootWithMissingNewRootReportsEnoentNotEperm) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string dir = root.path();
+  const std::string missing = JoinPath(dir, "missing");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, dir, kFsAccessV1);
+    _exit(ClassifyErrno(PivotRoot(missing, dir)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrNoent)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PivotRootWithNonDirectoryNewRootReportsEnotdirNotEperm) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string dir = root.path();
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir));
+  const std::string nondir = file.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, dir, kFsAccessV1);
+    _exit(ClassifyErrno(PivotRoot(nondir, dir)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrNotdir)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MoveMountResolvesTargetBeforeSource) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  MoveMount(-1, "", -1, "", 0);
+  SKIP_IF(errno == ENOSYS);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const std::string bad_source = JoinPath(file.path(), "x");
+  const std::string missing_target = JoinPath(root.path(), "missing");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, root.path(), kFsAccessV1);
+    _exit(ClassifyErrno(
+        MoveMount(AT_FDCWD, bad_source, AT_FDCWD, missing_target, 0)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrNoent)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MoveMountWithMissingSourceReportsEnoentNotEperm) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  MoveMount(-1, "", -1, "", 0);
+  SKIP_IF(errno == ENOSYS);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath dst_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string to = dst_dir.path();
+  const std::string missing = JoinPath(root.path(), "missing");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, to, kFsAccessV1);
+    _exit(ClassifyErrno(MoveMount(AT_FDCWD, missing, AT_FDCWD, to, 0)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrNoent)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, OverlayUnlinkOfMissingFileReportsEnoentNotEacces) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
@@ -1263,6 +1397,78 @@ TEST(LandlockV1Test, TiocgptpeerChecksOpenRightsUnlessOPath) {
   status = ASSERT_NO_ERRNO_AND_VALUE(peer(O_PATH));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "O_PATH: exit status " << status;
+}
+
+#ifndef SYS_fsopen
+#define SYS_fsopen 430
+#define SYS_fsconfig 431
+#define SYS_fsmount 432
+#endif
+#ifndef FSCONFIG_CMD_CREATE
+#define FSCONFIG_SET_STRING 0x1
+#define FSCONFIG_CMD_CREATE 0x6
+#define FSCONFIG_CMD_RECONFIGURE 0x7
+#endif
+
+TEST(LandlockV1Test, FsconfigReconfigureDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fs_fd = syscall(SYS_fsopen, "tmpfs", 0);
+    if (fs_fd < 0) {
+      _exit(kUnsupported);
+    }
+    if (syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE, nullptr, nullptr,
+                0) != 0) {
+      _exit(kUnsupported);
+    }
+    int mount_fd = syscall(SYS_fsmount, fs_fd, 0, 0);
+    if (mount_fd < 0) {
+      _exit(kUnsupported);
+    }
+
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+
+    _exit(ClassifyMount(syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_RECONFIGURE,
+                                nullptr, nullptr, 0)));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+bool InInitUserNamespace() {
+  auto uid_map = GetContents("/proc/self/uid_map");
+  return uid_map.ok() &&
+         uid_map.ValueOrDie().find("4294967295") != std::string::npos;
+}
+
+TEST(LandlockV1Test, FsconfigCreateDevtmpfsIgnoresDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!InInitUserNamespace());
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 6 || (version.major == 6 && version.minor < 15));
+  }
+  const DisableSave ds;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_CHAR |
+                            LANDLOCK_ACCESS_FS_MAKE_DIR |
+                            LANDLOCK_ACCESS_FS_MAKE_SYM);
+    int fs_fd = syscall(SYS_fsopen, "devtmpfs", 0);
+    if (fs_fd < 0) {
+      _exit(kUnsupported);
+    }
+    _exit(ClassifyErrno(syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE,
+                                nullptr, nullptr, 0)));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrOk)
+      << "exit status " << status;
 }
 
 TEST(LandlockV1Test, DomainEnforcedAfterExecve) {
@@ -2042,6 +2248,32 @@ TEST(LandlockV1Test, CrossMountLinkAndRenameAreExdevBeforeLandlock) {
     _exit(ClassifyErrno(rename(src.path().c_str(), dst.c_str())));
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrExdev)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PivotRootIgnoresSearchPermissionOnTargetsBeforeEperm) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const TempPath base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath new_root =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base.path()));
+  const TempPath put_old =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base.path()));
+  ASSERT_THAT(chmod(new_root.path().c_str(), 0), SyscallSucceeds());
+  ASSERT_THAT(chmod(put_old.path().c_str(), 0), SyscallSucceeds());
+  auto restore = Cleanup([&] {
+    EXPECT_THAT(chmod(new_root.path().c_str(), 0755), SyscallSucceeds());
+    EXPECT_THAT(chmod(put_old.path().c_str(), 0755), SyscallSucceeds());
+  });
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_CHECK_NO_ERRNO(SetCapability(CAP_DAC_OVERRIDE, false));
+    TEST_CHECK_NO_ERRNO(SetCapability(CAP_DAC_READ_SEARCH, false));
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyErrno(syscall(SYS_pivot_root, new_root.path().c_str(),
+                                put_old.path().c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrPerm)
       << "exit status " << status;
 }
 
