@@ -892,8 +892,10 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
 		if err := rp.checkLandlockGate(LandlockOpSymlink, linux.LANDLOCK_ACCESS_FS_MAKE_SYM); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.SymlinkAt(ctx, rp, target)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "SymlinkAt")
 			return nil
 		}
 		if checkInvariants {

@@ -1387,6 +1387,38 @@ TEST(LandlockV1Test, MakeRegInsideAllowedTreeAllowed) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, SymlinkCreationRequiresMakeSym) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath nested_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(allowed_dir.path()));
+  static std::string allowed;
+  static std::string allowed_link;
+  static std::string nested_link;
+  static std::string denied_link;
+  allowed = allowed_dir.path();
+  allowed_link = JoinPath(allowed_dir.path(), "link");
+  nested_link = JoinPath(nested_dir.path(), "link");
+  denied_link = JoinPath(root.path(), "link");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SYM, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SYM);
+    if (symlink("none", allowed_link.c_str()) != 0 ||
+        symlink("none", nested_link.c_str()) != 0) {
+      _exit(kOther);
+    }
+    _exit(ClassifyFs(symlink("none", denied_link.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+  EXPECT_THAT(unlink(nested_link.c_str()), SyscallSucceeds());
+  EXPECT_THAT(unlink(allowed_link.c_str()), SyscallSucceeds());
+}
+
 TEST(LandlockV1Test, MakeDirOutsideAllowedTreeDenied) {
   SKIP_IF(LandlockAbiVersion() < 1);
 

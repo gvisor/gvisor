@@ -1154,6 +1154,9 @@ func (fs *Filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	if err := rp.CheckLandlockCreate(ctx, parent.VFSDentry(), linux.ModeSymlink); err != nil {
+		return err
+	}
 	childI, err := parent.inode.NewSymlink(ctx, pc, target)
 	if err != nil {
 		return err
@@ -1376,7 +1379,7 @@ func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*Filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

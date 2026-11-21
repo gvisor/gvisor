@@ -1791,7 +1791,9 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
-	return fs.doCreateAt(ctx, rp, createNonDirectory, nil /* checkLandlock */, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry) error {
+		return rp.CheckLandlockCreate(ctx, &parent.vfsd, linux.ModeSymlink)
+	}, func(parent *dentry, childName string, haveUpperWhiteout bool, ds **[]*dentry) error {
 		vfsObj := fs.vfsfs.VirtualFilesystem()
 		pop := vfs.PathOperation{
 			Root:  parent.upperVD,
@@ -2229,7 +2231,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

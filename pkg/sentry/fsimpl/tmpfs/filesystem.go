@@ -906,6 +906,9 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
 	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
+		if err := rp.CheckLandlockCreate(ctx, &parentDir.dentry.vfsd, linux.ModeSymlink); err != nil {
+			return err
+		}
 		// Linux allocates a page to store symlink targets that have length larger
 		// than shortSymlinkLen. Targets are just stored as string here, but simulate
 		// the page accounting for it. See mm/shmem.c:shmem_symlink().
@@ -1125,7 +1128,7 @@ func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 
 // LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
 func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
-	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
