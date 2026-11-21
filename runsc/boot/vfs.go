@@ -806,6 +806,17 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		}
 	}
 
+	// Propagate the lower layer's root's owner, group, and mode to the upper
+	// layer's root for consistency with VFS1.
+	upperRootSetStat := vfs.SetStatOptions{
+		Stat: linux.Statx{
+			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
+			UID:  stat.UID,
+			GID:  stat.GID,
+			Mode: stat.Mode,
+		},
+	}
+
 	// We need to hide the filestore from the containerized application.
 	if mountConf.IsSelfBacked() {
 		// The whiteout is internal and must not change the mtime of the upper
@@ -821,6 +832,8 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to stat upper layer's root: %w", err)
 		}
+		upperRootSetStat.Stat.Mask |= linux.STATX_MTIME
+		upperRootSetStat.Stat.Mtime = upperRootStat.Mtime
 		if err := overlay.CreateWhiteout(ctx, c.l.k.VFS(), creds, &vfs.PathOperation{
 			Root:  upperRootVD,
 			Start: upperRootVD,
@@ -828,29 +841,12 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		}); err != nil {
 			return nil, nil, fmt.Errorf("failed to create whiteout to hide self overlay filestore: %w", err)
 		}
-		if err := c.l.k.VFS().SetStatAt(ctx, creds, upperRootPop, &vfs.SetStatOptions{
-			Stat: linux.Statx{
-				Mask:  linux.STATX_MTIME,
-				Mtime: upperRootStat.Mtime,
-			},
-		}); err != nil {
-			return nil, nil, fmt.Errorf("failed to restore upper layer's root mtime: %w", err)
-		}
 	}
 
-	// Propagate the lower layer's root's owner, group, and mode to the upper
-	// layer's root for consistency with VFS1.
 	err = c.l.k.VFS().SetStatAt(ctx, creds, &vfs.PathOperation{
 		Root:  upperRootVD,
 		Start: upperRootVD,
-	}, &vfs.SetStatOptions{
-		Stat: linux.Statx{
-			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
-			UID:  stat.UID,
-			GID:  stat.GID,
-			Mode: stat.Mode,
-		},
-	})
+	}, &upperRootSetStat)
 	if err != nil {
 		return nil, nil, err
 	}
