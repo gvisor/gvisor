@@ -87,8 +87,14 @@ func (fd *regularFileFD) currentFDLocked(ctx context.Context) (*vfs.FileDescript
 	d := fd.dentry()
 	statusFlags := fd.vfsfd.StatusFlags()
 	if !fd.copiedUp && d.isCopiedUp() {
-		// Switch to the copied-up file.
+		// Switch to the copied-up file. The switch opens the upper file with
+		// fd's own flags, so it needs the rights that this open needs from
+		// fs's creator's domain. A denied switch leaves fd on the lower
+		// file, and fails each later operation that needs the switch.
 		upperVD := d.topLayer()
+		if err := d.fs.checkLayerOpen(ctx, upperVD, &vfs.OpenOptions{Flags: statusFlags}); err != nil {
+			return nil, err
+		}
 		upperFD, err := fd.filesystem().vfsfs.VirtualFilesystem().OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 			Root:  upperVD,
 			Start: upperVD,

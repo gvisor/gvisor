@@ -122,8 +122,13 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		Start: d.lowerVDs[0],
 	}
 	const timestampsMask = linux.STATX_ATIME | linux.STATX_MTIME
+	statMask := uint32(timestampsMask)
+	if d.fs.creatorLandlock != nil {
+		// checkCopyUpData needs the size of a regular file.
+		statMask |= linux.STATX_SIZE
+	}
 	oldStat, err := vfsObj.StatAt(ctx, d.fs.creds, &oldpop, &vfs.StatOptions{
-		Mask: timestampsMask,
+		Mask: statMask,
 	})
 	if err != nil {
 		return err
@@ -155,6 +160,11 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 	}
 	switch ftype {
 	case linux.S_IFREG:
+		if !skipData && d.fs.creatorLandlock != nil {
+			if err := d.checkCopyUpData(ctx, parent, &oldStat); err != nil {
+				return err
+			}
+		}
 		oldFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &oldpop, &vfs.OpenOptions{
 			Flags: linux.O_RDONLY,
 		})
@@ -462,6 +472,28 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		d.copiedUp.Store(1)
 	})
 	return nil
+}
+
+// checkCopyUpData checks a copy-up of regular file d into the copied-up
+// directory parent that copies d's data, given oldStat, the stat of d's
+// topmost lower file, against d.fs.creatorLandlock. The copy-up needs
+// LANDLOCK_ACCESS_FS_READ_FILE on the lower file, then
+// LANDLOCK_ACCESS_FS_WRITE_FILE on the new upper file, checked from
+// d.fs.copyUpWriteDir(parent). A file whose size is known to be 0 has no data
+// to copy, so it needs neither right; a file whose filesystem reports no size,
+// as many synthetic files do, needs both. For example, chmod(2) of a non-empty
+// lower file fails with EACCES if the creator's domain denies reading it.
+//
+// Preconditions: d.copyMu must be locked for writing. oldStat.Mask was
+// requested with linux.STATX_SIZE.
+func (d *dentry) checkCopyUpData(ctx context.Context, parent *dentry, oldStat *linux.Statx) error {
+	if oldStat.Mask&linux.STATX_SIZE != 0 && oldStat.Size == 0 {
+		return nil
+	}
+	if err := d.fs.checkLayerAccess(ctx, d.lowerVDs[0], linux.LANDLOCK_ACCESS_FS_READ_FILE); err != nil {
+		return err
+	}
+	return d.fs.checkLayerAccess(ctx, d.fs.copyUpWriteDir(parent), linux.LANDLOCK_ACCESS_FS_WRITE_FILE)
 }
 
 // mustCopyXattr returns true if a copy-up failure on the given xattr must

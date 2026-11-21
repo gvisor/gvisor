@@ -1738,6 +1738,74 @@ TEST(LandlockV1Test, OpenCreatOfExistingFileNeedsNoMakeReg) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, OverlayOfLandlockedCreatorIsNotCheckedInItsLayers) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr) == 0);
+    const std::string lower = JoinPath(root.path(), "lower");
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    TEST_PCHECK(mkdir(lower.c_str(), 0755) == 0);
+    TEST_PCHECK(mkdir(JoinPath(lower, "sub").c_str(), 0755) == 0);
+    TEST_PCHECK(mkdir(upper.c_str(), 0755) == 0);
+    TEST_PCHECK(mkdir(work.c_str(), 0755) == 0);
+    for (const std::string& file :
+         {JoinPath(lower, "g"), JoinPath(lower, "sub/f")}) {
+      int fd = open(file.c_str(), O_CREAT | O_WRONLY, 0644);
+      TEST_PCHECK(fd >= 0);
+      close(fd);
+    }
+
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR,
+                  root.path(),
+                  LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR);
+    int fs_fd = syscall(SYS_fsopen, "overlay", 0);
+    if (fs_fd < 0) {
+      _exit(kUnsupported);
+    }
+    if (syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "lowerdir",
+                lower.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "upperdir",
+                upper.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "workdir",
+                work.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE, nullptr, nullptr,
+                0) != 0) {
+      perror("fsconfig(overlay)");
+      _exit(errno == EACCES ? kDenied : kUnsupported);
+    }
+    int mfd = syscall(SYS_fsmount, fs_fd, 0, 0);
+    if (mfd < 0) {
+      perror("fsmount(overlay)");
+      _exit(kSetup);
+    }
+    for (const char* name : {"g", "sub/f"}) {
+      int fd = openat(mfd, name, O_WRONLY);
+      if (fd < 0) {
+        perror(name);
+        _exit(ClassifyFs(fd));
+      }
+      close(fd);
+    }
+    int fd = openat(mfd, "sub/new", O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0 || errno != EACCES) {
+      _exit(kOther);
+    }
+    _exit(kAllowed);
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, ExecveatOfOpathDescriptorRequiresExecute) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(access("/bin/sh", X_OK) != 0);
@@ -2077,6 +2145,215 @@ TEST(LandlockV1Test, TiocgptpeerWithOPathReturnsOPathFile) {
   }
 }
 
+enum class OverlayCreator {
+  kRestrictedBeforeFsopen,
+  kRestrictedBeforeCreate,
+};
+
+PosixErrorOr<int> OverlayCopyUpOpens(const std::string& root,
+                                     std::vector<std::string> granted,
+                                     OverlayCreator creator) {
+  return InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.c_str(), "tmpfs", 0, nullptr) == 0);
+    const std::string lower = JoinPath(root, "lower");
+    const std::string sandbox = JoinPath(root, "sandbox");
+    const std::string upper = JoinPath(sandbox, "upper");
+    const std::string work = JoinPath(sandbox, "work");
+    for (const std::string& dir : {lower, sandbox, upper, work}) {
+      TEST_PCHECK(mkdir(dir.c_str(), 0755) == 0);
+    }
+    int fd = open(JoinPath(lower, "key").c_str(), O_CREAT | O_WRONLY, 0644);
+    TEST_PCHECK(fd >= 0);
+    TEST_PCHECK(write(fd, "secret", 6) == 6);
+    close(fd);
+    fd = open(JoinPath(lower, "empty").c_str(), O_CREAT | O_WRONLY, 0644);
+    TEST_PCHECK(fd >= 0);
+    close(fd);
+
+    int fs_fd = -1;
+    if (creator == OverlayCreator::kRestrictedBeforeCreate) {
+      fs_fd = syscall(SYS_fsopen, "overlay", 0);
+      if (fs_fd < 0) {
+        _exit(kUnsupported);
+      }
+    }
+    constexpr uint64_t kRW =
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
+    int ruleset = CreateRuleset(kRW);
+    for (const std::string& path : granted) {
+      AddPathRule(ruleset, JoinPath(root, path), kRW);
+    }
+    EnforceOrDie(ruleset);
+    if (fs_fd < 0) {
+      fs_fd = syscall(SYS_fsopen, "overlay", 0);
+      if (fs_fd < 0) {
+        _exit(kUnsupported);
+      }
+    }
+    if (syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "lowerdir",
+                lower.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "upperdir",
+                upper.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "workdir",
+                work.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE, nullptr, nullptr,
+                0) != 0) {
+      perror("fsconfig(overlay)");
+      _exit(kUnsupported);
+    }
+    int mfd = syscall(SYS_fsmount, fs_fd, 0, 0);
+    if (mfd < 0) {
+      perror("fsmount(overlay)");
+      _exit(kSetup);
+    }
+    if (fchmodat(mfd, "empty", 0600, 0) != 0) {
+      perror("fchmodat(empty)");
+      _exit(kOther);
+    }
+    int rc = fchmodat(mfd, "key", 0600, 0);
+    ChildResult res = ClassifyFs(rc);
+    struct stat st;
+    bool copied = stat(JoinPath(upper, "key").c_str(), &st) == 0;
+    if ((res == kAllowed) != copied) {
+      fprintf(stderr, "fchmodat(key): %d, upper/key exists: %d\n", rc, copied);
+      _exit(kOther);
+    }
+    _exit(res);
+  });
+}
+
+TEST(LandlockV1Test, OverlayCopyUpChecksCreatorDomainOnLayerFiles) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;
+
+  struct Case {
+    std::vector<std::string> granted;
+    OverlayCreator creator;
+    ChildResult want;
+  };
+  const Case cases[] = {
+      {{"sandbox"}, OverlayCreator::kRestrictedBeforeFsopen, kDenied},
+      {{"sandbox"}, OverlayCreator::kRestrictedBeforeCreate, kDenied},
+      {{""}, OverlayCreator::kRestrictedBeforeFsopen, kDenied},
+      {{"sandbox", "lower"}, OverlayCreator::kRestrictedBeforeFsopen, kAllowed},
+      {{"lower", "sandbox/upper"},
+       OverlayCreator::kRestrictedBeforeFsopen,
+       kAllowed},
+      {{"lower"}, OverlayCreator::kRestrictedBeforeFsopen, kDenied},
+  };
+  for (const Case& c : cases) {
+    const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+    int status = ASSERT_NO_ERRNO_AND_VALUE(
+        OverlayCopyUpOpens(root.path(), c.granted, c.creator));
+    SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == c.want)
+        << "granted " << absl::StrJoin(c.granted, ",") << ", creator "
+        << static_cast<int>(c.creator) << ": exit status " << status;
+  }
+}
+
+TEST(LandlockV1Test, OverlayLayerOpensCheckCreatorDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr) == 0);
+    const std::string lower1 = JoinPath(root.path(), "lower1");
+    const std::string lower2 = JoinPath(root.path(), "lower2");
+    const std::string sandbox = JoinPath(root.path(), "sandbox");
+    for (const std::string& dir : {lower1, lower2, sandbox}) {
+      TEST_PCHECK(mkdir(dir.c_str(), 0755) == 0);
+    }
+    int fd = open(JoinPath(lower1, "key").c_str(), O_CREAT | O_WRONLY, 0644);
+    TEST_PCHECK(fd >= 0);
+    TEST_PCHECK(write(fd, "secret", 6) == 6);
+    close(fd);
+
+    int sv[2];
+    TEST_PCHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t pid = fork();
+    TEST_PCHECK(pid >= 0);
+    if (pid == 0) {
+      ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
+                    sandbox,
+                    LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR);
+      int fs_fd = syscall(SYS_fsopen, "overlay", 0);
+      if (fs_fd < 0) {
+        _exit(kUnsupported);
+      }
+      const std::string lowers = absl::StrCat(lower1, ":", lower2);
+      if (syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "lowerdir",
+                  lowers.c_str(), 0) != 0 ||
+          syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE, nullptr, nullptr,
+                  0) != 0) {
+        _exit(kUnsupported);
+      }
+      int mfd = syscall(SYS_fsmount, fs_fd, 0, 0);
+      if (mfd < 0) {
+        _exit(kSetup);
+      }
+      char c = 0;
+      iovec iov = {&c, 1};
+      char cbuf[CMSG_SPACE(sizeof(int))] = {};
+      msghdr msg = {};
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      msg.msg_control = cbuf;
+      msg.msg_controllen = sizeof(cbuf);
+      cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+      cmsg->cmsg_level = SOL_SOCKET;
+      cmsg->cmsg_type = SCM_RIGHTS;
+      cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+      memcpy(CMSG_DATA(cmsg), &mfd, sizeof(int));
+      TEST_PCHECK(sendmsg(sv[1], &msg, 0) == 1);
+      _exit(0);
+    }
+    char c;
+    iovec iov = {&c, 1};
+    char cbuf[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg = {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
+    int creator_status;
+    TEST_PCHECK(waitpid(pid, &creator_status, 0) == pid);
+    if (!WIFEXITED(creator_status) || WEXITSTATUS(creator_status) != 0) {
+      _exit(WIFEXITED(creator_status) ? WEXITSTATUS(creator_status) : kSetup);
+    }
+    TEST_PCHECK(recvmsg(sv[0], &msg, 0) == 1);
+    int mfd;
+    memcpy(&mfd, CMSG_DATA(CMSG_FIRSTHDR(&msg)), sizeof(int));
+
+    if (openat(mfd, "key", O_RDONLY) >= 0 || errno != EACCES) {
+      perror("openat(key)");
+      _exit(kOther);
+    }
+    if (openat(mfd, ".", O_RDONLY | O_DIRECTORY) >= 0 || errno != EACCES) {
+      perror("openat(.)");
+      _exit(kOther);
+    }
+    fd = openat(mfd, "key", O_PATH);
+    if (fd < 0) {
+      perror("openat(key, O_PATH)");
+      _exit(kOther);
+    }
+    _exit(kAllowed);
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, FailedUnixBindByUnrestrictedTaskRemovesOnlyItsFile) {
   const DisableSave ds;
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -2305,6 +2582,155 @@ TEST(LandlockV1Test, RulesetReleasedWhileItsProcFdResolvesDoesNotHang) {
       << "exit status " << status;
 }
 
+int OverlayFromLandlockedCreator(const std::string& lower,
+                                 const std::string& upper,
+                                 const std::string& work, uint64_t handled,
+                                 const std::vector<std::string>& granted,
+                                 uint64_t granted_access) {
+  int sv[2];
+  TEST_PCHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  pid_t pid = fork();
+  TEST_PCHECK(pid >= 0);
+  if (pid == 0) {
+    int ruleset = CreateRuleset(handled);
+    for (const std::string& path : granted) {
+      AddPathRule(ruleset, path, granted_access);
+    }
+    EnforceOrDie(ruleset);
+    int fs_fd = syscall(SYS_fsopen, "overlay", 0);
+    if (fs_fd < 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "lowerdir",
+                lower.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "upperdir",
+                upper.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "workdir",
+                work.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE, nullptr, nullptr,
+                0) != 0) {
+      _exit(kUnsupported);
+    }
+    int mfd = syscall(SYS_fsmount, fs_fd, 0, 0);
+    if (mfd < 0) {
+      _exit(kSetup);
+    }
+    char c = 0;
+    iovec iov = {&c, 1};
+    char cbuf[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg = {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &mfd, sizeof(int));
+    TEST_PCHECK(sendmsg(sv[1], &msg, 0) == 1);
+    _exit(0);
+  }
+  int creator_status;
+  TEST_PCHECK(waitpid(pid, &creator_status, 0) == pid);
+  if (!WIFEXITED(creator_status) || WEXITSTATUS(creator_status) != 0) {
+    _exit(WIFEXITED(creator_status) ? WEXITSTATUS(creator_status) : kSetup);
+  }
+  char c;
+  iovec iov = {&c, 1};
+  char cbuf[CMSG_SPACE(sizeof(int))] = {};
+  msghdr msg = {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cbuf;
+  msg.msg_controllen = sizeof(cbuf);
+  TEST_PCHECK(recvmsg(sv[0], &msg, 0) == 1);
+  int mfd;
+  memcpy(&mfd, CMSG_DATA(CMSG_FIRSTHDR(&msg)), sizeof(int));
+  close(sv[0]);
+  close(sv[1]);
+  return mfd;
+}
+
+TEST(LandlockV1Test, OverlayCreatorDomainChecksDirectoryEntriesWhenRead) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr) == 0);
+    const std::string lower = JoinPath(root.path(), "lower");
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    for (const std::string& dir :
+         {lower, upper, work, JoinPath(lower, "d"), JoinPath(upper, "d")}) {
+      TEST_PCHECK(mkdir(dir.c_str(), 0755) == 0);
+    }
+    for (const std::string& file :
+         {JoinPath(lower, "d/a"), JoinPath(upper, "d/b")}) {
+      int fd = open(file.c_str(), O_CREAT | O_WRONLY, 0644);
+      TEST_PCHECK(fd >= 0);
+      close(fd);
+    }
+    const uint64_t kRead =
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    int mfd = OverlayFromLandlockedCreator(lower, upper, work, kRead,
+                                           {upper, work}, kRead);
+    int dfd = openat(mfd, "d", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+      perror("openat(d)");
+      _exit(kOther);
+    }
+    char buf[4096];
+    int n = syscall(SYS_getdents64, dfd, buf, sizeof(buf));
+    if (n >= 0 || errno != EACCES) {
+      fprintf(stderr, "getdents64: %d, %s\n", n, strerror(errno));
+      _exit(kOther);
+    }
+    _exit(kAllowed);
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, OverlayCreateOpenDeniedByCreatorDomainLeavesFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr) == 0);
+    const std::string lower = JoinPath(root.path(), "lower");
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    for (const std::string& dir : {lower, upper, work}) {
+      TEST_PCHECK(mkdir(dir.c_str(), 0755) == 0);
+    }
+    int mfd = OverlayFromLandlockedCreator(
+        lower, upper, work, LANDLOCK_ACCESS_FS_WRITE_FILE, {}, 0);
+    if (openat(mfd, "new", O_CREAT | O_WRONLY, 0644) >= 0 || errno != EACCES) {
+      perror("openat(new, O_CREAT)");
+      _exit(kOther);
+    }
+    struct stat st;
+    if (fstatat(mfd, "new", &st, 0) != 0) {
+      perror("fstatat(new)");
+      _exit(kOther);
+    }
+    _exit(kAllowed);
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, OverlayRulesAddedBeforeAndAfterCopyUpNameOneFile) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
@@ -2458,6 +2884,94 @@ TEST(LandlockV1Test, ConcurrentRenamesNeverCombineGrantsFromDifferentPaths) {
     _exit(kDenied);
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, OverlayCopyUpOfFileOfUnknownSizeChecksCreatorDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(InInitialUserNamespace()));
+  const std::string lower = "/sys/devices/system/cpu";
+  SKIP_IF(access(JoinPath(lower, "online").c_str(), R_OK) != 0);
+  const DisableSave ds;
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr) == 0);
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    for (const std::string& dir : {upper, work}) {
+      TEST_PCHECK(mkdir(dir.c_str(), 0755) == 0);
+    }
+    ApplyFsPolicy(kFsAccessV1, root.path(), kFsAccessV1);
+    int fs_fd = syscall(SYS_fsopen, "overlay", 0);
+    if (fs_fd < 0) {
+      _exit(kUnsupported);
+    }
+    if (syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "lowerdir",
+                lower.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "upperdir",
+                upper.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "workdir",
+                work.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE, nullptr, nullptr,
+                0) != 0) {
+      _exit(kUnsupported);
+    }
+    int mfd = syscall(SYS_fsmount, fs_fd, 0, 0);
+    if (mfd < 0) {
+      _exit(kSetup);
+    }
+    _exit(ClassifyFs(fchmodat(mfd, "online", 0644, 0)));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, OverlayCreatesItsWorkDirectoryWithoutCreatorDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr) == 0);
+    const std::string lower = JoinPath(root.path(), "lower");
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    for (const std::string& dir : {lower, upper, work}) {
+      TEST_PCHECK(mkdir(dir.c_str(), 0755) == 0);
+    }
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_DIR);
+    int fs_fd = syscall(SYS_fsopen, "overlay", 0);
+    if (fs_fd < 0) {
+      _exit(kUnsupported);
+    }
+    if (syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "lowerdir",
+                lower.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "upperdir",
+                upper.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_SET_STRING, "workdir",
+                work.c_str(), 0) != 0 ||
+        syscall(SYS_fsconfig, fs_fd, FSCONFIG_CMD_CREATE, nullptr, nullptr,
+                0) != 0) {
+      _exit(kUnsupported);
+    }
+    if (syscall(SYS_fsmount, fs_fd, 0, 0) < 0) {
+      _exit(kSetup);
+    }
+    struct stat st;
+    _exit(stat(JoinPath(work, "work").c_str(), &st) == 0 ? kAllowed : kDenied);
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }
 

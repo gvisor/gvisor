@@ -996,9 +996,14 @@ func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *
 	mnt := rp.Mount()
 
 	// Directory FDs open FDs from each layer when directory entries are read,
-	// so they don't require opening an FD from d.topLayer() up front.
+	// so they don't require opening an FD from d.topLayer() up front. The
+	// open still needs LANDLOCK_ACCESS_FS_READ_DIR on the topmost layer
+	// directory, whatever its flags.
 	ftype := d.mode.Load() & linux.S_IFMT
 	if ftype == linux.S_IFDIR {
+		if err := d.fs.checkLayerAccess(ctx, d.topLayer(), linux.LANDLOCK_ACCESS_FS_READ_DIR); err != nil {
+			return nil, err
+		}
 		fd := &directoryFD{}
 		fd.LockFD.Init(&d.locks)
 		if err := fd.vfsfd.Init(fd, opts.Flags, rp.Credentials(), mnt, &d.vfsd, &vfs.FileDescriptionOptions{
@@ -1010,6 +1015,11 @@ func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *
 	}
 
 	layerVD, isUpper := d.topLayerInfo()
+	if ftype == linux.S_IFREG {
+		if err := d.fs.checkLayerOpen(ctx, layerVD, opts); err != nil {
+			return nil, err
+		}
+	}
 	layerFD, err := rp.VirtualFilesystem().OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 		Root:  layerVD,
 		Start: layerVD,
@@ -1101,6 +1111,14 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	// cleanup (the file was created successfully even if we can no longer open
 	// it for some reason).
 	parent.dirents = nil
+	// Like any layer open, the open of the new upper file needs the rights
+	// that fs's creator's domain grants. A denied open leaves the new file in
+	// place, so watchers are still told about it.
+	if err := fs.checkLayerOpen(ctx, upperFD.VirtualDentry(), opts); err != nil {
+		upperFD.DecRef(ctx)
+		parent.watches.Notify(withDropList(ctx, ds), childName, linux.IN_CREATE, 0 /* cookie */, vfs.PathEvent, false /* unlinked */)
+		return nil, err
+	}
 	upperFlags := upperFD.StatusFlags()
 	fd := &regularFileFD{
 		copiedUp:    true,

@@ -30,6 +30,10 @@ func (d *dentry) isSGIDSet() bool {
 	return d.mode.Load()&linux.ModeSetGID != 0
 }
 
+// collectWhiteoutsForRmdirLocked reads the entries of each of d's layer
+// directories, each of which needs LANDLOCK_ACCESS_FS_READ_DIR from d.fs's
+// creator's domain (see filesystem.checkLayerAccess).
+//
 // Preconditions:
 //   - d.dirMu must be locked.
 //   - d.isDir().
@@ -39,6 +43,10 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 	whiteouts := make(map[string]bool)
 	var maybeWhiteouts []string
 	d.iterLayers(func(layerVD vfs.VirtualDentry, isUpper bool) bool {
+		if err := d.fs.checkLayerAccess(ctx, layerVD, linux.LANDLOCK_ACCESS_FS_READ_DIR); err != nil {
+			readdirErr = err
+			return false
+		}
 		layerFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 			Root:  layerVD,
 			Start: layerVD,
@@ -158,6 +166,11 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 	return d.getDirentsLocked(ctx)
 }
 
+// getDirentsLocked returns d's merged directory entries. Reading a layer
+// directory's entries needs LANDLOCK_ACCESS_FS_READ_DIR on it from d.fs's
+// creator's domain (see filesystem.checkLayerAccess). Entries cached in
+// d.dirents are returned without a new check.
+//
 // Preconditions:
 //   - filesystem.renameMu must be locked.
 //   - d.dirMu must be locked.
@@ -189,6 +202,10 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 	prevDirents := make(map[string]struct{})
 	var maybeWhiteouts []vfs.Dirent
 	d.iterLayers(func(layerVD vfs.VirtualDentry, isUpper bool) bool {
+		if err := d.fs.checkLayerAccess(ctx, layerVD, linux.LANDLOCK_ACCESS_FS_READ_DIR); err != nil {
+			readdirErr = err
+			return false
+		}
 		layerFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 			Root:  layerVD,
 			Start: layerVD,
