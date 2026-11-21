@@ -81,10 +81,12 @@ type Registry struct {
 // Registry to avoid dealing directly with the filesystem. RegistryImpl should
 // be implemented by mqfs and provided to Registry at initialization.
 type RegistryImpl interface {
-	// Get searches for a queue with the given name, if it exists, the queue is
-	// used to create a new FD, return it and return true. If the queue  doesn't
-	// exist, return false and no error. An error is returned if creation fails.
-	Get(ctx context.Context, name string, access AccessType, block bool, flags uint32) (*vfs.FileDescription, bool, error)
+	// Get searches for a queue with the given name. If the queue doesn't
+	// exist, Get returns false and no error. Otherwise, Get checks that the
+	// caller may open the queue with access, and returns true; if open is
+	// true, Get also opens the queue and returns a new FD for it. An error is
+	// returned if the check or the open fails.
+	Get(ctx context.Context, name string, access AccessType, block bool, flags uint32, open bool) (*vfs.FileDescription, bool, error)
 
 	// New creates a new inode and file description using the given queue,
 	// inserts the inode into the filesystem tree using the given name, and
@@ -161,16 +163,18 @@ func (r *Registry) FindOrCreate(ctx context.Context, opts OpenOpts, mode linux.F
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	fd, ok, err := r.impl.Get(ctx, opts.Name, opts.Access, opts.Block, flags)
+	// With O_CREAT|O_EXCL, an existing queue is not opened, so EEXIST comes
+	// after the permission check and before any check that the open makes.
+	exclusive := opts.Create && opts.Exclusive
+	fd, ok, err := r.impl.Get(ctx, opts.Name, opts.Access, opts.Block, flags, !exclusive /* open */)
 	if err != nil {
 		return nil, err
 	}
 
 	if ok {
-		if opts.Create && opts.Exclusive {
+		if exclusive {
 			// "Both O_CREAT and O_EXCL were specified in oflag, but a queue
 			//  with this name already exists."
-			fd.DecRef(ctx)
 			return nil, linuxerr.EEXIST
 		}
 		return fd, nil

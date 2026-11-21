@@ -603,6 +603,104 @@ TEST(LandlockV1Test, SocketProcFdIsNotDeniedByLandlock) {
       << "exit status " << status;
 }
 
+TEST(LandlockV1Test, MqOpenDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const std::string name = "/landlock_mq_open_denied";
+  mqd_t queue = mq_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600, nullptr);
+  SKIP_IF(queue == static_cast<mqd_t>(-1) && errno == ENOSYS);
+  ASSERT_THAT(static_cast<int>(queue), SyscallSucceeds());
+  ASSERT_THAT(mq_close(queue), SyscallSucceeds());
+  auto cleanup =
+      Cleanup([&] { EXPECT_THAT(mq_unlink(name.c_str()), SyscallSucceeds()); });
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_READ_FILE |
+                               LANDLOCK_ACCESS_FS_WRITE_FILE));
+    _exit(ClassifyFs(mq_open(name.c_str(), O_RDWR)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MqOpenAllowedWhenRightsUnhandled) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const std::string name = "/landlock_mq_open_unhandled";
+  mqd_t queue = mq_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600, nullptr);
+  SKIP_IF(queue == static_cast<mqd_t>(-1) && errno == ENOSYS);
+  ASSERT_THAT(static_cast<int>(queue), SyscallSucceeds());
+  ASSERT_THAT(mq_close(queue), SyscallSucceeds());
+  auto cleanup =
+      Cleanup([&] { EXPECT_THAT(mq_unlink(name.c_str()), SyscallSucceeds()); });
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    mqd_t fd = mq_open(name.c_str(), O_RDWR);
+    if (fd == static_cast<mqd_t>(-1)) {
+      _exit(ClassifyFs(-1));
+    }
+    mq_close(fd);
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MqOpenAllowedByRuleOnMqueueMount) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string mountpoint = dir.path();
+  const std::string name = "/landlock_mq_open_allowed";
+  mqd_t queue = mq_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600, nullptr);
+  SKIP_IF(queue == static_cast<mqd_t>(-1) && errno == ENOSYS);
+  ASSERT_THAT(static_cast<int>(queue), SyscallSucceeds());
+  ASSERT_THAT(mq_close(queue), SyscallSucceeds());
+  auto cleanup =
+      Cleanup([&] { EXPECT_THAT(mq_unlink(name.c_str()), SyscallSucceeds()); });
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    if (mount("mqueue", mountpoint.c_str(), "mqueue", 0, nullptr) != 0) {
+      _exit(kUnsupported);
+    }
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
+                  mountpoint,
+                  LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE);
+    mqd_t fd = mq_open(name.c_str(), O_RDWR);
+    if (fd == static_cast<mqd_t>(-1)) {
+      _exit(ClassifyFs(-1));
+    }
+    mq_close(fd);
+    _exit(kAllowed);
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MqOpenExclusiveOfExistingQueueReportsEexistNotEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const std::string name = "/landlock_mq_open_exclusive";
+  mqd_t queue = mq_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600, nullptr);
+  SKIP_IF(queue == static_cast<mqd_t>(-1) && errno == ENOSYS);
+  ASSERT_THAT(static_cast<int>(queue), SyscallSucceeds());
+  ASSERT_THAT(mq_close(queue), SyscallSucceeds());
+  auto cleanup =
+      Cleanup([&] { EXPECT_THAT(mq_unlink(name.c_str()), SyscallSucceeds()); });
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_READ_FILE |
+                               LANDLOCK_ACCESS_FS_WRITE_FILE));
+    _exit(ClassifyErrno(
+        mq_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600, nullptr)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrExist)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, MqOpenDescriptorCannotNameRule) {
   SKIP_IF(LandlockAbiVersion() < 1);
   const std::string name = "/landlock_mq_open_rule";
