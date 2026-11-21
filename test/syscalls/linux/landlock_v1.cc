@@ -725,6 +725,30 @@ TEST(LandlockV1Test, MqOpenDescriptorCannotNameRule) {
       SyscallFailsWithErrno(EBADFD));
 }
 
+TEST(LandlockV1Test, TiocgptpeerChecksOpenRightsUnlessOPath) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+  SKIP_IF(master < 0);
+  auto cleanup =
+      Cleanup([&] { EXPECT_THAT(close(master), SyscallSucceeds()); });
+  int unlock = 0;
+  ASSERT_THAT(ioctl(master, TIOCSPTLCK, &unlock), SyscallSucceeds());
+
+  auto peer = [&](int flags) {
+    return InForkedProcess([&] {
+      ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_READ_FILE |
+                              LANDLOCK_ACCESS_FS_WRITE_FILE);
+      _exit(ClassifyFs(ioctl(master, TIOCGPTPEER, flags)));
+    });
+  };
+  int status = ASSERT_NO_ERRNO_AND_VALUE(peer(O_RDWR | O_NOCTTY));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "O_RDWR: exit status " << status;
+  status = ASSERT_NO_ERRNO_AND_VALUE(peer(O_PATH));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "O_PATH: exit status " << status;
+}
+
 TEST(LandlockV1Test, DomainEnforcedAfterExecve) {
   SKIP_IF(LandlockAbiVersion() < 1);
   SKIP_IF(access("/bin/sh", X_OK) != 0);
@@ -957,6 +981,41 @@ TEST(LandlockV1Test, WriteOpenOnReadOnlyMountIsErofsBeforeLandlock) {
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrRofs)
       << "exit status " << status;
+}
+
+TEST(LandlockV1Test, TiocgptpeerWithOPathReturnsOPathFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+  SKIP_IF(master < 0);
+  auto cleanup =
+      Cleanup([&] { EXPECT_THAT(close(master), SyscallSucceeds()); });
+  int unlock = 0;
+  ASSERT_THAT(ioctl(master, TIOCSPTLCK, &unlock), SyscallSucceeds());
+
+  for (int flags : {O_PATH, O_RDWR | O_PATH, O_PATH | O_DIRECTORY}) {
+    int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+      ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_READ_FILE |
+                              LANDLOCK_ACCESS_FS_WRITE_FILE);
+      int peer = ioctl(master, TIOCGPTPEER, flags | O_NOCTTY | O_NONBLOCK);
+      if (peer < 0) {
+        _exit(kSetup);
+      }
+      int fl = fcntl(peer, F_GETFL);
+      if (fl < 0 || (fl & O_PATH) == 0) {
+        _exit(kOther);
+      }
+      char c = 'x';
+      if (write(peer, &c, 1) >= 0 || errno != EBADF) {
+        _exit(kOther);
+      }
+      if (read(peer, &c, 1) >= 0 || errno != EBADF) {
+        _exit(kOther);
+      }
+      _exit(kAllowed);
+    }));
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+        << "flags " << flags << ": exit status " << status;
+  }
 }
 
 TEST(LandlockV1Test, BindMountedNamespaceFileIsCheckedLikeAnyFile) {

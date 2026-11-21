@@ -143,6 +143,24 @@ func (rp *ResolvingPath) CheckLandlockOpen(ctx context.Context, d *Dentry, isDir
 	return rp.checkLandlock(ctx, dom, d, landlockAccessFSForOpen(opts, isDir))
 }
 
+// CheckOpenAccessFS returns nil if d allows an open with opts of the existing
+// file at vd, and EACCES otherwise. isDir is true if the file is a directory.
+// The open needs the rights that ResolvingPath.CheckLandlockOpen checks, and
+// CheckOpenAccessFS walks from vd as CheckAccessFS does, handing the
+// references that the walk takes to deferred.
+//
+// For example, an open with O_RDWR of a file needs
+// LANDLOCK_ACCESS_FS_READ_FILE and LANDLOCK_ACCESS_FS_WRITE_FILE, and an open
+// with access mode 3 needs no right.
+//
+// Preconditions: The caller holds a reference on vd.
+func (d *LandlockDomain) CheckOpenAccessFS(ctx context.Context, vd VirtualDentry, isDir bool, opts *OpenOptions, deferred *DeferredDecRefs) error {
+	if d == nil {
+		return nil
+	}
+	return d.CheckAccessFS(ctx, vd, landlockAccessFSForOpen(opts, isDir), deferred)
+}
+
 // CheckLandlockCreateOpen checks an open with opts that creates a regular file
 // in directory parent against the Landlock domain of rp's credentials, as
 // ResolvingPath.CheckLandlock does. The open needs

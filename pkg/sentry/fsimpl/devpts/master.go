@@ -275,14 +275,31 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 			return 0, err
 		}
 		defer replicaD.DecRef(t)
-		// Landlock does not check the open of the replica, so a task
-		// restricted by Landlock may not open it this way.
-		if t.LandlockDomain() != nil {
-			return 0, linuxerr.EACCES
-		}
-		replica, err := mfd.t.OpenTTY(t, masterMnt, replicaD.Dentry(), vfs.OpenOptions{
+		opts := vfs.OpenOptions{
 			Flags: flags & ^uint32(linux.O_CLOEXEC),
-		})
+		}
+		var replica *vfs.FileDescription
+		if dom := t.LandlockDomain(); dom == nil {
+			replica, err = mfd.t.OpenTTY(t, masterMnt, replicaD.Dentry(), opts)
+		} else if flags&linux.O_PATH != 0 {
+			// A task restricted by Landlock gets an ordinary O_PATH file for
+			// the replica, as open(2) gives, which needs no Landlock right.
+			// Only O_PATH and O_NOFOLLOW are kept: O_CLOEXEC applies to the
+			// new descriptor below, and other flags, such as O_DIRECTORY, are
+			// ignored.
+			replica, err = t.Kernel().VFS().OpenAt(t, t.Credentials(), &vfs.PathOperation{
+				Root:  replicaD,
+				Start: replicaD,
+			}, &vfs.OpenOptions{
+				Flags: flags & (linux.O_PATH | linux.O_NOFOLLOW),
+			})
+		} else {
+			// The replica is checked as reached through the master's mount.
+			if err := dom.CheckOpenAccessFS(t, replicaD, false /* isDir */, &opts, nil /* deferred */); err != nil {
+				return 0, err
+			}
+			replica, err = mfd.t.OpenTTY(t, masterMnt, replicaD.Dentry(), opts)
+		}
 		if err != nil {
 			return 0, err
 		}
