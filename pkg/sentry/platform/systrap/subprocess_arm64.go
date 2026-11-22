@@ -24,7 +24,6 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
 )
@@ -157,53 +156,6 @@ func maybePatchSignalInfo(regs *arch.Registers, signalInfo *linux.SignalInfo) (p
 //
 //go:nosplit
 func enableCpuidFault() {
-}
-
-// probeSeccomp returns true if seccomp is run after ptrace notifications,
-// which is generally the case for kernel version >= 4.8.
-//
-// On arm64, the support of PTRACE_SYSEMU was added in the 5.3 kernel, so
-// probeSeccomp can always return true.
-func probeSeccomp() bool {
-	return true
-}
-
-func (s *subprocess) arm64SyscallWorkaround(t *thread, regs *arch.Registers) {
-	// On ARM64, when ptrace stops on a system call, it uses the x7
-	// register to indicate whether the stop has been signalled from
-	// syscall entry or syscall exit. This means that we can't get a value
-	// of this register and we can't change it. More details are in the
-	// comment for tracehook_report_syscall in arch/arm64/kernel/ptrace.c.
-	//
-	// This happens only if we stop on a system call, so let's queue a
-	// signal, resume a stub thread and catch it on a signal handling.
-	t.NotifyInterrupt()
-	for {
-		if errno := hostsyscall.RawSyscallErrno(
-			unix.SYS_PTRACE,
-			unix.PTRACE_SYSEMU,
-			uintptr(t.tid), 0); errno != 0 {
-			panic(fmt.Sprintf("ptrace sysemu failed: %v", errno))
-		}
-
-		// Wait for the syscall-enter stop.
-		sig, err := t.wait(stopped)
-		if err != nil {
-			t.dumpAndPanic(fmt.Sprintf("wait failed: %v", err))
-		}
-		if sig == unix.SIGSTOP {
-			// SIGSTOP was delivered to another thread in the same thread
-			// group, which initiated another group stop. Just ignore it.
-			continue
-		}
-		if sig == (syscallEvent | unix.SIGTRAP) {
-			t.dumpAndPanic("unexpected syscall event")
-		}
-		break
-	}
-	if err := t.getRegs(regs); err != nil {
-		panic(fmt.Sprintf("ptrace get regs failed: %v", err))
-	}
 }
 
 func (s *subprocess) restoreArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {

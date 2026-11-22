@@ -837,11 +837,6 @@ func (t *thread) syscallIgnoreInterrupt(
 	}
 }
 
-// NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
-func (t *thread) NotifyInterrupt() {
-	unix.Tgkill(int(t.tgid), int(t.tid), unix.Signal(platform.SignalInterrupt))
-}
-
 func (s *subprocess) incAwakeContexts() {
 	nr := atomic.AddUint32(&s.contextQueue.numAwakeContexts, 1)
 	if nr > uint32(maxSysmsgThreads) {

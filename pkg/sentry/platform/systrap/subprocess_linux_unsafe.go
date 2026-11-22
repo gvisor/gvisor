@@ -18,26 +18,12 @@
 package systrap
 
 import (
-	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 )
-
-// maskPool contains reusable CPU masks for setting affinity. Unfortunately,
-// runtime.NumCPU doesn't actually record the number of CPUs on the system, it
-// just records the number of CPUs available in the scheduler affinity set at
-// startup. This may a) change over time and b) gives a number far lower than
-// the maximum indexable CPU. To prevent lots of allocation in the hot path, we
-// use a pool to store large masks that we can reuse during bind.
-var maskPool = sync.Pool{
-	New: func() any {
-		const maxCPUs = 1024 // Not a hard limit; see below.
-		return make([]uintptr, maxCPUs/64)
-	},
-}
 
 // unmaskAllSignals unmasks all signals on the current thread.
 //
