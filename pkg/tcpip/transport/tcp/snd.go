@@ -559,10 +559,11 @@ func (s *sender) resendSegment() {
 		s.FastRecovery.HighRxt = seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize())) - 1
 		s.FastRecovery.RescueRxt = seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize())) - 1
 		s.sendSegment(seg)
-		// An RTO can rewind writeNext to this segment. It has now been
-		// retransmitted, so sendData must not immediately send it again.
-		if s.writeNext == seg {
-			s.updateWriteNext(seg.Next())
+		// After an RTO, writeNext points back into data sent before it. Move
+		// it past all sent data: recovery retransmits only what is lost, at
+		// most SMSS at a time, and sendData sends only new data.
+		for s.writeNext != nil && s.writeNext.xmitCount > 0 {
+			s.updateWriteNext(s.writeNext.Next())
 		}
 		s.ep.stack.Stats().TCP.FastRetransmit.Increment()
 		s.ep.stats.SendErrors.FastRetransmit.Increment()
@@ -1272,7 +1273,11 @@ func (s *sender) SetPipe() {
 			// NOTE: here we mark the whole segment as lost. We do not try
 			// and test every byte in our write buffer as we maintain our
 			// pipe in terms of outstanding packets and not bytes.
-			if !s.ep.scoreboard.IsRangeLost(sb) {
+			//
+			// A segment RACK marked lost is not in flight either, as in
+			// Linux's tcp_packets_in_flight. IsLost alone needs SACKed data
+			// above the segment, which a tail loss never produces.
+			if !s1.lost && !s.ep.scoreboard.IsRangeLost(sb) {
 				pipe++
 			}
 			// SetPipe():
