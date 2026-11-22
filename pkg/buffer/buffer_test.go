@@ -817,6 +817,8 @@ func TestAppendCopy(t *testing.T) {
 		wantViews int
 		// wantFree is the minimum unused capacity of the last view.
 		wantFree int
+		// wantAlloc reports whether AppendCopy must allocate a new chunk.
+		wantAlloc bool
 	}{
 		{
 			name:      "FillsLastChunk",
@@ -832,6 +834,7 @@ func TestAppendCopy(t *testing.T) {
 			minCap:    300,
 			wantViews: 2,
 			wantFree:  300 - 2,
+			wantAlloc: true,
 		},
 		{
 			name:      "DoesNotWriteSharedChunk",
@@ -839,11 +842,13 @@ func TestAppendCopy(t *testing.T) {
 			clone:     true,
 			p:         []byte("cd"),
 			wantViews: 2,
+			wantAlloc: true,
 		},
 		{
 			name:      "Empty",
 			p:         []byte("ab"),
 			wantViews: 1,
+			wantAlloc: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -863,7 +868,14 @@ func TestAppendCopy(t *testing.T) {
 				sharedChunk = bytes.Clone(original.data.Front().chunk.data)
 			}
 
-			b.AppendCopy(tc.p, tc.minCap)
+			gotAlloc := b.AppendCopy(tc.p, tc.minCap)
+			if tc.wantAlloc {
+				if wantMin := max(len(tc.p), tc.minCap); gotAlloc < wantMin {
+					t.Errorf("AppendCopy() allocated = %d, want >= %d", gotAlloc, wantMin)
+				}
+			} else if gotAlloc != 0 {
+				t.Errorf("AppendCopy() allocated = %d, want 0", gotAlloc)
+			}
 
 			if got, want := b.Flatten(), append(bytes.Clone(tc.initial), tc.p...); !bytes.Equal(got, want) {
 				t.Errorf("Flatten() = %q, want %q", got, want)

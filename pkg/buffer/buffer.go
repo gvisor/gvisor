@@ -290,10 +290,10 @@ func (b *Buffer) Append(src *View) error {
 }
 
 // AppendCopy copies p to the end of b, filling the unused capacity of the last
-// chunk when b is its only owner. The rest goes in a new chunk of at least
-// minCap bytes, so a run of small appends shares chunks instead of each
-// allocating one.
-func (b *Buffer) AppendCopy(p []byte, minCap int) {
+// chunk when b is its only owner. Any remaining bytes go in a new chunk of at
+// least minCap bytes, and AppendCopy returns that new chunk's capacity (0 if
+// no chunk was allocated).
+func (b *Buffer) AppendCopy(p []byte, minCap int) int {
 	if v := b.data.Back(); !v.Full() && !v.sharesChunk() {
 		n := copy(v.chunk.data[v.write:], p)
 		v.write += n
@@ -301,11 +301,12 @@ func (b *Buffer) AppendCopy(p []byte, minCap int) {
 		p = p[n:]
 	}
 	if len(p) == 0 {
-		return
+		return 0
 	}
 	v := NewView(max(len(p), minCap))
 	v.Write(p)
 	b.appendOwned(v)
+	return len(v.chunk.data)
 }
 
 func (b *Buffer) appendOwned(v *View) {

@@ -696,12 +696,14 @@ func (d PacketData) AppendView(v *buffer.View) {
 }
 
 // AppendCopy copies the data of src to the end of d without referencing src's
-// chunks. See buffer.Buffer.AppendCopy for minCap.
-func (d PacketData) AppendCopy(src PacketData, minCap int) {
+// chunks. See buffer.Buffer.AppendCopy for minCap and the returned capacity.
+func (d PacketData) AppendCopy(src PacketData, minCap int) int {
 	offset := src.pk.dataOffset()
+	var allocated int
 	src.pk.buf.SubApply(offset, int(src.pk.buf.Size())-offset, func(v *buffer.View) {
-		d.pk.buf.AppendCopy(v.AsSlice(), minCap)
+		allocated = max(allocated, d.pk.buf.AppendCopy(v.AsSlice(), minCap))
 	})
+	return allocated
 }
 
 // MergeBuffer merges b into d and clears b.

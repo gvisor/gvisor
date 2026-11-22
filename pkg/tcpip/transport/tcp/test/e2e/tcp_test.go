@@ -3068,6 +3068,10 @@ func TestSmallSegmentsQueuedWhileNotReading(t *testing.T) {
 		segs   = 3000
 		rcvBuf = 64 << 10
 	)
+	delay := tcpip.TCPDelayedACKEnabled(false)
+	if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &delay); err != nil {
+		t.Fatalf("SetTransportProtocolOption(%d, &%T(false)): %s", tcp.ProtocolNumber, delay, err)
+	}
 	c.CreateConnected(context.TestInitialSequenceNumber, 30000, rcvBuf)
 	payload := []byte("+PONG\r\n")
 	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
@@ -3097,6 +3101,10 @@ func TestCoalesceSkipsSegmentBeingRead(t *testing.T) {
 	c := context.New(t, e2e.DefaultMTU)
 	defer c.Cleanup()
 
+	delay := tcpip.TCPDelayedACKEnabled(false)
+	if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &delay); err != nil {
+		t.Fatalf("SetTransportProtocolOption(%d, &%T(false)): %s", tcp.ProtocolNumber, delay, err)
+	}
 	c.CreateConnected(context.TestInitialSequenceNumber, 30000, 32<<10)
 	payload := []byte("+PONG\r\n")
 	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
