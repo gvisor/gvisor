@@ -156,13 +156,29 @@ func (i *fdDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.
 	return fd.VFSFileDescription(), nil
 }
 
+// Stat implements kernfs.Inode.Stat.
+//
+// +checklocksexclude:i.fdDir.task.mu
+func (i *fdDirInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
+	stat, err := i.InodeAttrs.Stat(ctx, fs, opts)
+	if err != nil {
+		return linux.Statx{}, err
+	}
+	fillTaskOwner(i.task, &stat, opts.Mask)
+	return stat, nil
+}
+
 // CheckPermissions implements kernfs.Inode.CheckPermissions.
 //
 // This is to match Linux, which uses a special permission handler to guarantee
 // that a process can still access /proc/self/fd after it has executed
 // setuid. See fs/proc/fd.c:proc_fd_permission.
+//
+// +checklocksexclude:i.fdDir.task.mu
 func (i *fdDirInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
-	err := i.InodeAttrs.CheckPermissions(ctx, creds, ats)
+	mode := i.Mode()
+	uid, gid := taskOwner(i.task, mode)
+	err := vfs.GenericCheckPermissions(creds, ats, mode, nil, uid, gid)
 	if err == nil {
 		// Access granted, no extra check needed.
 		return nil
@@ -209,7 +225,7 @@ func (fs *filesystem) newFDSymlink(ctx context.Context, task *kernel.Task, fd in
 		fd:   fd,
 	}
 	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
-	return inode
+	return &taskOwnedInode{Inode: inode, owner: task}
 }
 
 // +checklocksexclude:s.task.mu
@@ -318,6 +334,18 @@ func (i *fdInfoDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *ker
 	return fd.VFSFileDescription(), nil
 }
 
+// Stat implements kernfs.Inode.Stat.
+//
+// +checklocksexclude:i.fdDir.task.mu
+func (i *fdInfoDirInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
+	stat, err := i.InodeAttrs.Stat(ctx, fs, opts)
+	if err != nil {
+		return linux.Statx{}, err
+	}
+	fillTaskOwner(i.task, &stat, opts.Mask)
+	return stat, nil
+}
+
 // CheckPermissions implements kernfs.Inode.CheckPermissions.
 //
 // ptrace read access is required, then the mode check applies.
@@ -328,7 +356,9 @@ func (i *fdInfoDirInode) CheckPermissions(ctx context.Context, creds *auth.Crede
 	if !kernel.ContextCanTrace(ctx, i.task, false /* attach */) {
 		return linuxerr.EACCES
 	}
-	return i.InodeAttrs.CheckPermissions(ctx, creds, ats)
+	mode := i.Mode()
+	uid, gid := taskOwner(i.task, mode)
+	return vfs.GenericCheckPermissions(creds, ats, mode, nil, uid, gid)
 }
 
 // DecRef implements kernfs.Inode.DecRef.
