@@ -16,6 +16,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <features.h>
 #include <limits.h>
 #include <linux/capability.h>
 #include <linux/limits.h>
@@ -44,6 +45,12 @@
 #include <syscall.h>
 #include <time.h>
 #include <unistd.h>
+
+// Only some versions of glibc define the statx types in sys/stat.h.
+#if defined(__GLIBC__) && \
+    !(__GLIBC__ == 2 && (__GLIBC_MINOR__ == 28 || __GLIBC_MINOR__ == 29))
+#include <linux/stat.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -4337,12 +4344,19 @@ TEST(ProcPid, FdOwnerFollowsSetuid) {
 
   for (const char* name : {"fd", "fdinfo", "fd/0"}) {
     SCOPED_TRACE(name);
+    const std::string path = absl::StrCat("/proc/", child_pid, "/", name);
     struct stat st;
-    ASSERT_THAT(
-        lstat(absl::StrCat("/proc/", child_pid, "/", name).c_str(), &st),
-        SyscallSucceeds());
+    ASSERT_THAT(lstat(path.c_str(), &st), SyscallSucceeds());
     EXPECT_EQ(st.st_uid, kNobody);
     EXPECT_EQ(st.st_gid, kNobody);
+    struct statx stx = {};
+    ASSERT_THAT(syscall(SYS_statx, AT_FDCWD, path.c_str(), AT_SYMLINK_NOFOLLOW,
+                        STATX_UID, &stx),
+                SyscallSucceeds());
+    EXPECT_EQ(stx.stx_uid, kNobody);
+    if (stx.stx_mask & STATX_GID) {
+      EXPECT_EQ(stx.stx_gid, kNobody);
+    }
   }
 
   // A raw setuid changes only the calling thread's credentials.

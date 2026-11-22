@@ -278,7 +278,7 @@ func (i *taskOwnedInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.
 	if err != nil {
 		return linux.Statx{}, err
 	}
-	fillTaskOwner(i.owner, &stat, opts.Mask)
+	fillTaskOwner(i.owner, &stat)
 	return stat, nil
 }
 
@@ -309,19 +309,19 @@ func (i *taskOwnedInode) checkModePermissions(creds *auth.Credentials, ats vfs.A
 	return vfs.GenericCheckPermissions(creds, ats, mode, nil, uid, gid)
 }
 
-// fillTaskOwner fills in the owner fields of stat requested by mask with
-// taskOwner(t, stat.Mode).
+// fillTaskOwner updates the owner fields of stat that stat.Mask marks valid
+// with taskOwner(t, stat.Mode).
 //
 // +checklocksexclude:t.mu
-func fillTaskOwner(t *kernel.Task, stat *linux.Statx, mask uint32) {
-	if mask&(linux.STATX_UID|linux.STATX_GID) == 0 {
+func fillTaskOwner(t *kernel.Task, stat *linux.Statx) {
+	if stat.Mask&(linux.STATX_UID|linux.STATX_GID) == 0 {
 		return
 	}
 	uid, gid := taskOwner(t, linux.FileMode(stat.Mode))
-	if mask&linux.STATX_UID != 0 {
+	if stat.Mask&linux.STATX_UID != 0 {
 		stat.UID = uint32(uid)
 	}
-	if mask&linux.STATX_GID != 0 {
+	if stat.Mask&linux.STATX_GID != 0 {
 		stat.GID = uint32(gid)
 	}
 }

@@ -164,7 +164,7 @@ func (i *fdDirInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.Stat
 	if err != nil {
 		return linux.Statx{}, err
 	}
-	fillTaskOwner(i.task, &stat, opts.Mask)
+	fillTaskOwner(i.task, &stat)
 	return stat, nil
 }
 
@@ -342,7 +342,7 @@ func (i *fdInfoDirInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.
 	if err != nil {
 		return linux.Statx{}, err
 	}
-	fillTaskOwner(i.task, &stat, opts.Mask)
+	fillTaskOwner(i.task, &stat)
 	return stat, nil
 }
 
