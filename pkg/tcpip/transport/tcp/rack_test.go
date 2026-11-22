@@ -523,3 +523,45 @@ func TestRACKPTODuration(t *testing.T) {
 		})
 	}
 }
+
+// TestReducedForOutstandingData tests that a congestion event covers a loss
+// only while data sent before the event is unacknowledged. The cases include
+// distances of 2^31 bytes and more between that data and SndUna.
+func TestReducedForOutstandingData(t *testing.T) {
+	const reduced = 10
+	for _, test := range []struct {
+		name     string
+		ssthresh int
+		last     seqnum.Value
+		sndUna   seqnum.Value
+		sndNxt   seqnum.Value
+		want     bool
+	}{
+		{name: "new connection", ssthresh: InitialSsthresh, last: 100, sndUna: 101, sndNxt: 109, want: false},
+		{name: "last byte sent", ssthresh: reduced, last: 108, sndUna: 101, sndNxt: 109, want: true},
+		{name: "first unacknowledged byte", ssthresh: reduced, last: 101, sndUna: 101, sndNxt: 109, want: true},
+		{name: "first unsent byte", ssthresh: reduced, last: 109, sndUna: 101, sndNxt: 109, want: false},
+		{name: "last acknowledged byte", ssthresh: reduced, last: 100, sndUna: 101, sndNxt: 109, want: false},
+		{name: "no data outstanding", ssthresh: reduced, last: 108, sndUna: 109, sndNxt: 109, want: false},
+		{name: "2^31-1 bytes behind", ssthresh: reduced, last: 100, sndUna: 100 + 1<<31 - 1, sndNxt: 108 + 1<<31, want: false},
+		{name: "2^31 bytes behind", ssthresh: reduced, last: 100, sndUna: 100 + 1<<31, sndNxt: 108 + 1<<31, want: false},
+		{name: "2^31+1 bytes behind", ssthresh: reduced, last: 100, sndUna: 101 + 1<<31, sndNxt: 109 + 1<<31, want: false},
+		{name: "outstanding data wraps", ssthresh: reduced, last: 3, sndUna: 1<<32 - 4, sndNxt: 4, want: true},
+		{name: "acknowledged before wrap", ssthresh: reduced, last: 1<<32 - 5, sndUna: 1<<32 - 4, sndNxt: 4, want: false},
+		{name: "in range with initial threshold", ssthresh: InitialSsthresh, last: 104, sndUna: 101, sndNxt: 109, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var snd sender
+			snd.ep = &Endpoint{}
+			snd.ep.mu.Lock()
+			defer snd.ep.mu.Unlock()
+			snd.Ssthresh = test.ssthresh
+			snd.FastRecovery.Last = test.last
+			snd.SndUna = test.sndUna
+			snd.SndNxt = test.sndNxt
+			if got := snd.reducedForOutstandingData(); got != test.want {
+				t.Errorf("reducedForOutstandingData() = %t with Ssthresh = %d, Last = %d, SndUna = %d, SndNxt = %d, want %t", got, test.ssthresh, test.last, test.sndUna, test.sndNxt, test.want)
+			}
+		})
+	}
+}

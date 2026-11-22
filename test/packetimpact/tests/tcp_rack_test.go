@@ -305,6 +305,11 @@ func TestRACKFreshTimeoutRetransmission(t *testing.T) {
 	if !repaired {
 		t.Fatal("no later hole was repaired after the SACK")
 	}
+	// The timeout reduced the slow-start threshold for this flight. The
+	// later holes are not a new congestion event.
+	if got, want := dut.GetSockOptTCPInfo(t, fd).SndSsthresh, info.SndSsthresh; got != want {
+		t.Errorf("slow-start threshold after the SACK = %d, want %d", got, want)
+	}
 
 	// We have now received the entire flight. Confirm that the connection
 	// delivers new data after recovery.

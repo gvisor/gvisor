@@ -492,7 +492,12 @@ func (rc *rackControl) recover(retransmitHead bool) {
 		if next != snd.writeNext {
 			snd.updateWriteNext(next)
 		}
-		snd.cc.HandleLossDetected()
+		// If data sent before the most recent congestion event is
+		// unacknowledged, this loss is part of that event. See RFC 6675
+		// section 5.1 and RFC 8985 section 9.3.
+		if !snd.reducedForOutstandingData() {
+			snd.cc.HandleLossDetected()
+		}
 		snd.enterRecovery()
 		// Unlike three duplicate ACKs, a RACK loss can be anywhere in the
 		// flight. For example, an RTO may already have repaired the head

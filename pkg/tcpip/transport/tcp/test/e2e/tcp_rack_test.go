@@ -357,6 +357,183 @@ func TestRACKTLPFallbackRTO(t *testing.T) {
 	}
 }
 
+// sndSsthresh returns the slow-start threshold of the endpoint.
+func sndSsthresh(t *testing.T, c *context.Context) uint32 {
+	t.Helper()
+	var info tcpip.TCPInfoOption
+	if err := c.EP.GetSockOpt(&info); err != nil {
+		t.Fatalf("GetSockOpt failed: %v", err)
+	}
+	return info.SndSsthresh
+}
+
+// sendAndReceiveMore writes numPackets packets that follow data, receives
+// them, and returns data with the new packets appended.
+func sendAndReceiveMore(t *testing.T, c *context.Context, data []byte, numPackets int) []byte {
+	t.Helper()
+	sent := len(data)
+	for i := 0; i < numPackets*maxPayload; i++ {
+		data = append(data, byte(sent+i))
+	}
+	var r bytes.Reader
+	r.Reset(data[sent:])
+	if _, err := c.EP.Write(&r, tcpip.WriteOptions{}); err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+	for offset := sent; offset < len(data); offset += maxPayload {
+		c.ReceiveAndCheckPacketWithOptions(data, offset, maxPayload, e2e.TSOptionSize)
+	}
+	return data
+}
+
+// TestRACKRecoveryAfterRTOKeepsSsthresh tests that the slow-start threshold
+// does not change when RACK enters recovery while data sent before a
+// retransmit timeout is unacknowledged, and that a loss after all of that data
+// is acknowledged reduces the threshold.
+func TestRACKRecoveryAfterRTOKeepsSsthresh(t *testing.T) {
+	for _, algorithm := range []string{"reno", "cubic"} {
+		t.Run(algorithm, func(t *testing.T) {
+			c := context.New(t, uint32(mtu))
+			defer c.Cleanup()
+
+			cc := tcpip.CongestionControlOption(algorithm)
+			if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &cc); err != nil {
+				t.Fatalf("SetTransportProtocolOption(%s): %s", algorithm, err)
+			}
+
+			// pollRecoveries waits until the sender has entered recovery
+			// the given number of times, with one retransmit timeout.
+			pollRecoveries := func(want uint64) {
+				t.Helper()
+				if err := testutil.Poll(func() error {
+					tcpStats := c.Stack().Stats().TCP
+					if got := tcpStats.Timeouts.Value(); got != 1 {
+						return fmt.Errorf("got stats.TCP.Timeouts.Value() = %d, want = 1", got)
+					}
+					if got := tcpStats.SACKRecovery.Value(); got != want {
+						return fmt.Errorf("got stats.TCP.SACKRecovery.Value() = %d, want = %d", got, want)
+					}
+					return nil
+				}, 1*time.Second); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Send 10 packets and acknowledge none of them.
+			const numPackets = 10
+			data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
+
+			// The PTO fires and sends packet #10 as a TLP.
+			c.ReceiveAndCheckPacketWithOptions(data, (numPackets-1)*maxPayload, maxPayload, e2e.TSOptionSize)
+
+			// The RTO fires and retransmits packet #1.
+			c.ReceiveAndCheckPacketWithOptions(data, 0, maxPayload, e2e.TSOptionSize)
+
+			// The minimum threshold is 2 packets. A second reduction is
+			// visible only if the threshold is above the minimum now.
+			afterRTO := sndSsthresh(t, c)
+			if afterRTO <= 2 {
+				t.Fatalf("got SndSsthresh = %d after the RTO, want > 2", afterRTO)
+			}
+
+			// SACK packets [4-6]. RACK marks packets #2 and #3 as lost,
+			// enters recovery and retransmits them.
+			seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+			start := c.IRS.Add(seqnum.Size(1 + 3*maxPayload))
+			end := start.Add(seqnum.Size(3 * maxPayload))
+			c.SendAckWithSACK(seq, 0, []header.SACKBlock{{start, end}})
+			c.ReceiveAndCheckPacketWithOptions(data, maxPayload, maxPayload, e2e.TSOptionSize)
+			c.ReceiveAndCheckPacketWithOptions(data, 2*maxPayload, maxPayload, e2e.TSOptionSize)
+			pollRecoveries(1)
+			if got := sndSsthresh(t, c); got != afterRTO {
+				t.Errorf("got SndSsthresh = %d in recovery after the RTO, want = %d", got, afterRTO)
+			}
+
+			// Acknowledge all the data. The sender leaves recovery.
+			c.SendAck(seq, len(data))
+
+			// Send 4 more packets and SACK the last 3 of them. RACK marks
+			// the first one as lost and enters recovery. This loss is a
+			// new congestion event.
+			const numNewPackets = 4
+			sendAndReceiveMore(t, c, data, numNewPackets)
+			start = c.IRS.Add(seqnum.Size(1 + (numPackets+1)*maxPayload))
+			end = start.Add(seqnum.Size((numNewPackets - 1) * maxPayload))
+			c.SendAckWithSACK(seq, numPackets*maxPayload, []header.SACKBlock{{start, end}})
+			pollRecoveries(2)
+			if got := sndSsthresh(t, c); got >= afterRTO {
+				t.Errorf("got SndSsthresh = %d in recovery for a new loss, want < %d", got, afterRTO)
+			}
+		})
+	}
+}
+
+// TestRACKRecoveryAfterTLPLossKeepsSsthresh tests that the slow-start threshold
+// does not change when RACK enters recovery while data sent before a TLP loss
+// is unacknowledged.
+func TestRACKRecoveryAfterTLPLossKeepsSsthresh(t *testing.T) {
+	c := context.New(t, uint32(mtu))
+	defer c.Cleanup()
+
+	// Two reductions in sequence give two different thresholds with CUBIC.
+	e2e.EnableCUBIC(t, c)
+
+	// Send 2 packets and acknowledge none of them. The PTO fires and sends
+	// packet #2 as a TLP.
+	const numPackets = 2
+	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
+	c.ReceiveAndCheckPacketWithOptions(data, (numPackets-1)*maxPayload, maxPayload, e2e.TSOptionSize)
+	beforeLoss := sndSsthresh(t, c)
+
+	// Acknowledge both packets. This ACK does not show if the TLP repaired
+	// a loss.
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	c.SendAck(seq, len(data))
+
+	// Send 5 more packets and acknowledge the first one with no DSACK. The
+	// TLP repaired a loss, so the sender reduces the threshold.
+	const numNewPackets = 5
+	data = sendAndReceiveMore(t, c, data, numNewPackets)
+	const acked = (numPackets + 1) * maxPayload
+	c.SendAck(seq, acked)
+	var afterTLPLoss uint32
+	if err := testutil.Poll(func() error {
+		afterTLPLoss = sndSsthresh(t, c)
+		if afterTLPLoss >= beforeLoss {
+			return fmt.Errorf("got SndSsthresh = %d after the TLP loss, want < %d", afterTLPLoss, beforeLoss)
+		}
+		return nil
+	}, 1*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// The minimum threshold is 2 packets. A second reduction is visible only
+	// if the threshold is above the minimum now.
+	if afterTLPLoss <= 2 {
+		t.Fatalf("got SndSsthresh = %d after the TLP loss, want > 2", afterTLPLoss)
+	}
+
+	// SACK the last 3 packets. RACK marks the packet before them as lost,
+	// enters recovery and retransmits it.
+	start := c.IRS.Add(seqnum.Size(1 + acked + maxPayload))
+	end := start.Add(seqnum.Size(3 * maxPayload))
+	c.SendAckWithSACK(seq, acked, []header.SACKBlock{{start, end}})
+	c.ReceiveAndCheckPacketWithOptions(data, acked, maxPayload, e2e.TSOptionSize)
+	if err := testutil.Poll(func() error {
+		tcpStats := c.Stack().Stats().TCP
+		if got := tcpStats.Timeouts.Value(); got != 0 {
+			return fmt.Errorf("got stats.TCP.Timeouts.Value() = %d, want = 0", got)
+		}
+		if got := tcpStats.SACKRecovery.Value(); got != 1 {
+			return fmt.Errorf("got stats.TCP.SACKRecovery.Value() = %d, want = 1", got)
+		}
+		return nil
+	}, 1*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := sndSsthresh(t, c); got != afterTLPLoss {
+		t.Errorf("got SndSsthresh = %d in recovery after the TLP loss, want = %d", got, afterTLPLoss)
+	}
+}
+
 // TestNoTLPRecoveryOnDSACK tests the scenario where the sender speculates a
 // tail loss and sends a TLP. Everything is received and acked. The probe
 // segment is DSACKed. No fast recovery should be triggered in this case.
