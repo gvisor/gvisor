@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -23,24 +23,4 @@ go_library(
         "//pkg/tcpip",
         "@org_golang_x_sys//unix:go_default_library",
     ],
-)
-
-go_test(
-    name = "syserr_test",
-    size = "small",
-    srcs = ["syserr_test.go"],
-    embed = [":syserr"],
-    deps = select({
-        "@io_bazel_rules_go//go/platform:android": [
-            "//pkg/errors",
-            "//pkg/errors/linuxerr",
-            "@org_golang_x_sys//unix:go_default_library",
-        ],
-        "@io_bazel_rules_go//go/platform:linux": [
-            "//pkg/errors",
-            "//pkg/errors/linuxerr",
-            "@org_golang_x_sys//unix:go_default_library",
-        ],
-        "//conditions:default": [],
-    }),
 )

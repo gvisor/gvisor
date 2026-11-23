@@ -191,6 +191,7 @@ func TestSyscallErrnoToErrors(t *testing.T) {
 		{errno: syscall.EINTR, err: linuxerr.EINTR},
 		{errno: syscall.EINVAL, err: linuxerr.EINVAL},
 		{errno: syscall.EIO, err: linuxerr.EIO},
+		{errno: syscall.ENONET, err: linuxerr.ENONET},
 		{errno: syscall.ENOTDIR, err: linuxerr.ENOTDIR},
 		{errno: syscall.ENOTTY, err: linuxerr.ENOTTY},
 		{errno: syscall.EPERM, err: linuxerr.EPERM},
@@ -305,11 +306,5 @@ func TestConvertIntr(t *testing.T) {
 				t.Fatalf("ConvertIntr(%v, %v) = %v, want %v", tc.err, tc.intr, got, tc.expected)
 			}
 		})
-	}
-}
-
-func TestENONET(t *testing.T) {
-	if got := linuxerr.ErrorFromUnix(unix.ENONET); got != linuxerr.ENONET {
-		t.Fatalf("ErrorFromUnix(ENONET) = %v, want %v", got, linuxerr.ENONET)
 	}
 }
