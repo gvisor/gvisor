@@ -56,6 +56,7 @@ go_library(
         "//pkg/sentry/control/controlapi",
         "//pkg/sentry/devices/memdev",
         "//pkg/sentry/devices/nvproxy",
+        "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/devices/tpuproxy/vfio",
         "//pkg/sentry/fdcollector",
         "//pkg/sentry/fdimport",
