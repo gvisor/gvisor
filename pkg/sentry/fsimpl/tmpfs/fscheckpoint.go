@@ -47,7 +47,7 @@ func FSCheckpointWrite(ctx context.Context, vfsfs *vfs.Filesystem, dst io.Writer
 	if fs == nil {
 		return fmt.Errorf("non-tmpfs filesystem: %T", vfsfs.Impl())
 	}
-	return fs.tarWrite(ctx, dst, &fsckptTarWriterCallbacks{
+	return fs.tarWrite(ctx, dst, fs.overlayUpper, &fsckptTarWriterCallbacks{
 		regularFiles: make(map[*regularFile]*fsckptRegularFile),
 	})
 }

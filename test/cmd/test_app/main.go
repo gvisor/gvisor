@@ -63,6 +63,7 @@ func main() {
 	subcommands.Register(new(taskTree), "")
 	subcommands.Register(new(taskTreePGID), "")
 	subcommands.Register(new(uds), "")
+	subcommands.Register(new(udsBind), "")
 	subcommands.Register(new(zombieTest), "")
 	subcommands.Register(new(fsCheckpoint), "")
 	subcommands.Register(new(setXattr), "")
@@ -310,6 +311,39 @@ func server(listener net.Listener, out *os.File) {
 		data := buf[0:nr]
 		fmt.Fprint(out, string(data)+"\n")
 	}
+}
+
+type udsBind struct{}
+
+// Name implements subcommands.Command.Name.
+func (*udsBind) Name() string {
+	return "uds-bind"
+}
+
+// Synopsis implements subcommands.Command.Synopsis.
+func (*udsBind) Synopsis() string {
+	return "binds a unix domain socket at each path and exits, leaving the socket files behind"
+}
+
+// Usage implements subcommands.Command.Usage.
+func (*udsBind) Usage() string {
+	return "uds-bind <path>..."
+}
+
+// SetFlags implements subcommands.Command.SetFlags.
+func (*udsBind) SetFlags(*flag.FlagSet) {}
+
+// Execute implements subcommands.Command.Execute.
+func (*udsBind) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	for _, path := range f.Args() {
+		l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+		if err != nil {
+			log.Fatalf("error listening on socket %q: %v", path, err)
+		}
+		l.SetUnlinkOnClose(false)
+		l.Close()
+	}
+	return subcommands.ExitSuccess
 }
 
 type taskTree struct {

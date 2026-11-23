@@ -351,16 +351,24 @@ func (tarDefaultReaderCallbacks) regularFileRead(ctx context.Context, hdr *tar.H
 
 // TarUpperLayer implements vfs.TarSerializer.TarUpperLayer.
 func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
-	return fs.tarWrite(ctx, outFD, tarDefaultWriterCallbacks{})
+	return fs.tarWrite(ctx, outFD, false /* overlayUpper */, tarDefaultWriterCallbacks{})
 }
 
-func (fs *filesystem) tarWrite(ctx context.Context, dst io.Writer, cb tarWriterCallbacks) error {
+// TarOverlayUpper implements vfs.OverlayUpperTarSerializer.TarOverlayUpper.
+func (fs *filesystem) TarOverlayUpper(ctx context.Context, outFD *os.File) error {
+	return fs.tarWrite(ctx, outFD, true /* overlayUpper */, tarDefaultWriterCallbacks{})
+}
+
+// tarWrite writes fs to dst as a tar archive. If overlayUpper is true, the
+// archive is extracted over the lower layers of an overlay whose upper layer
+// is fs.
+func (fs *filesystem) tarWrite(ctx context.Context, dst io.Writer, overlayUpper bool, cb tarWriterCallbacks) error {
 	tw := tar.NewWriter(dst)
 
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 
-	err := fs.root.writeToTar(ctx, tw, ".", make(map[uint64]string), cb)
+	err := fs.root.writeToTar(ctx, tw, ".", make(map[uint64]string), overlayUpper, cb)
 	if err != nil {
 		return fmt.Errorf("failed to write dentry to tar: %w", err)
 	}
@@ -373,7 +381,7 @@ func (fs *filesystem) tarWrite(ctx context.Context, dst io.Writer, cb tarWriterC
 }
 
 // writeToTar recursively writes a dentry and its children to the tar archive.
-func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string, inoToPath map[uint64]string, cb tarWriterCallbacks) error {
+func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string, inoToPath map[uint64]string, overlayUpper bool, cb tarWriterCallbacks) error {
 	path := baseDir
 	if d.name != "" {
 		path = path + "/" + d.name
@@ -388,7 +396,7 @@ func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string,
 			defer rf.inode.mu.Unlock()
 		}
 	}
-	header, err := d.createTarHeader(path, inoToPath, cb)
+	header, err := d.createTarHeader(path, inoToPath, overlayUpper, cb)
 	if err != nil {
 		return fmt.Errorf("failed to create tar header for %q: %w", path, err)
 	}
@@ -408,7 +416,7 @@ func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string,
 	switch impl := d.inode.impl.(type) {
 	case *directory:
 		for _, child := range impl.childMap {
-			if err := child.writeToTar(ctx, tw, path, inoToPath, cb); err != nil {
+			if err := child.writeToTar(ctx, tw, path, inoToPath, overlayUpper, cb); err != nil {
 				return err
 			}
 		}
@@ -428,7 +436,7 @@ func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string,
 const tarOctalFieldLimit = 1 << 21
 
 // createTarHeader creates a tar header for the given dentry.
-func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb tarWriterCallbacks) (*tar.Header, error) {
+func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, overlayUpper bool, cb tarWriterCallbacks) (*tar.Header, error) {
 	if d.isSelfFilestoreWhiteout() {
 		// Skip the self filestore whiteout.
 		return nil, nil
@@ -440,6 +448,17 @@ func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb ta
 		Uid:     int(d.inode.uid.Load()),
 		Gid:     int(d.inode.gid.Load()),
 		ModTime: time.Unix(0, d.inode.mtime.Load()),
+	}
+	_, isSocket := d.inode.impl.(*socketFile)
+	sockWhiteout := isSocket && overlayUpper
+	if sockWhiteout {
+		// A socket cannot be archived, but omitting it would expose the lower
+		// layer's file at this path. A whiteout keeps it hidden. Hard links
+		// to the socket become hard links to the whiteout, and extractors
+		// apply a hard link entry's owner and mode to its target, so every
+		// name carries the whiteout's.
+		header.Mode = linux.WHITEOUT_MODE
+		header.Uid, header.Gid = 0, 0
 	}
 	if d.inode.fs.tarNanosecondTimestamps && header.Mode < tarOctalFieldLimit {
 		header.Format = tar.FormatPAX
@@ -475,6 +494,13 @@ func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb ta
 			header.Format = tar.FormatUnknown
 		}
 	case *socketFile:
+		if sockWhiteout {
+			header.Typeflag = tar.TypeChar
+			major, minor := linux.DecodeDeviceID(linux.WHITEOUT_DEV)
+			header.Devmajor, header.Devminor = int64(major), int64(minor)
+			inoToPath[d.inode.ino] = path
+			return header, nil
+		}
 		// This is consistent with the behavior of tar(1).
 		log.Warningf("Skipping socket file %q while generating tar archive", path)
 		return nil, nil

@@ -567,6 +567,17 @@ type TarSerializer interface {
 	TarUpperLayer(ctx context.Context, outFD *os.File) error
 }
 
+// OverlayUpperTarSerializer is an interface for serializing a filesystem that
+// is the upper layer of an overlay to a tar archive. It is an extension of
+// FilesystemImpl.
+type OverlayUpperTarSerializer interface {
+	// TarOverlayUpper serializes the filesystem to a tar archive that is
+	// extracted over the overlay's lower layers, so the archive must hide
+	// every lower layer file that the filesystem hides. It writes the tar
+	// archive to outFD.
+	TarOverlayUpper(ctx context.Context, outFD *os.File) error
+}
+
 // PrependPathAtVFSRootError is returned by implementations of
 // FilesystemImpl.PrependPath() when they encounter the contextual VFS root.
 //
