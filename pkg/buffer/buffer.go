@@ -461,7 +461,17 @@ func (b *Buffer) Apply(fn func(*View)) {
 
 // SubApply applies fn to a given range of data in b. Any part of the range
 // outside of b is ignored.
+// SubApply calls fn on a length-byte range of views starting at offset.
 func (b *Buffer) SubApply(offset, length int, fn func(*View)) {
+	b.SubApplyUntil(offset, length, func(v *View) bool {
+		fn(v)
+		return true
+	})
+}
+
+// SubApplyUntil calls fn on a length-byte range of views starting at offset,
+// stopping early if fn returns false.
+func (b *Buffer) SubApplyUntil(offset, length int, fn func(*View) bool) {
 	for v := b.data.Front(); length > 0 && v != nil; v = v.Next() {
 		if offset >= v.Size() {
 			offset -= v.Size()
@@ -475,9 +485,12 @@ func (b *Buffer) SubApply(offset, length int, fn func(*View)) {
 		if length < d.Size() {
 			d.write = d.read + length
 		}
-		fn(d)
+		cont := fn(d)
 		length -= d.Size()
 		d.Release()
+		if !cont {
+			return
+		}
 	}
 }
 

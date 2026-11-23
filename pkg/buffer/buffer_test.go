@@ -893,6 +893,25 @@ func TestAppendCopy(t *testing.T) {
 	}
 }
 
+func TestSubApplyUntil(t *testing.T) {
+	var b Buffer
+	defer b.Release()
+	for _, s := range []string{"aaaa", "bbbb", "cccc"} {
+		v := NewView(len(s))
+		v.Write([]byte(s))
+		b.appendOwned(v)
+	}
+
+	var visited []string
+	b.SubApplyUntil(2, int(b.Size())-2, func(v *View) bool {
+		visited = append(visited, string(v.AsSlice()))
+		return len(visited) < 2
+	})
+	if want := []string{"aa", "bbbb"}; len(visited) != len(want) || visited[0] != want[0] || visited[1] != want[1] {
+		t.Errorf("visited = %q, want %q", visited, want)
+	}
+}
+
 func TestGrowBufferCloned(t *testing.T) {
 	original := MakeWithData([]byte("abcd"))
 	defer original.Release()
