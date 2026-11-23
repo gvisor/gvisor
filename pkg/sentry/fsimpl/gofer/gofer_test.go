@@ -15,21 +15,28 @@
 package gofer
 
 import (
+	"bytes"
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/lisafs"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -212,6 +219,25 @@ type recycledInoConnImpl struct {
 	mu         sync.Mutex
 	rootStat   lisafs.Statx
 	targetStat lisafs.Statx
+
+	// If readGate is not nil, PRead on "target" blocks on it.
+	readGate *readGate
+}
+
+// readGate holds every PRead until release is closed. started is closed when
+// the first PRead arrives; reads counts PReads.
+type readGate struct {
+	startOnce sync.Once
+	started   chan struct{}
+	release   chan struct{}
+	reads     atomicbitops.Int32
+}
+
+func newReadGate() *readGate {
+	return &readGate{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
 }
 
 func (s *recycledInoConnImpl) getTargetStat() lisafs.Statx {
@@ -249,6 +275,7 @@ func (s *recycledInoConnImpl) SupportedMessages() []lisafs.MID {
 		lisafs.OpenAt,
 		lisafs.Close,
 		lisafs.Flush,
+		lisafs.PRead,
 	}
 }
 
@@ -316,15 +343,35 @@ func (fd *recycledInoControlFD) WalkStat(path lisafs.StringArray, recordStat fun
 }
 
 func (fd *recycledInoControlFD) Open(flags uint32) (*lisafs.OpenFD, int, error) {
-	ofd := &recycledInoOpenFD{stat: fd.stat}
+	ofd := &recycledInoOpenFD{connImpl: fd.connImpl, stat: fd.stat}
 	ofd.Init(fd.FD(), flags, ofd)
 	return &ofd.OpenFD, -1, nil
 }
 
+// recycledInoFileByte is the content of every byte of "target".
+const recycledInoFileByte = 0x5a
+
 type recycledInoOpenFD struct {
 	lisafs.OpenFD
 	lisafs.OpenFDImpl
-	stat lisafs.Statx
+	connImpl *recycledInoConnImpl
+	stat     lisafs.Statx
+}
+
+func (fd *recycledInoOpenFD) Read(buf []byte, off uint64) (uint64, error) {
+	if g := fd.connImpl.readGate; g != nil {
+		g.reads.Add(1)
+		g.startOnce.Do(func() { close(g.started) })
+		<-g.release
+	}
+	if off >= fd.stat.Size {
+		return 0, nil
+	}
+	n := min(uint64(len(buf)), fd.stat.Size-off)
+	for i := range buf[:n] {
+		buf[i] = recycledInoFileByte
+	}
+	return n, nil
 }
 
 func (fd *recycledInoOpenFD) FD() *lisafs.OpenFD          { return &fd.OpenFD }
@@ -337,6 +384,13 @@ func mountTestLisafsFS(t *testing.T, targetStat lisafs.Statx) (context.Context, 
 }
 
 func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts string) (context.Context, *auth.Credentials, *recycledInoConnImpl, *vfs.VirtualFilesystem, vfs.VirtualDentry) {
+	t.Helper()
+	return mountTestLisafsFSWithCache(t, cacheRemoteRevalidating, targetStat, nil /* readGate */, extraOpts)
+}
+
+// mountTestLisafsFSWithCache mounts a test lisafs filesystem with the given
+// cache mode. If readGate is not nil, PRead on "target" blocks on it.
+func mountTestLisafsFSWithCache(t *testing.T, cache string, targetStat lisafs.Statx, readGate *readGate, extraOpts string) (context.Context, *auth.Credentials, *recycledInoConnImpl, *vfs.VirtualFilesystem, vfs.VirtualDentry) {
 	t.Helper()
 	ctx := contexttest.Context(t)
 	creds := auth.CredentialsFromContext(ctx)
@@ -358,6 +412,7 @@ func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts 
 			Ino:      1,
 		},
 		targetStat: targetStat,
+		readGate:   readGate,
 	}
 	conn, err := srv.CreateConnection(serverSock, "/", lisafs.ConnectionOpts{WalkStatSupported: true}, connImpl)
 	if err != nil {
@@ -382,7 +437,7 @@ func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts 
 	if err != nil {
 		t.Fatalf("clientSock.Release: %v", err)
 	}
-	data := fmt.Sprintf("trans=fd,rfdno=%d,wfdno=%d,cache=remote_revalidating", sockFD, sockFD)
+	data := fmt.Sprintf("trans=fd,rfdno=%d,wfdno=%d,cache=%s", sockFD, sockFD, cache)
 	if extraOpts != "" {
 		data += "," + extraOpts
 	}
@@ -693,5 +748,393 @@ func TestEmptyWriteKeepsOffsetAndSize(t *testing.T) {
 				t.Errorf("after PWrite(offset=%#x, len=0), file size = %d, want %d", 3*pageSize, got, want)
 			}
 		})
+	}
+}
+
+// mmapFaultEnv is a MemoryManager with a touched anonymous page and a private
+// mapping of "target", a gofer file whose server donates no host FD and gates
+// PReads. The mapping holds the only reference on the file, and runs
+// beforeWait, if set, when MM waits for a fault on it.
+type mmapFaultEnv struct {
+	ctx        context.Context
+	creds      *auth.Credentials
+	vfsObj     *vfs.VirtualFilesystem
+	root       vfs.VirtualDentry
+	gate       *readGate
+	release    func()
+	m          *mm.MemoryManager
+	anonAddr   hostarch.Addr
+	fileAddr   hostarch.Addr
+	d          *dentry
+	beforeWait func()
+}
+
+func newMMapFaultEnv(t *testing.T, pages uint64) *mmapFaultEnv {
+	t.Helper()
+	return newMMapFaultEnvWithOpts(t, pages, "" /* extraOpts */)
+}
+
+func newMMapFaultEnvWithOpts(t *testing.T, pages uint64, extraOpts string) *mmapFaultEnv {
+	t.Helper()
+	e := &mmapFaultEnv{gate: newReadGate()}
+	e.ctx, e.creds, _, e.vfsObj, e.root = mountTestLisafsFSWithCache(t, cacheFSCache, lisafs.Statx{
+		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO | linux.STATX_SIZE,
+		Mode:     linux.S_IFREG | 0666,
+		DevMajor: 0,
+		DevMinor: 1,
+		Ino:      42,
+		Size:     pages * uint64(hostarch.PageSize),
+	}, e.gate, extraOpts)
+	ctx := e.ctx
+
+	m, err := mm.NewMemoryManager(platform.FromContext(ctx), pgalloc.MemoryFileFromContext(ctx))
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	t.Cleanup(func() { m.DecUsers(ctx) })
+	if _, err := m.SetMmapLayout(&arch.Context64{}, limits.NewLimitSet()); err != nil {
+		t.Fatalf("SetMmapLayout: %v", err)
+	}
+	e.m = m
+
+	// Map and touch an anonymous page.
+	e.anonAddr, err = m.MMap(ctx, memmap.MMapOpts{
+		Length:   uint64(hostarch.PageSize),
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap(anonymous): %v", err)
+	}
+	if _, err := m.CopyOut(ctx, e.anonAddr, []byte{1}, usermem.IOOpts{}); err != nil {
+		t.Fatalf("CopyOut(anonymous): %v", err)
+	}
+
+	// Map the file, which has no host FD.
+	fd, err := e.open(linux.O_RDONLY)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer fd.DecRef(ctx)
+	e.d = fd.Dentry().Impl().(*dentry)
+	if got := e.d.inode.mmapFD.Load(); got >= 0 {
+		t.Fatalf("mmapFD = %d, want none", got)
+	}
+	opts := memmap.MMapOpts{
+		Length:   pages * uint64(hostarch.PageSize),
+		Private:  true,
+		Perms:    hostarch.Read,
+		MaxPerms: hostarch.AnyAccess,
+	}
+	if err := fd.ConfigureMMap(ctx, &opts); err != nil {
+		t.Fatalf("ConfigureMMap: %v", err)
+	}
+	opts.Mappable = &waitHookMappable{Mappable: opts.Mappable, e: e}
+	e.fileAddr, err = m.MMap(ctx, opts)
+	opts.MappingIdentity.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("MMap(file): %v", err)
+	}
+
+	// Release the gate before tearing down, so that no fault is still
+	// blocked in PRead.
+	var releaseOnce sync.Once
+	e.release = func() { releaseOnce.Do(func() { close(e.gate.release) }) }
+	t.Cleanup(e.release)
+	return e
+}
+
+func (e *mmapFaultEnv) open(flags uint32) (*vfs.FileDescription, error) {
+	return e.vfsObj.OpenAt(e.ctx, e.creds, &vfs.PathOperation{
+		Root:  e.root,
+		Start: e.root,
+		Path:  fspath.Parse("target"),
+	}, &vfs.OpenOptions{Flags: flags})
+}
+
+// userFault takes a read fault on addr, then reads the page.
+func userFault(ctx context.Context, m *mm.MemoryManager, addr hostarch.Addr) ([]byte, error) {
+	if err := m.HandleUserFault(ctx, addr, hostarch.Read, 0); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, hostarch.PageSize)
+	_, err := m.CopyIn(ctx, addr, buf, usermem.IOOpts{})
+	return buf, err
+}
+
+// kernelCopy reads the page at addr without a prior user fault.
+func kernelCopy(ctx context.Context, m *mm.MemoryManager, addr hostarch.Addr) ([]byte, error) {
+	buf := make([]byte, hostarch.PageSize)
+	_, err := m.CopyIn(ctx, addr, buf, usermem.IOOpts{})
+	return buf, err
+}
+
+type faultResult struct {
+	buf []byte
+	err error
+}
+
+func (e *mmapFaultEnv) goFault(fault func(context.Context, *mm.MemoryManager, hostarch.Addr) ([]byte, error), addr hostarch.Addr) <-chan faultResult {
+	done := make(chan faultResult, 1)
+	go func() {
+		buf, err := fault(e.ctx, e.m, addr)
+		done <- faultResult{buf, err}
+	}()
+	return done
+}
+
+func checkFaultResult(t *testing.T, r faultResult) {
+	t.Helper()
+	if r.err != nil {
+		t.Errorf("fault: %v", r.err)
+		return
+	}
+	if want := bytes.Repeat([]byte{recycledInoFileByte}, len(r.buf)); !bytes.Equal(r.buf, want) {
+		t.Errorf("file mapping contents = %x..., want %x...", r.buf[:8], want[:8])
+	}
+}
+
+// checkAnonCopyOut checks that a CopyOut to the anonymous page completes while
+// PReads are gated. If it doesn't, the returned function waits for it after
+// the gate is released.
+func (e *mmapFaultEnv) checkAnonCopyOut(t *testing.T, blocker string) (finish func()) {
+	t.Helper()
+	copied := make(chan error, 1)
+	go func() {
+		_, err := e.m.CopyOut(e.ctx, e.anonAddr, []byte{2}, usermem.IOOpts{})
+		copied <- err
+	}()
+	select {
+	case err := <-copied:
+		if err != nil {
+			t.Errorf("CopyOut(anonymous): %v", err)
+		}
+		return func() {}
+	case <-time.After(10 * time.Second):
+		t.Errorf("CopyOut(anonymous) blocked behind %s", blocker)
+		return func() {
+			if err := <-copied; err != nil {
+				t.Errorf("CopyOut(anonymous): %v", err)
+			}
+		}
+	}
+}
+
+// TestMMapFaultWithoutHostFDReleasesMM checks that while a fault on a mapped
+// gofer file waits for a PRead (the server donated no host FD), other threads
+// can still access their already-mapped memory.
+func TestMMapFaultWithoutHostFDReleasesMM(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault func(context.Context, *mm.MemoryManager, hostarch.Addr) ([]byte, error)
+	}{
+		{"user fault", userFault},
+		{"kernel copy", kernelCopy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newMMapFaultEnv(t, 1)
+			done := e.goFault(tc.fault, e.fileAddr)
+			select {
+			case <-e.gate.started:
+			case r := <-done:
+				t.Fatalf("fault completed without reading the file: %v", r.err)
+			}
+
+			// The fault is now blocked in PRead. Accessing the anonymous
+			// page must not wait for it.
+			finish := e.checkAnonCopyOut(t, "the file fault's PRead")
+			e.release()
+			checkFaultResult(t, <-done)
+			finish()
+		})
+	}
+}
+
+// TestMMapFaultSameFileReleasesMM checks that a fault on a gofer file whose
+// page cache another fault is filling waits for that fill without MM locks,
+// and then reads none of the pages the other fill cached. In "handle upgrade",
+// another thread opening the file for writing waits for the first fill, and
+// the second fault must also wait behind it without MM locks.
+func TestMMapFaultSameFileReleasesMM(t *testing.T) {
+	// blockedDelay is how long a goroutine is given to reach the lock it
+	// blocks on.
+	const blockedDelay = 100 * time.Millisecond
+	for _, tc := range []struct {
+		name       string
+		openWriter bool
+	}{
+		{"page cache fill", false},
+		{"handle upgrade", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One vma of two pages, so the first fault's readahead covers
+			// the page of the second.
+			e := newMMapFaultEnv(t, 2)
+			first := e.goFault(userFault, e.fileAddr)
+			select {
+			case <-e.gate.started:
+			case r := <-first:
+				t.Fatalf("first fault completed without reading the file: %v", r.err)
+			}
+
+			// The first fault is now blocked in PRead, holding the file's
+			// locks but not MM's.
+			var opened chan error
+			if tc.openWriter {
+				opened = make(chan error, 1)
+				go func() {
+					fd, err := e.open(linux.O_RDWR)
+					if err == nil {
+						fd.DecRef(e.ctx)
+					}
+					opened <- err
+				}()
+				time.Sleep(blockedDelay)
+				select {
+				case err := <-opened:
+					t.Fatalf("OpenAt(O_RDWR) completed while the first fault's PRead was blocked: %v", err)
+				default:
+				}
+			}
+			second := e.goFault(userFault, e.fileAddr+hostarch.Addr(hostarch.PageSize))
+			time.Sleep(blockedDelay)
+
+			finish := e.checkAnonCopyOut(t, "a fault waiting for the same file")
+			var secondResult *faultResult
+			select {
+			case r := <-second:
+				secondResult = &r
+				t.Errorf("second fault completed while the first fault's PRead was blocked: %v", r.err)
+			default:
+			}
+
+			e.release()
+			checkFaultResult(t, <-first)
+			if secondResult == nil {
+				r := <-second
+				secondResult = &r
+			}
+			checkFaultResult(t, *secondResult)
+			finish()
+			if opened != nil {
+				if err := <-opened; err != nil {
+					t.Errorf("OpenAt(O_RDWR): %v", err)
+				}
+			}
+			if got := e.gate.reads.Load(); got != 1 {
+				t.Errorf("PReads = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// waitHookMappable is the Mappable of an mmapFaultEnv's file mapping. It runs
+// e.beforeWait, if set, when MM waits for a fault returned by the file.
+type waitHookMappable struct {
+	memmap.Mappable
+	e *mmapFaultEnv
+}
+
+// Translate implements memmap.Mappable.Translate.
+func (m *waitHookMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	ts, err := m.Mappable.Translate(ctx, required, optional, at)
+	if fault, ok := err.(memmap.TranslationFault); ok {
+		err = &hookedTranslationFault{fault, m.e}
+	}
+	return ts, err
+}
+
+type hookedTranslationFault struct {
+	memmap.TranslationFault
+	e *mmapFaultEnv
+}
+
+// Wait implements memmap.TranslationFault.Wait.
+func (f *hookedTranslationFault) Wait(ctx context.Context, interruptible bool) error {
+	if f.e.beforeWait != nil {
+		f.e.beforeWait()
+	}
+	return f.TranslationFault.Wait(ctx, interruptible)
+}
+
+func (e *mmapFaultEnv) cacheEmpty() bool {
+	e.d.inode.dataMu.RLock()
+	defer e.d.inode.dataMu.RUnlock()
+	return e.d.inode.cache.IsEmpty()
+}
+
+// TestMMapFaultWaitAfterLastFileReference checks that a fault keeps the file
+// referenced while it waits for a page cache fill, even if its mapping, which
+// holds the file's last reference, is removed first; Linux's
+// maybe_unlock_mmap_for_io() likewise pins vm_file across the I/O. With no
+// dentry cache, an unreferenced file is destroyed at once, as an unlinked one
+// would be. The fill must use the live file, the retry must find the mapping
+// gone, and the file must then be destroyed with its page cache.
+func TestMMapFaultWaitAfterLastFileReference(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault func(context.Context, *mm.MemoryManager, hostarch.Addr) ([]byte, error)
+	}{
+		{"user fault", userFault},
+		{"kernel copy", kernelCopy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newMMapFaultEnvWithOpts(t, 1, moptDcache+"=0")
+			e.release()
+			e.beforeWait = func() {
+				if err := e.m.MUnmap(e.ctx, e.fileAddr, uint64(hostarch.PageSize)); err != nil {
+					t.Errorf("MUnmap: %v", err)
+				}
+				if e.d.refs.Load() <= 0 {
+					t.Error("file destroyed before Wait")
+				}
+			}
+			if _, err := tc.fault(e.ctx, e.m, e.fileAddr); err == nil {
+				t.Error("fault succeeded after its mapping was removed")
+			}
+			if got := e.gate.reads.Load(); got != 1 {
+				t.Errorf("PReads = %d, want 1", got)
+			}
+			if got := e.d.refs.Load(); got != -1 {
+				t.Errorf("file references after the fault = %d, want destroyed", got)
+			}
+			if !e.cacheEmpty() {
+				t.Error("destroyed file has a page cache")
+			}
+		})
+	}
+}
+
+// TestMMapFaultWaitAfterUnmapIsEvictable checks that pages that a fault's
+// Wait fills after the faulting mapping was removed, and after MemoryFile has
+// already tried to evict the file's unmapped pages, can still be evicted while
+// the file stays open.
+func TestMMapFaultWaitAfterUnmapIsEvictable(t *testing.T) {
+	e := newMMapFaultEnv(t, 1)
+	e.release()
+	fd, err := e.open(linux.O_RDONLY)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer fd.DecRef(e.ctx)
+	mf := e.d.inode.fs.mf
+	e.beforeWait = func() {
+		if err := e.m.MUnmap(e.ctx, e.fileAddr, uint64(hostarch.PageSize)); err != nil {
+			t.Errorf("MUnmap: %v", err)
+		}
+		mf.StartEvictions()
+		mf.WaitForEvictions()
+	}
+	if _, err := kernelCopy(e.ctx, e.m, e.fileAddr); err == nil {
+		t.Error("fault succeeded after its mapping was removed")
+	}
+	if e.cacheEmpty() {
+		t.Fatal("Wait did not fill the page cache")
+	}
+	mf.StartEvictions()
+	mf.WaitForEvictions()
+	if !e.cacheEmpty() {
+		t.Error("unmapped pages filled by Wait were not evicted")
 	}
 }
