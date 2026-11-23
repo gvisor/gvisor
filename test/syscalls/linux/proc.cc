@@ -4314,7 +4314,7 @@ TEST(Proc, GetdentsPartialBufferSparsePids) {
 TEST(ProcPid, FdOwnerFollowsSetuid) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETGID)));
-  constexpr int kNobody = 65534;
+  static constexpr int kNobody = 65534;
 
   const pid_t child_pid = fork();
   if (child_pid == 0) {
@@ -4331,8 +4331,8 @@ TEST(ProcPid, FdOwnerFollowsSetuid) {
     _exit(0);
   }
   ASSERT_THAT(child_pid, SyscallSucceeds());
-  auto kill_cleanup = Cleanup([child_pid] {
-    EXPECT_THAT(kill(child_pid, SIGKILL), SyscallSucceeds());
+  auto cont_cleanup = Cleanup([child_pid] {
+    EXPECT_THAT(kill(child_pid, SIGCONT), SyscallSucceeds());
     EXPECT_THAT(RetryEINTR(waitpid)(child_pid, nullptr, 0),
                 SyscallSucceedsWithValue(child_pid));
   });
@@ -4342,26 +4342,37 @@ TEST(ProcPid, FdOwnerFollowsSetuid) {
               SyscallSucceedsWithValue(child_pid));
   ASSERT_TRUE(WIFSTOPPED(status)) << status;
 
-  for (const char* name : {"fd", "fdinfo", "fd/0"}) {
-    SCOPED_TRACE(name);
-    const std::string path = absl::StrCat("/proc/", child_pid, "/", name);
-    struct stat st;
-    ASSERT_THAT(lstat(path.c_str(), &st), SyscallSucceeds());
-    EXPECT_EQ(st.st_uid, kNobody);
-    EXPECT_EQ(st.st_gid, kNobody);
-    struct statx stx = {};
-    ASSERT_THAT(syscall(SYS_statx, AT_FDCWD, path.c_str(), AT_SYMLINK_NOFOLLOW,
-                        STATX_UID, &stx),
-                SyscallSucceeds());
-    EXPECT_EQ(stx.stx_uid, kNobody);
-    if (stx.stx_mask & STATX_GID) {
-      EXPECT_EQ(stx.stx_gid, kNobody);
-    }
-  }
-
-  // A raw setuid changes only the calling thread's credentials.
+  // A raw setuid changes only the calling thread's credentials. Run the
+  // ownership checks as kNobody too so the test only needs CAP_SETUID and
+  // CAP_SETGID.
   ScopedThread nobody_thread([child_pid] {
     ASSERT_THAT(syscall(SYS_setuid, kNobody), SyscallSucceeds());
+    for (const char* name : {"fd", "fdinfo", "fd/0"}) {
+      SCOPED_TRACE(name);
+      const std::string path = absl::StrCat("/proc/", child_pid, "/", name);
+      struct stat st;
+      ASSERT_THAT(lstat(path.c_str(), &st), SyscallSucceeds());
+      EXPECT_EQ(st.st_uid, kNobody);
+      EXPECT_EQ(st.st_gid, kNobody);
+      struct statx stx = {};
+      ASSERT_THAT(syscall(SYS_statx, AT_FDCWD, path.c_str(),
+                          AT_SYMLINK_NOFOLLOW, STATX_UID, &stx),
+                  SyscallSucceeds());
+      EXPECT_EQ(stx.stx_uid, kNobody);
+      if (stx.stx_mask & STATX_GID) {
+        EXPECT_EQ(stx.stx_gid, kNobody);
+      }
+      struct statx stx_ino = {};
+      ASSERT_THAT(syscall(SYS_statx, AT_FDCWD, path.c_str(),
+                          AT_SYMLINK_NOFOLLOW, STATX_INO, &stx_ino),
+                  SyscallSucceeds());
+      if (stx_ino.stx_mask & STATX_UID) {
+        EXPECT_EQ(stx_ino.stx_uid, kNobody);
+      }
+      if (stx_ino.stx_mask & STATX_GID) {
+        EXPECT_EQ(stx_ino.stx_gid, kNobody);
+      }
+    }
     EXPECT_NO_ERRNO(
         Open(absl::StrCat("/proc/", child_pid, "/fd"), O_RDONLY | O_DIRECTORY));
   });

@@ -278,7 +278,7 @@ func (i *taskOwnedInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.
 	if err != nil {
 		return linux.Statx{}, err
 	}
-	fillTaskOwner(i.owner, &stat)
+	fillTaskOwner(i.owner, &stat, opts.Mask)
 	return stat, nil
 }
 
@@ -310,10 +310,15 @@ func (i *taskOwnedInode) checkModePermissions(creds *auth.Credentials, ats vfs.A
 }
 
 // fillTaskOwner updates the owner fields of stat that stat.Mask marks valid
-// with taskOwner(t, stat.Mode).
+// with taskOwner(t, stat.Mode). When requestedMask requests neither ID, it
+// clears the owner bits in stat.Mask instead of taking t.mu.
 //
 // +checklocksexclude:t.mu
-func fillTaskOwner(t *kernel.Task, stat *linux.Statx) {
+func fillTaskOwner(t *kernel.Task, stat *linux.Statx, requestedMask uint32) {
+	if requestedMask&(linux.STATX_UID|linux.STATX_GID) == 0 {
+		stat.Mask &^= linux.STATX_UID | linux.STATX_GID
+		return
+	}
 	if stat.Mask&(linux.STATX_UID|linux.STATX_GID) == 0 {
 		return
 	}
@@ -328,8 +333,7 @@ func fillTaskOwner(t *kernel.Task, stat *linux.Statx) {
 
 // taskOwner returns the owner of a /proc/[pid] file with the given mode. It
 // must be computed on each access rather than at inode creation, since the
-// task's credentials and dumpability change over its lifetime (Linux
-// re-evaluates it in fs/proc/base.c:pid_revalidate).
+// task's credentials and dumpability change over its lifetime.
 //
 // +checklocksexclude:t.mu
 func taskOwner(t *kernel.Task, mode linux.FileMode) (auth.KUID, auth.KGID) {
