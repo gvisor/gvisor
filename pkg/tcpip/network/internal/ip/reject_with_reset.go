@@ -125,6 +125,17 @@ func buildResetPayloadV6(hopLimit uint8, src, dst tcpip.Address, tcpHdr header.T
 	return v
 }
 
+// hasRoute returns whether the route table has a route to addr through an
+// enabled NIC.
+func hasRoute(stk *stack.Stack, addr tcpip.Address) bool {
+	for _, r := range stk.GetRouteTable() {
+		if r.Destination.Contains(addr) && stk.CheckNIC(r.NIC) {
+			return true
+		}
+	}
+	return false
+}
+
 // RejectWithTCPReset sends a TCP reset in response to the packet.
 //
 // Ref: net/ipv[4|6]/netfilter/nf_reject_ipv[4|6].c:nf_send_reset[6]()
@@ -236,21 +247,6 @@ func RejectWithTCPReset(pkt *stack.PacketBuffer, netProto tcpip.NetworkProtocolN
 		}
 	}
 
-	localAddr := dst
-	if hook != stack.Input {
-		// If the packet wasn't delivered locally, do not use the packet's destination
-		// address as the response's source address as we should not own the
-		// destination address.
-		localAddr = tcpip.Address{}
-	}
-
-	route, err := stk.FindRoute(0 /*nicID*/, localAddr, src, netProto, false /* multicastLoop */)
-	if err != nil {
-		return err
-	}
-	defer route.Release()
-	ttl = route.DefaultTTL()
-
 	var seq uint32
 	var ack uint32
 	payloadLen := uint32(pkt.Data().Size())
@@ -270,11 +266,64 @@ func RejectWithTCPReset(pkt *stack.PacketBuffer, netProto tcpip.NetworkProtocolN
 		}
 	}
 
+	// The reset for a bridged packet is sent straight out of the bridge port
+	// the packet was received on, from the link address the packet was sent
+	// to. It needs a route to the source, but no local address.
+	physIn := pkt.BridgePhysIn()
+	var route *stack.Route
+	if physIn != 0 {
+		if !hasRoute(stk, src) {
+			return &tcpip.ErrNetworkUnreachable{}
+		}
+		var defaultTTL tcpip.DefaultTTLOption
+		if err := stk.NetworkProtocolOption(netProto, &defaultTTL); err != nil {
+			return err
+		}
+		ttl = uint8(defaultTTL)
+	} else {
+		localAddr := dst
+		if hook != stack.Input {
+			// If the packet wasn't delivered locally, do not use the packet's destination
+			// address as the response's source address as we should not own the
+			// destination address.
+			localAddr = tcpip.Address{}
+		}
+
+		var err tcpip.Error
+		route, err = stk.FindRoute(0 /*nicID*/, localAddr, src, netProto, false /* multicastLoop */)
+		if err != nil {
+			return err
+		}
+		defer route.Release()
+		ttl = route.DefaultTTL()
+	}
+
 	var v *buffer.View
 	if netProto == header.IPv4ProtocolNumber {
 		v = buildResetPayloadV4(ttl, src, dst, tcpHdr, seq, ack, flags)
 	} else {
 		v = buildResetPayloadV6(ttl, src, dst, tcpHdr, seq, ack, flags)
+	}
+
+	if physIn != 0 {
+		origEth := header.Ethernet(pkt.LinkHeader().Slice())
+		if len(origEth) < header.EthernetMinimumSize {
+			v.Release()
+			return nil
+		}
+		if netProto == header.IPv4ProtocolNumber {
+			ipHdr := header.IPv4(v.AsSlice())
+			ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
+		}
+		eth := buffer.NewViewSize(header.EthernetMinimumSize)
+		header.Ethernet(eth.AsSlice()).Encode(&header.EthernetFields{
+			SrcAddr: origEth.DestinationAddress(),
+			DstAddr: origEth.SourceAddress(),
+			Type:    netProto,
+		})
+		frame := buffer.MakeWithView(eth)
+		frame.Append(v)
+		return stk.WriteRawPacket(physIn, netProto, frame)
 	}
 
 	rstPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{

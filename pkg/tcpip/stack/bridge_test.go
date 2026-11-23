@@ -440,6 +440,8 @@ func newDispatchTestContext(t *testing.T, classifying bool) *dispatchTestContext
 	c.s = stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
 	})
+	// The test frames have no IPv4 header, which bridge netfilter drops.
+	setBridgeNetfilterCalls(c.s, false /* ip */, false /* arp */)
 	t.Cleanup(func() {
 		drainChannels(c.ch1, c.ch2)
 		c.ch1.Close()

@@ -107,11 +107,11 @@ type IPTables struct {
 	modified bool
 }
 
-// Modified returns whether iptables has been modified. It is inherently racy
-// and intended for use only in tests.
+// Modified returns whether iptables has been modified. The result may be
+// stale by the time it is used.
 func (it *IPTables) Modified() bool {
-	it.mu.Lock()
-	defer it.mu.Unlock()
+	it.mu.RLock()
+	defer it.mu.RUnlock()
 	return it.modified
 }
 
