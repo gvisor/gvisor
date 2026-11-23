@@ -34,6 +34,15 @@ type OpenMountArgs struct {
 	Flags uint32
 }
 
+// mountNSRequest is a request for the thread that runs in the gofer's mount
+// namespace.
+type mountNSRequest interface {
+	// handle serves the request.
+	handle()
+	// cancel fails the request with err.
+	cancel(err error)
+}
+
 type openMountRequest struct {
 	args   *OpenMountArgs
 	result *OpenMountResult
@@ -44,9 +53,9 @@ type openMountRequest struct {
 // calls outside of its namespace container. It is used to configure sandbox
 // mounts.
 type goferToHostRPC struct {
-	mu                sync.Mutex
-	openMountRequests chan *openMountRequest
-	goferPID          int
+	mu              sync.Mutex
+	mountNSRequests chan mountNSRequest
+	goferPID        int
 }
 
 // OpenMountResult is a result of the rpcp.OpenMount call.
@@ -154,7 +163,7 @@ func openIDMappedMount(req *OpenMountArgs) (*os.File, error) {
 	return os.NewFile(uintptr(fd), req.Mount.Source), nil
 }
 
-func (rpc *goferToHostRPC) handleRequest(req *openMountRequest) {
+func (req *openMountRequest) handle() {
 	defer close(req.done)
 
 	var fd *os.File
@@ -173,22 +182,50 @@ func (rpc *goferToHostRPC) handleRequest(req *openMountRequest) {
 	req.result.Files = []*os.File{fd}
 }
 
-func (rpc *goferToHostRPC) openMountThread() error {
+func (req *openMountRequest) cancel(err error) {
+	defer close(req.done)
+
+	req.done <- err
+}
+
+func (rpc *goferToHostRPC) mountNSThread() error {
 	if err := unix.Unshare(unix.CLONE_FS); err != nil {
-		return fmt.Errorf("open mount thread: unshare filesystem attributes: %w", err)
+		return fmt.Errorf("mount namespace thread: unshare filesystem attributes: %w", err)
 	}
 	nsFd, err := os.Open(fmt.Sprintf("/proc/%d/ns/mnt", rpc.goferPID))
 	if err != nil {
-		return fmt.Errorf("open mount thread: open container mntns: %w", err)
+		return fmt.Errorf("mount namespace thread: open container mntns: %w", err)
 	}
 	defer nsFd.Close()
 	if err := unix.Setns(int(nsFd.Fd()), unix.CLONE_NEWNS); err != nil {
-		return fmt.Errorf("open mount thread: join container mntns: %w", err)
+		return fmt.Errorf("mount namespace thread: join container mntns: %w", err)
 	}
-	for req := range rpc.openMountRequests {
-		rpc.handleRequest(req)
+	for req := range rpc.mountNSRequests {
+		req.handle()
 	}
 	return nil
+}
+
+// startMountNSThread starts the thread that runs in the gofer's mount
+// namespace, unless it is running.
+func (rpc *goferToHostRPC) startMountNSThread() {
+	if rpc.mountNSRequests != nil {
+		return
+	}
+	rpc.mountNSRequests = make(chan mountNSRequest)
+	go func() {
+		// This goroutine holds the current threads forever. It
+		// never exits, because child processes can set
+		// PDEATHSIG. It can't serve other go-routines, because
+		// it does unshare CLONE_FS.
+		runtime.LockOSThread()
+		if err := rpc.mountNSThread(); err != nil {
+			for req := range rpc.mountNSRequests {
+				req.cancel(err)
+			}
+		}
+		panic("unreachable")
+	}()
 }
 
 // OpenMount opens a specified mount and returns a file descriptor to it. It is
@@ -197,28 +234,13 @@ func (rpc *goferToHostRPC) OpenMount(reqArg *OpenMountArgs, res *OpenMountResult
 	rpc.mu.Lock()
 	defer rpc.mu.Unlock()
 
-	if rpc.openMountRequests == nil {
-		rpc.openMountRequests = make(chan *openMountRequest)
-		go func() {
-			// This goroutine holds the current threads forever. It
-			// never exits, because child processes can set
-			// PDEATHSIG. It can't serve other go-routines, because
-			// it does unshare CLONE_FS.
-			runtime.LockOSThread()
-			if err := rpc.openMountThread(); err != nil {
-				for req := range rpc.openMountRequests {
-					req.done <- err
-				}
-			}
-			panic("unreachable")
-		}()
-	}
+	rpc.startMountNSThread()
 	req := openMountRequest{
 		args:   reqArg,
 		result: res,
 		done:   make(chan error),
 	}
-	rpc.openMountRequests <- &req
+	rpc.mountNSRequests <- &req
 	err := <-req.done
 	return err
 }
