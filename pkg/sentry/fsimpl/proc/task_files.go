@@ -1076,12 +1076,13 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	}
 	buf.WriteString(" \n")
 
-	// As in Linux's fs/proc/array.c:proc_pid_status(), a task without an mm,
-	// such as an exited thread group leader, has no Vm* lines.
+	// A task without an mm, such as an exited thread group leader, has no Vm*
+	// lines.
 	if mm := getMM(s.task); mm != nil {
+		// Read ResidentSetSize before MaxResidentSetSize so VmHWM >= VmRSS.
 		rss := mm.ResidentSetSize()
 		fmt.Fprintf(buf, "VmSize:\t%d kB\n", mm.VirtualMemorySize()>>10)
-		fmt.Fprintf(buf, "VmHWM:\t%d kB\n", max(mm.MaxResidentSetSize(), rss)>>10)
+		fmt.Fprintf(buf, "VmHWM:\t%d kB\n", mm.MaxResidentSetSize()>>10)
 		fmt.Fprintf(buf, "VmRSS:\t%d kB\n", rss>>10)
 		fmt.Fprintf(buf, "VmData:\t%d kB\n", mm.VirtualDataSize()>>10)
 	}
