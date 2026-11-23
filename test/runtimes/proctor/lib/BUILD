@@ -14,6 +14,7 @@ go_library(
         "nodejs.go",
         "php.go",
         "python.go",
+        "rust.go",
     ],
     importpath = "gvisor.dev/gvisor/test/runtimes/proctor/lib",
     visibility = ["//test:__subpackages__"],
