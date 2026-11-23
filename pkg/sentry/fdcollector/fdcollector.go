@@ -95,6 +95,11 @@ func (c *Agent) run() {
 	}
 }
 
+// Wait waits for the goroutine to read until EOF or an error.
+func (c *Agent) Wait() {
+	c.wg.Wait()
+}
+
 // Stop stops the goroutine that reads from the vfs.FileDescription.
 func (c *Agent) Stop() {
 	close(c.stopC)

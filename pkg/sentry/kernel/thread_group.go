@@ -868,6 +868,19 @@ func (tg *ThreadGroup) SigsegvUnlock() {
 	}
 }
 
+// SigsegvLockedTasks returns the tasks in tg that SigsegvLock has stopped.
+func (tg *ThreadGroup) SigsegvLockedTasks() []*Task {
+	sh := tg.signalLock()
+	defer sh.mu.Unlock()
+	var stopped []*Task
+	for t := tg.tasks.Front(); t != nil; t = t.Next() {
+		if _, ok := t.stop.(*sigsegvLockStop); ok {
+			stopped = append(stopped, t)
+		}
+	}
+	return stopped
+}
+
 // sigsegvLockStop is a TaskStop entered when a task would raise SIGSEGV due to
 // an unhandled page fault, but ThreadGroup.SigsegvLock() is in effect.
 //
