@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -449,6 +450,56 @@ TEST_F(IoctlTest, SIOCGPGRPSucceeds) {
   int get = -1;
   ASSERT_THAT(ioctl(s.get(), SIOCGPGRP, &get), SyscallSucceeds());
   EXPECT_EQ(get, 0);
+}
+
+namespace {
+
+// Checks that FIOGETOWN and SIOCGPGRP both return want for fd. The result
+// starts as INT_MIN, which is never a valid owner, so that the check fails if
+// the ioctl does not write it.
+void ExpectGetOwnerIoctls(int fd, int want) {
+  int get = INT_MIN;
+  ASSERT_THAT(ioctl(fd, FIOGETOWN, &get), SyscallSucceeds());
+  EXPECT_EQ(get, want);
+
+  get = INT_MIN;
+  ASSERT_THAT(ioctl(fd, SIOCGPGRP, &get), SyscallSucceeds());
+  EXPECT_EQ(get, want);
+}
+
+}  // namespace
+
+TEST_F(IoctlTest, GetOwnerPid) {
+  const FileDescriptor s = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+
+  ASSERT_THAT(syscall(__NR_fcntl, s.get(), F_SETOWN, getpid()),
+              SyscallSucceeds());
+  ExpectGetOwnerIoctls(s.get(), getpid());
+}
+
+TEST_F(IoctlTest, GetOwnerPgrp) {
+  const FileDescriptor s = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+
+  f_owner_ex owner = {};
+  owner.type = F_OWNER_PGRP;
+  owner.pid = getpgrp();
+  ASSERT_THAT(syscall(__NR_fcntl, s.get(), F_SETOWN_EX, &owner),
+              SyscallSucceeds());
+  ExpectGetOwnerIoctls(s.get(), -owner.pid);
+}
+
+TEST_F(IoctlTest, GetOwnerTid) {
+  const FileDescriptor s = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+
+  f_owner_ex owner = {};
+  owner.type = F_OWNER_TID;
+  owner.pid = static_cast<int>(syscall(SYS_gettid));
+  ASSERT_THAT(syscall(__NR_fcntl, s.get(), F_SETOWN_EX, &owner),
+              SyscallSucceeds());
+  ExpectGetOwnerIoctls(s.get(), owner.pid);
 }
 
 }  // namespace testing
