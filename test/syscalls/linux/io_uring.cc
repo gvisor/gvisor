@@ -14,35 +14,50 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
+#include <linux/fuse.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <ostream>
+#include <string>
 #include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "test/util/cleanup.h"
+#include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/fuse_util.h"
 #include "test/util/io_uring_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
+#include "test/util/mount_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -1221,6 +1236,170 @@ TEST(IOUringTest, READVWithInvalidSqeFieldValue) {
 
   uint32_t cq_head = io_uring->load_cq_head();
   io_uring->store_cq_head(cq_head + 1);
+}
+
+// Submits a single IORING_OP_READV of iovcnt iovecs from fd, waits for it to
+// complete, and stores the CQE result in res.
+void SubmitREADV(int fd, const struct iovec* iov, int iovcnt, int32_t* res) {
+  IOUringParams params = {};
+  std::unique_ptr<IOUring> io_uring =
+      ASSERT_NO_ERRNO_AND_VALUE(IOUring::InitIOUring(1, params));
+  IOUringSqe* sqe = io_uring->get_sqes();
+  memset(sqe, 0, sizeof(*sqe));
+  sqe->opcode = IORING_OP_READV;
+  sqe->fd = fd;
+  sqe->addr = reinterpret_cast<uint64_t>(iov);
+  sqe->len = iovcnt;
+  sqe->user_data = 1;
+  io_uring->get_sq_array()[0] = 0;
+  io_uring->store_sq_tail(io_uring->load_sq_tail() + 1);
+
+  ASSERT_EQ(io_uring->Enter(1, 1, IORING_ENTER_GETEVENTS, nullptr), 1)
+      << "errno=" << errno;
+  ASSERT_EQ(io_uring->load_cq_tail(), 1);
+  const IOUringCqe* cqe = io_uring->get_cqes();
+  EXPECT_EQ(cqe->user_data, 1);
+  *res = cqe->res;
+  io_uring->store_cq_head(io_uring->load_cq_head() + 1);
+}
+
+// A READV that faults after copying some bytes completes with the number of
+// bytes copied, as readv(2) returns.
+TEST(IOUringTest, READVPartialReadThenFault) {
+  SKIP_IF(!IOUringAvailable());
+
+  const std::string contents(64, 'a');
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), contents, 0644));
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDONLY));
+
+  constexpr size_t kCopied = 6;
+  char buf[kCopied] = {};
+  const Mapping inaccessible =
+      ASSERT_NO_ERRNO_AND_VALUE(MmapAnon(kPageSize, PROT_NONE, MAP_PRIVATE));
+  struct iovec iov[] = {
+      {.iov_base = buf, .iov_len = sizeof(buf)},
+      {.iov_base = inaccessible.ptr(), .iov_len = contents.size() - kCopied},
+  };
+  int32_t res;
+  ASSERT_NO_FATAL_FAILURE(SubmitREADV(fd.get(), iov, 2, &res));
+  ASSERT_EQ(res, kCopied);
+  EXPECT_EQ(absl::string_view(buf, res), contents.substr(0, kCopied));
+}
+
+// A READV request interrupted while it waits for a FUSE server completes with
+// EINTR, never with a syscall restart errno: a submitted request can't be
+// restarted like a syscall. In gVisor, checkpointing the sandbox interrupts
+// such waits. Checkpoints only occur in save variants; otherwise (including on
+// Linux), the read completes normally.
+TEST(IOUringTest, READVInterruptedFUSERead) {
+  SKIP_IF(!IOUringAvailable());
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  // Save only at the explicit checkpoint below, while the read is waiting.
+  std::optional<DisableSave> ds(std::in_place);
+
+  FileDescriptor dev = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/fuse", O_RDWR));
+  const TempPath mount_point = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string mount_opts =
+      absl::StrFormat("fd=%d,user_id=0,group_id=0,rootmode=40000", dev.get());
+  const Cleanup mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("fuse", mount_point.path(), "fuse", 0 /* mountflags */, mount_opts,
+            0 /* umountflags */));
+  ASSERT_NO_FATAL_FAILURE(FuseInit(dev.get()));
+  const FileDescriptor stop_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NewEventFD(0, EFD_CLOEXEC));
+
+  constexpr absl::string_view kData = "io_uring FUSE read";
+  // The result of the server's reply to the first FUSE_READ request.
+  std::optional<PosixError> read_reply;
+  ScopedThread server([&, server_fd = dev.release()] {
+    RunFuseServer(
+        server_fd, stop_fd.get(), [&](int fd, const fuse_in_header& in) {
+          switch (in.opcode) {
+            case FUSE_LOOKUP: {
+              fuse_entry_out out = {.nodeid = 2, .generation = 1};
+              out.attr = {.ino = 2,
+                          .size = kData.size(),
+                          .mode = S_IFREG | 0644,
+                          .nlink = 1};
+              FuseRespond(fd, in.unique, &out, sizeof(out));
+              break;
+            }
+            case FUSE_GETATTR: {
+              fuse_attr_out out = {};
+              out.attr = {
+                  .ino = in.nodeid,
+                  .size = in.nodeid == 1 ? 0 : kData.size(),
+                  .mode = in.nodeid == 1 ? S_IFDIR | 0755U : S_IFREG | 0644U,
+                  .nlink = 1};
+              FuseRespond(fd, in.unique, &out, sizeof(out));
+              break;
+            }
+            case FUSE_OPEN: {
+              fuse_open_out out = {.fh = 1};
+              FuseRespond(fd, in.unique, &out, sizeof(out));
+              break;
+            }
+            case FUSE_READ: {
+              const auto& read_in =
+                  *reinterpret_cast<const fuse_read_in*>(&in + 1);
+              const size_t n =
+                  read_in.offset == 0
+                      ? std::min<size_t>(read_in.size, kData.size())
+                      : 0;
+              if (read_reply.has_value()) {
+                FuseRespond(fd, in.unique, kData.data(), n);
+                break;
+              }
+              // Checkpoint while the READV waits for this reply.
+              ds.reset();
+              MaybeSave();
+              ds.emplace();
+              read_reply = FuseWriteReply(fd, in.unique, kData.data(), n);
+              break;
+            }
+            case FUSE_INTERRUPT:
+              // Interrupt requests need no reply.
+              break;
+            case FUSE_FLUSH:
+            case FUSE_RELEASE:
+              FuseRespond(fd, in.unique);
+              break;
+            default:
+              FuseRespond(fd, in.unique, nullptr, 0, -ENOSYS);
+              break;
+          }
+          return in.opcode != FUSE_RELEASE;
+        });
+  });
+  // An assertion before the file is opened cannot rely on a RELEASE request to
+  // stop the server. Wake its poll before ScopedThread's destructor joins it.
+  const Cleanup stop_server([&] {
+    const uint64_t stop = 1;
+    EXPECT_THAT(RetryEINTR(write)(stop_fd.get(), &stop, sizeof(stop)),
+                SyscallSucceedsWithValue(sizeof(stop)));
+  });
+
+  FileDescriptor file = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(JoinPath(mount_point.path(), "file"), O_RDONLY));
+  char buf[64] = {};
+  struct iovec iov = {.iov_base = buf, .iov_len = sizeof(buf)};
+  int32_t res;
+  ASSERT_NO_FATAL_FAILURE(SubmitREADV(file.get(), &iov, 1, &res));
+  file.reset();
+  server.Join();
+
+  ASSERT_TRUE(read_reply.has_value()) << "res=" << res;
+  if (read_reply->errno_value() == ENOENT) {
+    // The checkpoint abandoned the FUSE request before the server replied.
+    EXPECT_EQ(res, -EINTR);
+  } else {
+    EXPECT_NO_ERRNO(*read_reply);
+    ASSERT_EQ(res, kData.size());
+    EXPECT_EQ(absl::string_view(buf, res), kData);
+  }
 }
 
 }  // namespace

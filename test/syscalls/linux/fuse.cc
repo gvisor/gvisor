@@ -59,6 +59,7 @@
 #include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/fuse_util.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/mount_util.h"
@@ -84,62 +85,6 @@ namespace {
 
 int fallocate(int fd, int mode, off_t offset, off_t len) {
   return RetryEINTR(syscall)(__NR_fallocate, fd, mode, offset, len);
-}
-
-void FuseRespond(int fd, uint64_t unique, const void* payload = nullptr,
-                 size_t size = 0, int error = 0) {
-  fuse_out_header out_hdr = {
-      .len = static_cast<uint32_t>(sizeof(out_hdr) + size),
-      .error = error,
-      .unique = unique,
-  };
-  struct iovec iov[] = {
-      {.iov_base = &out_hdr, .iov_len = sizeof(out_hdr)},
-      {.iov_base = const_cast<void*>(payload), .iov_len = size},
-  };
-  ASSERT_THAT(writev(fd, iov, payload ? 2 : 1),
-              SyscallSucceedsWithValue(out_hdr.len));
-}
-
-void FuseInit(int fd) {
-  alignas(fuse_in_header) char req_buf[FUSE_MIN_READ_BUFFER];
-  ASSERT_THAT(read(fd, req_buf, sizeof(req_buf)),
-              SyscallSucceedsWithValue(Ge(sizeof(fuse_in_header))));
-
-  fuse_in_header* in_hdr = reinterpret_cast<fuse_in_header*>(req_buf);
-  ASSERT_EQ(in_hdr->opcode, FUSE_INIT);
-
-  fuse_init_out out_payload = {
-      .major = FUSE_KERNEL_VERSION,
-      .minor = FUSE_KERNEL_MINOR_VERSION,
-  };
-  FuseRespond(fd, in_hdr->unique, &out_payload, sizeof(out_payload));
-}
-
-// Takes ownership of an initialized device. The callback returns false to stop
-// serving requests; a fatal assertion also stops the loop. Closing the device
-// on exit aborts any client still waiting for a reply.
-void RunFuseServer(
-    int device_fd, int stop_fd,
-    const std::function<bool(int, const fuse_in_header&)>& respond) {
-  const FileDescriptor fd(device_fd);
-  ASSERT_THAT(fcntl(fd.get(), F_SETFL, O_NONBLOCK), SyscallSucceeds());
-  alignas(fuse_in_header) char req_buf[65536];
-  while (!::testing::Test::HasFatalFailure()) {
-    struct pollfd fds[] = {
-        {.fd = fd.get(), .events = POLLIN},
-        {.fd = stop_fd, .events = POLLIN},
-    };
-    ASSERT_THAT(RetryEINTR(poll)(fds, 2, -1), SyscallSucceeds());
-    if (fds[1].revents & POLLIN) break;
-    ssize_t res = RetryEINTR(read)(fd.get(), req_buf, sizeof(req_buf));
-    if (res < 0 && errno == EAGAIN) continue;
-    ASSERT_THAT(res, SyscallSucceedsWithValue(Ge(sizeof(fuse_in_header))));
-    const auto& in = *reinterpret_cast<fuse_in_header*>(req_buf);
-    if (in.opcode == FUSE_FORGET) continue;
-    SCOPED_TRACE(absl::StrFormat("FUSE opcode %u", in.opcode));
-    if (!respond(fd.get(), in)) break;
-  }
 }
 
 TEST(FuseTest, EpollAfterAbort) {
