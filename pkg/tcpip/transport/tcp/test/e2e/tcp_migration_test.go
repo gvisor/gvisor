@@ -518,6 +518,150 @@ func TestRestoreListenWithPreexistingConnection(t *testing.T) {
 	}
 }
 
+// TestRestoreConnectedGVisorGSOWrite tests that a connected endpoint migrated
+// onto a new NIC sends writes with the GSO options of the new NIC, split by the
+// restored MSS.
+func TestRestoreConnectedGVisorGSOWrite(t *testing.T) {
+	const mtu = 1500
+	testCases := []struct {
+		name       string
+		gsoAtSave  bool
+		gsoRestore bool
+	}{
+		{
+			name:       "GVisorGSOBeforeAndAfter",
+			gsoAtSave:  true,
+			gsoRestore: true,
+		},
+		{
+			name:       "GVisorGSOOnlyAfter",
+			gsoAtSave:  false,
+			gsoRestore: true,
+		},
+		{
+			name:       "GVisorGSOOnlyBefore",
+			gsoAtSave:  true,
+			gsoRestore: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testcontext.New(t, mtu)
+			defer c.Cleanup()
+
+			c.SetGVisorGSOEnabled(tc.gsoAtSave)
+			c.Stack().SetAllowLiveTCPMigration(true)
+			c.CreateConnected(testcontext.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+
+			var buf bytes.Buffer
+			if _, err := state.Save(context.Background(), &buf, c.Stack()); err != nil {
+				t.Fatalf("Save failed: %v", err)
+			}
+
+			restoredStack := stack.New(stack.Options{
+				TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+			})
+			restoredStack.SetAllowLiveTCPMigration(true)
+			defer restoredStack.Destroy()
+
+			if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), restoredStack); err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+
+			ep := channel.New(1000, mtu, "")
+			wantGSO := stack.GSONone
+			if tc.gsoRestore {
+				wantGSO = stack.GSOGvisor
+				ep.SupportedGSOKind = stack.GVisorGSOSupported
+			}
+			if err := restoredStack.CreateNIC(1, ep); err != nil {
+				t.Fatalf("CreateNIC failed: %v", err)
+			}
+			if err := restoredStack.AddProtocolAddress(1, tcpip.ProtocolAddress{
+				Protocol:          header.IPv4ProtocolNumber,
+				AddressWithPrefix: testcontext.StackAddrWithPrefix,
+			}, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress failed: %v", err)
+			}
+			restoredStack.SetRouteTable([]tcpip.Route{
+				{
+					Destination: header.IPv4EmptySubnet,
+					NIC:         1,
+				},
+			})
+
+			stackType := reflect.TypeOf(restoredStack).Elem()
+			sf, ok := stackType.FieldByName("restoredEndpoints")
+			if !ok {
+				t.Fatalf("Field restoredEndpoints not found")
+			}
+			ptr := unsafe.Pointer(uintptr(unsafe.Pointer(restoredStack)) + sf.Offset)
+			restoredEndpoints := *(*[]stack.RestoredEndpoint)(ptr)
+			if len(restoredEndpoints) != 1 {
+				t.Fatalf("Expected 1 restored endpoint, got %d", len(restoredEndpoints))
+			}
+			restoredEP, ok := restoredEndpoints[0].(tcpip.Endpoint)
+			if !ok {
+				t.Fatalf("Restored endpoint does not implement tcpip.Endpoint")
+			}
+
+			restoredStack.Restore()
+
+			if got, want := tcp.EndpointState(restoredEP.State()), tcp.StateEstablished; got != want {
+				t.Fatalf("Unexpected restored endpoint state: want %v, got %v", want, got)
+			}
+
+			// Write more than one MSS so the segment is split by GSO.
+			mss := int(c.MSSWithoutOptions())
+			data := make([]byte, 3*mss+100)
+			for i := range data {
+				data[i] = byte(i)
+			}
+			var r bytes.Reader
+			r.Reset(data)
+			if _, err := restoredEP.Write(&r, tcpip.WriteOptions{}); err != nil {
+				t.Fatalf("Write failed: %v", err)
+			}
+
+			localAddr, tcpErr := restoredEP.GetLocalAddress()
+			if tcpErr != nil {
+				t.Fatalf("GetLocalAddress failed: %v", tcpErr)
+			}
+			readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var got []byte
+			for len(got) < len(data) {
+				pkt := ep.ReadContext(readCtx)
+				if pkt == nil {
+					t.Fatalf("Timed out after receiving %d of %d bytes", len(got), len(data))
+				}
+				gso := pkt.GSOOptions.Type
+				v := pkt.ToView()
+				pkt.DecRef()
+				defer v.Release()
+				if gso != wantGSO {
+					t.Fatalf("Got GSO type %v, want %v", gso, wantGSO)
+				}
+				checker.IPv4(t, v, checker.TCP(
+					checker.SrcPort(localAddr.Port),
+					checker.DstPort(testcontext.TestPort),
+					checker.TCPSeqNum(uint32(c.IRS)+1+uint32(len(got))),
+				))
+				payload := header.TCP(header.IPv4(v.AsSlice()).Payload()).Payload()
+				if len(payload) == 0 || len(payload) > mss {
+					t.Fatalf("Got segment with %d payload bytes, want 1 to %d", len(payload), mss)
+				}
+				got = append(got, payload...)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("Restored endpoint sent wrong data")
+			}
+		})
+	}
+}
+
 type unregisteredClock struct {
 	tcpip.Clock
 }

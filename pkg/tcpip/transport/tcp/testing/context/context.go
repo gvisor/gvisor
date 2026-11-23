@@ -445,7 +445,8 @@ func (c *Context) packetView(pkt *stack.PacketBuffer) *buffer.View {
 	cu := cleanup.Make(view.Release)
 	defer cu.Clean()
 
-	if pkt.GSOOptions.Type != stack.GSONone && pkt.GSOOptions.L3HdrLen != header.IPv4MinimumSize {
+	// gVisor GSO segments in software and does not set L3HdrLen.
+	if pkt.GSOOptions.Type != stack.GSONone && pkt.GSOOptions.Type != stack.GSOGvisor && pkt.GSOOptions.L3HdrLen != header.IPv4MinimumSize {
 		c.t.Errorf("got L3HdrLen = %d, want = %d", pkt.GSOOptions.L3HdrLen, header.IPv4MinimumSize)
 	}
 
@@ -1364,6 +1365,16 @@ func (c *Context) SACKEnabled() bool {
 func (c *Context) SetGSOEnabled(enable bool) {
 	if enable {
 		c.linkEP.SupportedGSOKind = stack.HostGSOSupported
+	} else {
+		c.linkEP.SupportedGSOKind = stack.GSONotSupported
+	}
+}
+
+// SetGVisorGSOEnabled enables or disables gVisor software segmentation
+// offload.
+func (c *Context) SetGVisorGSOEnabled(enable bool) {
+	if enable {
+		c.linkEP.SupportedGSOKind = stack.GVisorGSOSupported
 	} else {
 		c.linkEP.SupportedGSOKind = stack.GSONotSupported
 	}
