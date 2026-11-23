@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -79,6 +80,7 @@ func newTestWatcherV2(pub *mockPublisher) *watcherV2 {
 		publisher: pub,
 		cgroups:   make(map[string]*cgroupV2Entry),
 		lastOOM:   make(map[string]uint64),
+		watched:   make(map[string]struct{}),
 		statPath: func(string) (uint64, error) {
 			return 0, fmt.Errorf("statPath not configured in test")
 		},
@@ -164,37 +166,6 @@ func TestWatcherV2AsyncPublishesIncrementedOOMCount(t *testing.T) {
 
 	if got := pub.eventCount(); got != 2 {
 		t.Errorf("expected 2 events, got %d", got)
-	}
-}
-
-// TestWatcherV2ErrorRetainsStateForExitCheck verifies that an error from
-// EventChan (which fires when the cgroup is deleted — under the systemd
-// cgroup driver, the moment the container's process dies) keeps both the
-// cgroups entry and the ledger. isOOM needs the entry to find the pod cgroup,
-// and dropping the ledger would make a kill the async path already announced
-// look unannounced, producing a second TaskOOM.
-func TestWatcherV2ErrorRetainsStateForExitCheck(t *testing.T) {
-	pub := &mockPublisher{}
-	w := newTestWatcherV2(pub)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go w.run(ctx)
-
-	w.mu.Lock()
-	w.lastOOM["c1"] = 1
-	w.cgroups["c1"] = &cgroupV2Entry{parentPath: "/parent", parentBase: 0}
-	w.mu.Unlock()
-
-	w.itemCh <- itemV2{id: "c1", err: fmt.Errorf("cgroup deleted")}
-	waitForProcessing(t, w)
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if _, ok := w.cgroups["c1"]; !ok {
-		t.Error("expected cgroups entry to survive EventChan error")
-	}
-	if got, ok := w.lastOOM["c1"]; !ok || got != 1 {
-		t.Errorf("lastOOM = %d (present %v), want 1: dropping it causes a duplicate TaskOOM", got, ok)
 	}
 }
 
@@ -474,9 +445,9 @@ func TestWatcherV2IsOOMUntracks(t *testing.T) {
 }
 
 // TestWatcherV2NoPublishAfterExit covers a container that has already exited.
-// Its EventChan goroutine watches the shared sandbox cgroup, so it outlives
-// the container and cannot be stopped; events it relays afterwards must not
-// become a TaskOOM for a container that is gone.
+// The watch on the shared sandbox cgroup outlives the container. An event
+// that reaches run afterwards must not become a TaskOOM for a container that
+// is gone.
 func TestWatcherV2NoPublishAfterExit(t *testing.T) {
 	pub := &mockPublisher{}
 	w := newTestWatcherV2(pub)
@@ -507,5 +478,174 @@ func TestWatcherV2NoPublishAfterExit(t *testing.T) {
 
 	if got := pub.eventCount(); got != 1 {
 		t.Errorf("published %d events, want 1: TaskOOM republished for an exited container", got)
+	}
+}
+
+// fakeWatch is a test replacement for the EventChan watch on one cgroup.
+type fakeWatch struct {
+	events chan cgroupsv2.Event
+	errs   chan error
+	ended  bool
+}
+
+// end ends the watch as the EventChan watch does: it sends its error, if it
+// has one, and closes errs.
+func (fw *fakeWatch) end(err error) {
+	if err != nil {
+		fw.errs <- err
+	}
+	close(fw.errs)
+	fw.ended = true
+}
+
+// watchTest is a running watcherV2 that starts fake watches.
+type watchTest struct {
+	w       *watcherV2
+	pub     *mockPublisher
+	watches []*fakeWatch
+}
+
+func newWatchTest(t *testing.T) *watchTest {
+	wt := &watchTest{pub: &mockPublisher{}}
+	wt.w = newTestWatcherV2(wt.pub)
+	wt.w.statPath = func(string) (uint64, error) { return 0, nil }
+	// add calls eventChan on the goroutine of the test.
+	wt.w.eventChan = func(*cgroupsv2.Manager) (<-chan cgroupsv2.Event, <-chan error) {
+		fw := &fakeWatch{events: make(chan cgroupsv2.Event), errs: make(chan error, 1)}
+		wt.watches = append(wt.watches, fw)
+		return fw.events, fw.errs
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go wt.w.run(ctx)
+	// End the watches while run still receives what their goroutines forward,
+	// and stop run after those goroutines have returned.
+	t.Cleanup(func() {
+		for _, fw := range wt.watches {
+			if !fw.ended {
+				fw.end(nil)
+			}
+		}
+		wt.waitUnwatched(t)
+		cancel()
+	})
+	return wt
+}
+
+// waitUnwatched waits until the goroutine of every watch that has ended has
+// dropped its cgroup. The goroutine forwards nothing after that.
+func (wt *watchTest) waitUnwatched(t *testing.T) {
+	t.Helper()
+	live := 0
+	for _, fw := range wt.watches {
+		if !fw.ended {
+			live++
+		}
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		wt.w.mu.Lock()
+		watched := len(wt.w.watched)
+		wt.w.mu.Unlock()
+		if watched == live {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for ended watches to be dropped: %d cgroups watched, want %d", watched, live)
+		}
+	}
+}
+
+// add adds containers on the cgroup at path and checks the number of watches
+// that have started.
+func (wt *watchTest) add(t *testing.T, path string, wantWatches int, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if err := wt.w.add(id, &cgroupV2{path: path}); err != nil {
+			t.Fatalf("add(%q) failed: %v", id, err)
+		}
+	}
+	if got := len(wt.watches); got != wantWatches {
+		t.Fatalf("started %d watches after add of %q on %q, want %d", got, ids, path, wantWatches)
+	}
+}
+
+// send sends an event with the given OOM kill count on watch number i. It
+// fails the test unless a TaskOOM is then published for exactly the given
+// containers.
+func (wt *watchTest) send(t *testing.T, i int, oomKill uint64, want ...string) {
+	t.Helper()
+	// The watch goroutine takes the second event only after it has forwarded
+	// the first one. An empty event never causes a publish.
+	for _, ev := range []cgroupsv2.Event{{OOMKill: oomKill}, {}} {
+		select {
+		case wt.watches[i].events <- ev:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for the watch goroutine to take an event")
+		}
+	}
+	waitForProcessing(t, wt.w)
+
+	wt.pub.mu.Lock()
+	var got []string
+	for _, e := range wt.pub.events {
+		got = append(got, e.event.(*TaskOOM).ContainerID)
+	}
+	wt.pub.events = nil
+	wt.pub.mu.Unlock()
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("published TaskOOM for %q, want %q", got, want)
+	}
+}
+
+// TestWatcherV2SharesWatchPerCgroup verifies that the containers of a pod,
+// which share the sandbox cgroup, share one watch, and that the events of a
+// watch reach the containers on its cgroup that have not exited.
+func TestWatcherV2SharesWatchPerCgroup(t *testing.T) {
+	wt := newWatchTest(t)
+	wt.add(t, testCgroupPath, 1, "c1", "c2")
+	wt.add(t, "/pod2/c1", 2, "other")
+
+	wt.send(t, 0, 1, "c1", "c2")
+	wt.send(t, 1, 1, "other")
+
+	wt.w.isOOM("c1")
+	wt.send(t, 0, 2, "c2")
+
+	// A container that is added after a kill does not get a TaskOOM for it.
+	wt.w.statPath = func(string) (uint64, error) { return 2, nil }
+	wt.add(t, testCgroupPath, 2, "c3")
+	wt.send(t, 0, 2)
+	wt.send(t, 0, 3, "c2", "c3")
+}
+
+// TestWatcherV2ReplacesEndedWatch verifies that the next container on a
+// cgroup starts a new watch after the watch on that cgroup has ended, with an
+// error or, as when the cgroup is removed, without one. The new watch serves
+// all containers on the cgroup, and the end of the watch does not drop what
+// was published for them.
+func TestWatcherV2ReplacesEndedWatch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "error", err: fmt.Errorf("read failed")},
+		{name: "no error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wt := newWatchTest(t)
+			wt.add(t, testCgroupPath, 1, "c1", "c2")
+			wt.send(t, 0, 1, "c1", "c2")
+
+			wt.watches[0].end(tc.err)
+			wt.waitUnwatched(t)
+
+			// c3 starts after the kill, so the kill is not a kill of c3. It
+			// was published for c1 and c2, and is not published again.
+			wt.w.statPath = func(string) (uint64, error) { return 1, nil }
+			wt.add(t, testCgroupPath, 2, "c3")
+			wt.send(t, 1, 1)
+			wt.send(t, 1, 2, "c1", "c2", "c3")
+		})
 	}
 }

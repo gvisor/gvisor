@@ -51,7 +51,9 @@ func newOOMv2Poller(publisher shim.Publisher) (oomPoller, error) {
 		publisher: publisher,
 		cgroups:   make(map[string]*cgroupV2Entry),
 		lastOOM:   make(map[string]uint64),
+		watched:   make(map[string]struct{}),
 		statPath:  readOOMKill,
+		eventChan: (*cgroupsv2.Manager).EventChan,
 	}, nil
 }
 
@@ -96,6 +98,9 @@ type watcherV2 struct {
 	// path. It is a field so tests can substitute counts and failures.
 	statPath func(string) (uint64, error)
 
+	// eventChan starts a watch for memory events on a cgroup.
+	eventChan func(*cgroupsv2.Manager) (<-chan cgroupsv2.Event, <-chan error)
+
 	mu sync.Mutex
 
 	// +checklocks:mu
@@ -112,6 +117,13 @@ type watcherV2 struct {
 	//
 	// +checklocks:mu
 	lastOOM map[string]uint64
+
+	// watched holds the unified group paths that have a watch, from when add
+	// starts the watch until the watch ends. The containers of a pod share
+	// the sandbox cgroup, so they share one watch.
+	//
+	// +checklocks:mu
+	watched map[string]struct{}
 }
 
 // readOOMKill returns the oom_kill count from memory.events for the cgroup at
@@ -160,9 +172,8 @@ func cgroupGone(err error) bool {
 }
 
 type itemV2 struct {
-	id  string
-	ev  cgroupsv2.Event
-	err error
+	id string
+	ev cgroupsv2.Event
 }
 
 // Close closes the watcher
@@ -178,10 +189,6 @@ func (w *watcherV2) run(ctx context.Context) {
 			w.Close()
 			return
 		case i := <-w.itemCh:
-			if i.err != nil {
-				logrus.WithError(i.err).Debugf("Error listening for OOM, id: %q", i.id)
-				continue
-			}
 			logrus.Debugf("Received OOM event, id: %q, event: %+v", i.id, i.ev)
 			w.mu.Lock()
 			lastOOM, tracked := w.lastOOM[i.id]
@@ -212,9 +219,9 @@ func (w *watcherV2) isOOM(id string) oomStatus {
 	entry, ok := w.cgroups[id]
 	delete(w.cgroups, id)
 	// What the async path has already announced. Dropping it also untracks
-	// the container: its EventChan goroutine watches the shared sandbox
-	// cgroup, so it outlives the container and keeps relaying events that
-	// must not be published for it.
+	// the container: the watch on the shared sandbox cgroup outlives the
+	// container, and an event that is already on its way to run must not be
+	// published for it.
 	lastOOM := w.lastOOM[id]
 	delete(w.lastOOM, id)
 	w.mu.Unlock()
@@ -297,26 +304,52 @@ func (w *watcherV2) add(id string, cgx any) error {
 	// is compared against already stands at base. Membership marks it
 	// tracked.
 	w.lastOOM[id] = entry.base
+	_, watched := w.watched[cg.path]
+	w.watched[cg.path] = struct{}{}
 	w.mu.Unlock()
+	if watched {
+		return nil
+	}
 	// NOTE: containerd/cgroups/v2 does not support closing eventCh routine
 	// currently. The routine shuts down when an error happens, mostly when the
 	// cgroup is deleted.
-	eventCh, errCh := cg.mgr.EventChan()
+	eventCh, errCh := w.eventChan(cg.mgr)
 	go func() {
 		for {
-			i := itemV2{id: id}
 			select {
 			case ev := <-eventCh:
-				i.ev = ev
-				w.itemCh <- i
+				for _, id := range w.containersOn(cg.path) {
+					w.itemCh <- itemV2{id: id, ev: ev}
+				}
 			case err := <-errCh:
-				i.err = err
-				w.itemCh <- i
-				// we no longer get any event/err when we got an err
-				logrus.WithError(err).Warn("error from eventChan")
+				// we no longer get any event/err when we got an err. The next
+				// add for this cgroup starts a new watch. Until then isOOM
+				// reports the kills on this cgroup when a container exits.
+				w.mu.Lock()
+				delete(w.watched, cg.path)
+				w.mu.Unlock()
+				if err == nil {
+					logrus.Debugf("OOM watch on cgroup %q ended", cg.path)
+				} else {
+					logrus.WithError(err).Warnf("OOM watch on cgroup %q ended", cg.path)
+				}
 				return
 			}
 		}
 	}()
 	return nil
+}
+
+// containersOn returns the IDs of the containers in w.cgroups whose sandbox
+// cgroup is at path.
+func (w *watcherV2) containersOn(path string) []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var ids []string
+	for id, entry := range w.cgroups {
+		if entry.path == path {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
