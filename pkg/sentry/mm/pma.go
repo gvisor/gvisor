@@ -149,6 +149,23 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 	return pstart, pend, alignerr
 }
 
+// waitForTranslation waits for fault, which getPMAsLocked or getVecPMAsLocked
+// returned, and returns the context with which the caller must retry. The
+// caller must hold no MM locks.
+//
+// Each operation waits at most once: the retry translates with
+// memmap.WithoutTranslationFaults, so an operation terminates even if the
+// backing filled by Wait is gone again by the time it retries.
+func waitForTranslation(ctx context.Context, fault memmap.TranslationFault, interruptible bool) (context.Context, error) {
+	if checkInvariants && !memmap.TranslationFaultsAllowed(ctx) {
+		panic(fmt.Sprintf("Translate returned %v after WithoutTranslationFaults", fault))
+	}
+	if err := fault.Wait(ctx, interruptible); err != nil {
+		return ctx, err
+	}
+	return memmap.WithoutTranslationFaults(ctx), nil
+}
+
 // getVecPMAsLocked ensures that pmas exist for all addresses in ars, and
 // support access of type at. It returns the subset of ars for which pmas
 // exist. If this is not equal to ars, it returns a non-nil error explaining
@@ -763,6 +780,9 @@ func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at host
 		}
 	}
 
+	originalAR := ar
+retry:
+	ar = originalAR
 	// Ensure that we have usable vmas.
 	mm.mappingMu.RLock()
 	vseg, vend, verr := mm.getVMAsLocked(ctx, ar, at, ignorePermissions)
@@ -779,6 +799,14 @@ func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at host
 	mm.hasPinned = true
 	pseg, pend, perr := mm.getPMAsLocked(ctx, vseg, ar, at, false /* callerIndirectCommit */, true /* forPin */)
 	mm.mappingMu.RUnlock()
+	if fault, ok := perr.(memmap.TranslationFault); ok {
+		mm.activeMu.Unlock()
+		var err error
+		if ctx, err = waitForTranslation(ctx, fault, false /* interruptible */); err != nil {
+			return nil, err
+		}
+		goto retry
+	}
 	if pendaddr := pend.Start(); pendaddr < ar.End {
 		if pendaddr <= ar.Start {
 			mm.activeMu.Unlock()

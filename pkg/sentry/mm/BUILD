@@ -182,7 +182,10 @@ go_library(
 go_test(
     name = "mm_test",
     size = "small",
-    srcs = ["mm_test.go"],
+    srcs = [
+        "mm_test.go",
+        "translation_fault_test.go",
+    ],
     embed = [":mm"],
     deps = [
         "//pkg/context",

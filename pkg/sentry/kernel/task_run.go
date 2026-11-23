@@ -310,9 +310,10 @@ func (app *runApp) execute(t *Task) taskRunState {
 			addr := hostarch.Addr(info.Addr())
 			err := t.MemoryManager().HandleUserFault(t, addr, at, hostarch.Addr(t.Arch().Stack()))
 			region.End()
-			if err == nil {
+			if err == nil || err == linuxerr.ErrInterrupted {
 				// The fault was handled appropriately.
-				// We can resume running the application.
+				// Re-enter the run loop to resume or handle an interruption
+				// received while waiting for backing memory.
 				return (*runApp)(nil)
 			}
 
