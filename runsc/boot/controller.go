@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/server"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
@@ -366,13 +367,24 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
 
+	cm.l.saveMu.Lock()
 	cm.l.mu.Lock()
 	cu := cleanup.Make(cm.l.mu.Unlock)
 	defer cu.Clean()
 
-	if cm.l.state != created {
-		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
+	if cm.l.restoring.Load() || cm.l.state != created {
+		cm.l.saveMu.Unlock()
+		return fmt.Errorf("cannot start restore in state=%s: %w", cm.l.state, linuxerr.EBUSY)
 	}
+	cm.l.pauseMu.Lock()
+	if cm.l.ociPauseCount != 0 {
+		cm.l.pauseMu.Unlock()
+		cm.l.saveMu.Unlock()
+		return errors.New("cannot restore a paused sandbox")
+	}
+	cm.l.restoring.Store(true)
+	cm.l.pauseMu.Unlock()
+	cm.l.saveMu.Unlock()
 	defer func() {
 		if retErr != nil {
 			cu.Clean() // Release `cm.l.mu` as onRestoreFailed will acquire it.
@@ -599,6 +611,7 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 
 func (cm *containerManager) onRestoreFailed(err error) {
 	cm.l.lifecycleCPUs.releaseForRestore()
+	cm.l.restoring.Store(true)
 	cm.l.mu.Lock()
 	cm.l.state = restoreFailed
 	cm.l.restoreErr = err
@@ -708,14 +721,37 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply
 
 // Pause pauses all tasks, blocking until they are stopped.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
+	cm.l.pauseMu.Lock()
+	defer cm.l.pauseMu.Unlock()
+	if cm.l.restoring.Load() {
+		return fmt.Errorf("cannot pause a sandbox during restore: %w", linuxerr.EBUSY)
+	}
+	if cm.l.k.TaskSet().IsExiting() {
+		return fmt.Errorf("cannot pause an exiting sandbox: %w", linuxerr.ESRCH)
+	}
 	cm.l.k.Pause()
+	cm.l.ociPauseCount++
 	return nil
 }
 
 // Resume resumes all tasks.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
+	cm.l.pauseMu.Lock()
+	if cm.l.ociPauseCount == 0 {
+		cm.l.pauseMu.Unlock()
+		return errors.New("container is not paused")
+	}
 	cm.l.k.Unpause()
-	return control.PostResume(cm.l.k, nil)
+	cm.l.ociPauseCount--
+	cleanupPending := cm.l.ociPauseCount == 0 && cm.l.checkpointResumePending.Load()
+	cm.l.pauseMu.Unlock()
+	if !cleanupPending {
+		return nil
+	}
+	cm.l.saveMu.Lock()
+	defer cm.l.saveMu.Unlock()
+	defer cm.l.stopIfKilled()
+	return cm.l.runPostResume(false /* prepared */)
 }
 
 // Wait waits for the init process in the given container.
@@ -951,6 +987,11 @@ func (cm *containerManager) ContainerRuntimeState(cid *string, state *sentryapi.
 //
 // +checklocksexclude:cm.l.k.fsSaveMu
 func (cm *containerManager) FSSave(args *sentryapi.FSSaveArgs, _ *struct{}) error {
+	cm.l.saveMu.Lock()
+	defer cm.l.saveMu.Unlock()
+	if cm.l.restoreBlocksCheckpoint() {
+		return fmt.Errorf("sandbox restore is in progress: %w", linuxerr.EBUSY)
+	}
 	log.Debugf("containerManager.FSSave")
 	kopts, err := convertToKernelFSSaveOpts(args)
 	if err != nil {

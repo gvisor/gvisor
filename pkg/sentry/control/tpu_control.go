@@ -48,53 +48,61 @@ type tpuTaskInfo struct {
 	rspReadFd  int32
 }
 
-func preSaveTPU(k *kernel.Kernel) error {
+func preSaveTPU(k *kernel.Kernel) (bool, error) {
 	tpuTasks := findTPUTasks(k)
 	if len(tpuTasks) == 0 {
-		return nil
+		return false, nil
+	}
+	if err := controlTPUTasks(k, tpu_pb.ControlAction_ACTION_CHECKPOINT, tpuTasks); err != nil {
+		// TODO(gvisor.dev/issue/17889): Resume tasks that acknowledged
+		// checkpoint preparation before another task failed.
+		return false, fmt.Errorf("TPU checkpoint failed: %w", err)
 	}
 
-	var tasks []*kernel.Task
+	tasks := make([]*kernel.Task, 0, len(tpuTasks))
 	for _, info := range tpuTasks {
 		tasks = append(tasks, info.task)
 	}
 	k.AddStateToCheckpoint(tpuTasksStateKey, tasks)
-
-	if err := controlTPUTasks(k, tpu_pb.ControlAction_ACTION_CHECKPOINT, tpuTasks); err != nil {
-		return fmt.Errorf("TPU checkpoint failed: %w", err)
-	}
-	return nil
+	return true, nil
 }
 
 func postRestoreTPU(k *kernel.Kernel) error {
-	return postResumeTPU(k)
+	return restoreTPUTasks(k, true /* discover */)
 }
 
 func postResumeTPU(k *kernel.Kernel) error {
+	return restoreTPUTasks(k, false /* discover */)
+}
+
+func restoreTPUTasks(k *kernel.Kernel, discover bool) error {
 	tpuTasksVal := k.PopCheckpointState(tpuTasksStateKey)
 	var tpuTasks []*tpuTaskInfo
+	var decodeErr error
 	if tpuTasksVal != nil {
 		tasks := tpuTasksVal.([]*kernel.Task)
 		for _, t := range tasks {
 			info, err := extractTPUTaskInfo(t)
 			if err != nil {
-				log.Warningf("Failed to extract TPU task info for task %d: %v", t.ThreadID(), err)
+				err = fmt.Errorf("failed to read TPU control state for task %d: %w", t.ThreadID(), err)
+				if discover {
+					log.Warningf("%v", err)
+				} else {
+					decodeErr = errors.Join(decodeErr, err)
+				}
 				continue
 			}
 			tpuTasks = append(tpuTasks, info)
 		}
-	} else {
+	} else if discover {
+		// An older image may lack a saved task list.
 		tpuTasks = findTPUTasks(k)
 	}
 
-	if len(tpuTasks) == 0 {
-		return nil
-	}
-
 	if err := controlTPUTasks(k, tpu_pb.ControlAction_ACTION_RESTORE, tpuTasks); err != nil {
-		return fmt.Errorf("TPU restore failed: %w", err)
+		return errors.Join(decodeErr, fmt.Errorf("TPU restore failed: %w", err))
 	}
-	return nil
+	return decodeErr
 }
 
 // Callers must not hold any thread-group leader's Task.mu in k.

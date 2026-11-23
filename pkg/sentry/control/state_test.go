@@ -85,11 +85,8 @@ func TestSaveGraphEngineOverride(t *testing.T) {
 				t.Fatalf("ConvertToStateSaveOpts() failed: %v", err)
 			}
 			defer saveOpts.Close()
-			if err := Save(k, w, saveOpts, &opts.ExecOpts); err != nil {
+			if _, err := Save(k, w, saveOpts, &opts.ExecOpts); err != nil {
 				t.Fatalf("Save() failed: %v", err)
-			}
-			if err := PostResume(k, nil /* timeline */); err != nil {
-				t.Fatalf("PostResume() failed: %v", err)
 			}
 
 			if got := pkgstate.GraphEngineEnabled(); got != tc.processDefault {

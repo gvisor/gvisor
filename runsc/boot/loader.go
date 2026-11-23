@@ -203,6 +203,23 @@ func (s loaderState) String() string {
 	}
 }
 
+func (s loaderState) blocksCheckpoint() bool {
+	return s == restoringUnstarted || s == restoreFailed
+}
+
+// restoreBlocksCheckpoint reports whether restore hooks or notification are
+// pending, or the restore failed. Page loads can finish during checkpointing.
+//
+// +checklocksexclude:l.mu
+func (l *Loader) restoreBlocksCheckpoint() bool {
+	if l.restoring.Load() {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.restoring.Load() || l.state.blocksCheckpoint()
+}
+
 // Loader keeps state needed to start the kernel and run the container.
 type Loader struct {
 	// k is the kernel.
@@ -279,15 +296,34 @@ type Loader struct {
 	// freeOSMemory is runtimedebug.FreeOSMemory, replaced in tests.
 	freeOSMemory func()
 
-	// saveMu serializes save operations. Saves can be requested concurrently:
+	// saveMu serializes save operations and their post-resume cleanup. Saves
+	// can be requested concurrently:
 	// autosave in save-resume mode is triggered by any task executing the
 	// trigger syscall, and checkpoints may be requested concurrently via the
 	// control API. Overlapping saves race: post-save cleanup
 	// (Kernel.BeforeResume) runs outside Kernel.extMu, so save N's cleanup can
 	// clear state that save N+1's in-progress Kernel.SaveTo has just set up.
 	//
-	// Lock order: saveMu is taken before mu.
-	saveMu sync.Mutex
+	// Lock order: saveMu is taken before mu and pauseMu.
+	saveMu sync.CrossGoroutineMutex
+
+	// restoring blocks OCI pause during restore setup and hooks. Checkpoint
+	// admission also waits for the restore notification under mu. A failed
+	// restore leaves the sandbox unavailable.
+	restoring atomicbitops.Bool
+
+	// pauseMu serializes user-requested pause transitions with the decision to
+	// start post-resume cleanup.
+	pauseMu sync.Mutex
+
+	// ociPauseCount is the number of outstanding OCI pauses.
+	//
+	// +checklocks:pauseMu
+	ociPauseCount int
+
+	// checkpointResumePending records cleanup deferred until the last OCI
+	// pause is released.
+	checkpointResumePending atomicbitops.Bool
 
 	// mu guards the fields below.
 	mu sync.Mutex

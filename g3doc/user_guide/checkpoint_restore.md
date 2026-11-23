@@ -332,8 +332,9 @@ following protocol:
 2.  **Write** `1` (or `1\n`, so `echo 1` works) to trigger a checkpoint. Writing
     requires `dev.gvisor.internal.checkpoint.enable=true`. Writing is optional —
     a process can simply read the file to passively wait for a checkpoint
-    triggered by some other process. Triggering a second save by writing to the
-    same file will fail with `ENXIO`.
+    triggered by some other process. After the first save completes, triggering
+    a second save by writing to the same file will fail with `ENXIO`. A write
+    during an active checkpoint can fail with `EBUSY` instead.
 3.  **Read** the file. The read blocks until the checkpoint completes and then
     returns one of the following lines:
     -   `resume` — the checkpoint completed and the original workload has

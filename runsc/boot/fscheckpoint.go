@@ -61,6 +61,15 @@ const (
 // +checklocksexclude:l.mu
 // +checklocksexclude:l.k.fsSaveMu
 func (l *Loader) FSSave() error {
+	// A save or resume hook can request a filesystem checkpoint. Do not wait
+	// for the full checkpoint that is waiting for this hook to finish.
+	if !l.saveMu.TryLock() {
+		return linuxerr.EBUSY
+	}
+	defer l.saveMu.Unlock()
+	if l.restoreBlocksCheckpoint() {
+		return linuxerr.EBUSY
+	}
 	l.mu.Lock()
 	fsSaveFDs := l.fsSaveFDs
 	l.fsSaveFDs = nil
