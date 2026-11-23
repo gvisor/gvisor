@@ -149,6 +149,71 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 	return pstart, pend, alignerr
 }
 
+// translationFault is a memmap.TranslationFault returned by the Mappable of
+// a vma.
+type translationFault struct {
+	memmap.TranslationFault
+
+	// id is the vma's MappingIdentity, which may be nil. The fault holds a
+	// reference on it from holdTranslationFault until waitForTranslation.
+	id memmap.MappingIdentity
+}
+
+// vmaTranslationFault returns err, wrapped in a translationFault if it is a
+// memmap.TranslationFault returned by vma.mappable.
+func vmaTranslationFault(err error, vma *vma) error {
+	if fault, ok := err.(memmap.TranslationFault); ok {
+		return &translationFault{fault, vma.id}
+	}
+	return err
+}
+
+// holdTranslationFault returns err as a translationFault, or nil if it is not
+// one. If it is, holdTranslationFault takes a reference on the faulting vma's
+// MappingIdentity, which keeps its Mappable valid after mm.mappingMu is
+// released and the vma is removed; waitForTranslation drops it. This is
+// Linux's mm/internal.h:maybe_unlock_mmap_for_io() taking get_file() on
+// vmf->vma->vm_file before releasing mmap_lock.
+//
+// +checklocksread:mm.mappingMu
+func (mm *MemoryManager) holdTranslationFault(err error) *translationFault {
+	fault, ok := err.(*translationFault)
+	if !ok {
+		return nil
+	}
+	if fault.id != nil {
+		fault.id.IncRef()
+	}
+	return fault
+}
+
+// waitForTranslation waits for fault, which holdTranslationFault returned,
+// and returns the context with which the caller must retry. The caller must
+// hold no MM locks.
+//
+// Each operation waits at most once: the retry translates with
+// memmap.WithoutTranslationFaults, so an operation terminates even if the
+// backing filled by Wait is gone again by the time it retries. The caller
+// retries even if Wait fails, so that translating the current vmas
+// synchronously determines how much of the operation succeeds and with what
+// error; Linux's mm/filemap.c:filemap_fault() likewise returns VM_FAULT_RETRY
+// after a read that failed without mmap_lock. The returned error is non-nil
+// only if interruptible is true and Wait was interrupted, in which case the
+// caller must not retry.
+func waitForTranslation(ctx context.Context, fault *translationFault, interruptible bool) (context.Context, error) {
+	if checkInvariants && !memmap.TranslationFaultsAllowed(ctx) {
+		panic(fmt.Sprintf("Translate returned %v after WithoutTranslationFaults", fault.TranslationFault))
+	}
+	err := fault.Wait(ctx, interruptible)
+	if fault.id != nil {
+		fault.id.DecRef(ctx)
+	}
+	if interruptible && err == linuxerr.ErrInterrupted {
+		return ctx, err
+	}
+	return memmap.WithoutTranslationFaults(ctx), nil
+}
+
 // getVecPMAsLocked ensures that pmas exist for all addresses in ars, and
 // support access of type at. It returns the subset of ars for which pmas
 // exist. If this is not equal to ars, it returns a non-nil error explaining
@@ -381,6 +446,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							panic(fmt.Sprintf("Mappable(%T).Translate(%v, %v, %v): %v", vma.mappable, reqMR, optMR, perms, err))
 						}
 					}
+					err = vmaTranslationFault(err, vma)
 					// Install a pma for each translation.
 					if len(ts) == 0 {
 						return pstart, pgap, err
@@ -550,6 +616,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							panic(fmt.Sprintf("Mappable(%T).Translate(%v, %v, %v): %v", vma.mappable, reqMR, optMR, perms, err))
 						}
 					}
+					err = vmaTranslationFault(err, vma)
 					// Remove the part of the existing pma covered by new
 					// Translations, then insert new pmas. This doesn't change
 					// RSS.
@@ -763,6 +830,9 @@ func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at host
 		}
 	}
 
+	originalAR := ar
+retry:
+	ar = originalAR
 	// Ensure that we have usable vmas.
 	mm.mappingMu.RLock()
 	vseg, vend, verr := mm.getVMAsLocked(ctx, ar, at, ignorePermissions)
@@ -778,7 +848,13 @@ func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at host
 	mm.activeMu.Lock()
 	mm.hasPinned = true
 	pseg, pend, perr := mm.getPMAsLocked(ctx, vseg, ar, at, false /* callerIndirectCommit */, true /* forPin */)
+	fault := mm.holdTranslationFault(perr)
 	mm.mappingMu.RUnlock()
+	if fault != nil {
+		mm.activeMu.Unlock()
+		ctx, _ = waitForTranslation(ctx, fault, false /* interruptible */)
+		goto retry
+	}
 	if pendaddr := pend.Start(); pendaddr < ar.End {
 		if pendaddr <= ar.Start {
 			mm.activeMu.Unlock()

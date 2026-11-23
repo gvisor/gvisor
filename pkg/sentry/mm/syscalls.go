@@ -45,9 +45,10 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	// Don't bother trying existingPMAsLocked; in most cases, if we did have
 	// existing pmas, we wouldn't have faulted.
 
+retry:
 	// Ensure that we have a usable vma. Here and below, since we are only
-	// asking for a single page, there is no possibility of partial success,
-	// and any error is immediately fatal.
+	// asking for a single page, there is no possibility of partial success.
+	// A TranslationFault is retried after waiting; any other error is fatal.
 	mm.mappingMu.RLock()
 	vseg, _, err := mm.getVMAsLocked(ctx, ar, at, false)
 	if err != nil {
@@ -58,9 +59,16 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	// Ensure that we have a usable pma.
 	mm.activeMu.Lock()
 	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
+	fault := mm.holdTranslationFault(err)
 	mm.mappingMu.RUnlock()
 	if err != nil {
 		mm.activeMu.Unlock()
+		if fault != nil {
+			if ctx, err = waitForTranslation(ctx, fault, true /* interruptible */); err != nil {
+				return err
+			}
+			goto retry
+		}
 		return err
 	}
 
@@ -147,7 +155,10 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	switch {
 	case opts.PlatformEffect >= memmap.PlatformEffectPopulate:
 		if opts.RequirePlatformEffect {
-			if err := mm.populateVMA(ctx, vseg, ar, opts.PlatformEffect); err != nil {
+			// Fill synchronously, without releasing mappingMu, so that no
+			// other thread observes the range between the removal of any
+			// mapping this one replaces and its population.
+			if err := mm.populateVMA(memmap.WithoutTranslationFaults(ctx), vseg, ar, opts.PlatformEffect); err != nil {
 				_, droppedIDs = mm.unmapLocked(ctx, ar, droppedIDs)
 				mm.mappingMu.Unlock()
 				return 0, err
@@ -180,7 +191,9 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 // populateVMA obtains pmas for addresses in ar in the given vma, and maps them
 // into mm.as if it is active.
 //
-// Preconditions: vseg.Range().IsSupersetOf(ar).
+// Preconditions:
+//   - vseg.Range().Contains(ar.Start).
+//   - vmas exist for all of ar and have some effective permission.
 //
 // +checklocksread:mm.mappingMu
 // +checklocksexclude:mm.activeMu
@@ -256,6 +269,9 @@ func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaItera
 		// mm/gup.c:mm_populate(). If it matters, we'll get it again when
 		// userspace actually tries to use the failing page.
 		mm.activeMu.Unlock()
+		if _, ok := err.(memmap.TranslationFault); ok {
+			mm.populateRange(ctx, ar, platformEffect)
+		}
 		return
 	}
 
@@ -263,6 +279,35 @@ func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaItera
 	mm.activeMu.DowngradeLock()
 	mm.mapASLocked(ctx, pseg, ar, platformEffect)
 	mm.activeMu.RUnlock()
+}
+
+// populateRange performs best-effort population with fresh VMA lookups across
+// content waits. Call without MM locks; no iterators survive a wait.
+//
+// +checklocksexclude:mm.mappingMu
+// +checklocksexclude:mm.activeMu
+func (mm *MemoryManager) populateRange(ctx context.Context, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
+	for {
+		mm.mappingMu.RLock()
+		vseg, _, err := mm.getVMAsLocked(ctx, ar, hostarch.NoAccess, false)
+		if err == nil {
+			for seg := vseg; seg.Ok() && seg.Start() < ar.End; seg = seg.NextSegment() {
+				if !seg.ValuePtr().effectivePerms.Any() {
+					err = linuxerr.EFAULT
+					break
+				}
+			}
+		}
+		if err == nil {
+			err = mm.populateVMA(ctx, vseg, ar, platformEffect)
+		}
+		fault := mm.holdTranslationFault(err)
+		mm.mappingMu.RUnlock()
+		if fault == nil {
+			return err
+		}
+		ctx, _ = waitForTranslation(ctx, fault, false /* interruptible */)
+	}
 }
 
 // MapStack allocates the initial process stack.
@@ -409,10 +454,14 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	}
 
 	var droppedIDs []memmap.MappingIdentity
+	var delayedPopulate hostarch.AddrRange
 	// This must run after mm.mappingMu.Unlock().
 	defer func() {
 		for _, id := range droppedIDs {
 			id.DecRef(ctx)
+		}
+		if delayedPopulate.Length() != 0 {
+			mm.populateRange(ctx, delayedPopulate, memmap.PlatformEffectCommit)
 		}
 	}()
 
@@ -524,7 +573,9 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 				vseg = mm.vmas.Unisolate(vseg)
 			}
 			if mlockMode == memmap.MLockEager {
-				mm.populateVMA(ctx, vseg, ar, memmap.PlatformEffectCommit)
+				if _, ok := mm.populateVMA(ctx, vseg, ar, memmap.PlatformEffectCommit).(memmap.TranslationFault); ok {
+					delayedPopulate = ar
+				}
 			}
 			return oldAddr, nil
 		}
@@ -645,7 +696,9 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 		if vma.mlockMode != memmap.MLockNone {
 			mm.lockedAS += uint64(newAR.Length())
 			if vma.mlockMode == memmap.MLockEager {
-				mm.populateVMA(ctx, vseg, newAR, memmap.PlatformEffectCommit)
+				if _, ok := mm.populateVMA(ctx, vseg, newAR, memmap.PlatformEffectCommit).(memmap.TranslationFault); ok {
+					delayedPopulate = newAR
+				}
 			}
 		}
 		return newAR.Start, nil
@@ -689,7 +742,9 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	}
 
 	if vma.mlockMode == memmap.MLockEager {
-		mm.populateVMA(ctx, vseg, newAR, memmap.PlatformEffectCommit)
+		if _, ok := mm.populateVMA(ctx, vseg, newAR, memmap.PlatformEffectCommit).(memmap.TranslationFault); ok {
+			delayedPopulate = newAR
+		}
 	}
 
 	return newAR.Start, nil
@@ -996,6 +1051,9 @@ func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length u
 			if err != nil {
 				mm.activeMu.Unlock()
 				mm.mappingMu.RUnlock()
+				if _, ok := err.(memmap.TranslationFault); ok {
+					err = mm.populateRange(ctx, ar, memmap.PlatformEffectCommit)
+				}
 				// Linux: mm/mlock.c:__mlock_posix_error_return()
 				if linuxerr.Equals(linuxerr.EFAULT, err) {
 					return linuxerr.ENOMEM
@@ -1046,6 +1104,13 @@ func (mm *MemoryManager) MLockAll(ctx context.Context, opts MLockAllOpts) error 
 		return linuxerr.EINVAL
 	}
 
+	var delayedPopulate []hostarch.AddrRange
+	defer func() {
+		for _, ar := range delayedPopulate {
+			mm.populateRange(ctx, ar, memmap.PlatformEffectCommit)
+		}
+	}()
+
 	mm.mappingMu.Lock()
 	// Can't defer mm.mappingMu.Unlock(); see below.
 
@@ -1090,7 +1155,10 @@ func (mm *MemoryManager) MLockAll(ctx context.Context, opts MLockAllOpts) error 
 		mm.mappingMu.DowngradeLock()
 		for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
 			if vseg.ValuePtr().effectivePerms.Any() {
-				mm.getPMAsLocked(ctx, vseg, vseg.Range(), hostarch.NoAccess, true /* callerIndirectCommit */, false /* forPin */)
+				_, _, err := mm.getPMAsLocked(ctx, vseg, vseg.Range(), hostarch.NoAccess, true /* callerIndirectCommit */, false /* forPin */)
+				if _, ok := err.(memmap.TranslationFault); ok {
+					delayedPopulate = append(delayedPopulate, vseg.Range())
+				}
 			}
 		}
 

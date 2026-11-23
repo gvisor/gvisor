@@ -583,10 +583,13 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 	// overflow because otherwise it would have been caught by CheckIORange.
 	end, _ := ioar.End.RoundUp()
 	ar := hostarch.AddrRange{addr.RoundDown(), end}
+	originalAR := ar
 
 	// Don't bother trying existingPMAsLocked; in most cases, if we did have
 	// existing pmas, we wouldn't have faulted.
 
+retry:
+	ar = originalAR
 	// Ensure that we have usable vmas. Here and below, only return early if we
 	// can't map the first (faulting) page; failure to map later pages are
 	// silently ignored. This maximizes partial success.
@@ -603,7 +606,13 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 	// Ensure that we have usable pmas.
 	mm.activeMu.Lock()
 	pseg, pend, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
+	fault := mm.holdTranslationFault(err)
 	mm.mappingMu.RUnlock()
+	if fault != nil {
+		mm.activeMu.Unlock()
+		ctx, _ = waitForTranslation(ctx, fault, false /* interruptible */)
+		goto retry
+	}
 	if pendaddr := pend.Start(); pendaddr < ar.End {
 		if pendaddr <= ar.Start {
 			mm.activeMu.Unlock()
@@ -639,6 +648,7 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 // +checklocksexclude:mm.mappingMu
 // +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
+	originalAR := ar
 	// If pmas are already available, we can do IO without touching mm.vmas or
 	// mm.mappingMu.
 	mm.activeMu.RLock()
@@ -654,6 +664,8 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 	}
 	mm.activeMu.RUnlock()
 
+retry:
+	ar = originalAR
 	// Ensure that we have usable vmas.
 	mm.mappingMu.RLock()
 	vseg, vend, verr := mm.getVMAsLocked(ctx, ar, at, ignorePermissions)
@@ -668,7 +680,13 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 	// Ensure that we have usable pmas.
 	mm.activeMu.Lock()
 	pseg, pend, perr := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
+	fault := mm.holdTranslationFault(perr)
 	mm.mappingMu.RUnlock()
+	if fault != nil {
+		mm.activeMu.Unlock()
+		ctx, _ = waitForTranslation(ctx, fault, false /* interruptible */)
+		goto retry
+	}
 	if pendaddr := pend.Start(); pendaddr < ar.End {
 		if pendaddr <= ar.Start {
 			mm.activeMu.Unlock()
@@ -740,6 +758,7 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	}
 	mm.activeMu.RUnlock()
 
+retry:
 	// Ensure that we have usable vmas.
 	mm.mappingMu.RLock()
 	vars, verr := mm.getVecVMAsLocked(ctx, ars, at, ignorePermissions)
@@ -751,7 +770,13 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	// Ensure that we have usable pmas.
 	mm.activeMu.Lock()
 	pars, perr := mm.getVecPMAsLocked(ctx, vars, at, true /* callerIndirectCommit */)
+	fault := mm.holdTranslationFault(perr)
 	mm.mappingMu.RUnlock()
+	if fault != nil {
+		mm.activeMu.Unlock()
+		ctx, _ = waitForTranslation(ctx, fault, false /* interruptible */)
+		goto retry
+	}
 	if pars.NumBytes() == 0 {
 		mm.activeMu.Unlock()
 		return 0, translateIOError(ctx, perr)
