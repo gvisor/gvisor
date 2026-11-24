@@ -27,10 +27,6 @@ priority: ${PRIORITY:-0}
 steps:
   - <<: *common
     <<: *source_test
-    label: ":fire: Smoke tests (AMD64)"
-    command: make smoke-tests
-  - <<: *common
-    <<: *source_test
     env:
       GLIBC_TUNABLES: glibc.pthread.rseq=0
     label: ":fire: Smoke race tests"
