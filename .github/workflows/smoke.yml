@@ -37,10 +37,26 @@ jobs:
 
     # Ubuntu 23.10+ uses AppArmor to restrict unprivileged user namespaces,
     # which breaks rootless runsc.
-    - name: Allow unprivileged user namespaces
+    - &allow-userns
+      name: Allow unprivileged user namespaces
       run: |
         if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" == "1" ]]; then
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         fi
 
     - run: make smoke-tests
+
+  smoke-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    # Allow unprivileged user namespaces, as in the smoke job.
+    - *allow-userns
+
+    - run: make smoke-race-tests
+      env:
+        GLIBC_TUNABLES: glibc.pthread.rseq=0
