@@ -46,9 +46,10 @@ installer image yourself, see [Building the installer image][gvisor-deploy-build
 To uninstall, delete the gVisor pods, then run
 `helm uninstall gvisor -n kube-system --wait`. This restores the nodes.
 
-To try it on a local [kind][kind] cluster, run
-`kind create cluster --name gvisor` first. To remove the cluster, run
-`kind delete cluster --name gvisor`.
+For a local kind cluster, see the [kind Quick Start][gvisor-kind].
+gvisor-deploy also works on [k3s][k3s] clusters (to create one, see the
+[k3s quick start][k3s-quick-start]): it adds gVisor to the containerd config of
+k3s and restarts k3s.
 
 ## Using Containerd
 
@@ -59,12 +60,14 @@ instructions in the [Containerd Quick Start][gvisor-containerd].
 [containerd]: https://containerd.io/
 [minikube]: https://github.com/kubernetes/minikube/blob/master/deploy/addons/gvisor/README.md
 [gke]: https://cloud.google.com/kubernetes-engine/
-[kind]: https://kind.sigs.k8s.io/
 [gke-sandbox]: https://docs.cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods
 [gke-sandbox-docs]: https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods
 [gvisor-containerd]: /docs/user_guide/containerd/quick_start/
 [gvisor-deploy]: https://github.com/gvisor/gvisor/tree/master/deploy/kubernetes
 [gvisor-deploy-building]: https://github.com/gvisor/gvisor/blob/master/deploy/kubernetes/BUILDING.md
 [gvisor-deploy-supported]: https://github.com/gvisor/gvisor/tree/master/deploy/kubernetes#supported-nodes
+[gvisor-kind]: /docs/user_guide/quick_start/kind/
+[k3s]: https://k3s.io/
+[k3s-quick-start]: https://docs.k3s.io/quick-start
 [runtimeclass]: https://kubernetes.io/docs/concepts/containers/runtime-class/
 [wordpress-quick]: /docs/tutorials/kubernetes/
