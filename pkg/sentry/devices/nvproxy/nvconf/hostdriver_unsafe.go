@@ -26,9 +26,9 @@ import (
 
 // HostDriverVersion returns the version of the host Nvidia driver.
 func HostDriverVersion() (string, error) {
-	ctlFD, err := unix.Openat(-1, "/dev/nvidiactl", unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	ctlFD, err := openNvidiaCtlDevice()
 	if err != nil {
-		return "", fmt.Errorf("failed to open /dev/nvidiactl: %w", err)
+		return "", err
 	}
 	defer unix.Close(ctlFD)
 
@@ -69,4 +69,47 @@ func HostDriverVersion() (string, error) {
 		return string(ioctlParams.VersionString[:i]), nil
 	}
 	return string(ioctlParams.VersionString[:]), nil
+}
+
+// openNvidiaCtlDevice opens the control device. It prefers to make an in-memory
+// node for it, as the host may not have one, as when the device nodes are
+// only in a driver container. It opens /dev/nvidiactl if that isn't possible.
+func openNvidiaCtlDevice() (int, error) {
+	fd, err := openInMemoryCharDevice(nvgpu.NV_MAJOR_DEVICE_NUMBER, nvgpu.NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE)
+	if err == nil {
+		return fd, nil
+	}
+	fd, err = unix.Openat(-1, "/dev/nvidiactl", unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, fmt.Errorf("failed to open /dev/nvidiactl: %w", err)
+	}
+	return fd, nil
+}
+
+// openInMemoryCharDevice opens the character device with the given number,
+// without a device node on any filesystem. The node is made on a tmpfs that is
+// mounted nowhere, so it can't be seen by anyone.
+func openInMemoryCharDevice(major, minor uint32) (int, error) {
+	fsFD, err := unix.Fsopen("tmpfs", unix.FSOPEN_CLOEXEC)
+	if err != nil {
+		return -1, fmt.Errorf("fsopen(tmpfs) failed: %w", err)
+	}
+	defer unix.Close(fsFD)
+	if err := unix.FsconfigCreate(fsFD); err != nil {
+		return -1, fmt.Errorf("creating a tmpfs failed: %w", err)
+	}
+	mntFD, err := unix.Fsmount(fsFD, unix.FSMOUNT_CLOEXEC, unix.MOUNT_ATTR_NOSUID|unix.MOUNT_ATTR_NOEXEC)
+	if err != nil {
+		return -1, fmt.Errorf("fsmount failed: %w", err)
+	}
+	defer unix.Close(mntFD)
+
+	if err := unix.Mknodat(mntFD, "device", unix.S_IFCHR|0600, int(unix.Mkdev(major, minor))); err != nil {
+		return -1, fmt.Errorf("mknod failed: %w", err)
+	}
+	fd, err := unix.Openat(mntFD, "device", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("opening the device failed: %w", err)
+	}
+	return fd, nil
 }

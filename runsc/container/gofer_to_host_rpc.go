@@ -25,6 +25,8 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -34,9 +36,29 @@ type OpenMountArgs struct {
 	Flags uint32
 }
 
+// mountNSRequest is a request for the thread that runs in the gofer's mount
+// namespace.
+type mountNSRequest interface {
+	// handle serves the request.
+	handle()
+	// cancel fails the request with err.
+	cancel(err error)
+}
+
 type openMountRequest struct {
 	args   *OpenMountArgs
 	result *OpenMountResult
+	done   chan error
+}
+
+// CreateDeviceArgs represents a device to be created, as the spec has it.
+type CreateDeviceArgs struct {
+	Device specs.LinuxDevice
+}
+
+type createDeviceRequest struct {
+	args   *CreateDeviceArgs
+	result *CreateDeviceResult
 	done   chan error
 }
 
@@ -44,14 +66,22 @@ type openMountRequest struct {
 // calls outside of its namespace container. It is used to configure sandbox
 // mounts.
 type goferToHostRPC struct {
-	mu                sync.Mutex
-	openMountRequests chan *openMountRequest
-	goferPID          int
+	mu              sync.Mutex
+	mountNSRequests chan mountNSRequest
+	goferPID        int
+	spec            *specs.Spec
+	conf            *config.Config
 }
 
 // OpenMountResult is a result of the rpcp.OpenMount call.
 type OpenMountResult struct {
 	urpc.FilePayload
+}
+
+// CreateDeviceResult is a result of the rpcp.CreateDevice call. Path is the
+// path of the device that was created, in the gofer's mount namespace.
+type CreateDeviceResult struct {
+	Path string
 }
 
 func createIDMappedUserNS(uidMappings, gidMappings []specs.LinuxIDMapping) (*os.File, error) {
@@ -154,7 +184,7 @@ func openIDMappedMount(req *OpenMountArgs) (*os.File, error) {
 	return os.NewFile(uintptr(fd), req.Mount.Source), nil
 }
 
-func (rpc *goferToHostRPC) handleRequest(req *openMountRequest) {
+func (req *openMountRequest) handle() {
 	defer close(req.done)
 
 	var fd *os.File
@@ -173,22 +203,73 @@ func (rpc *goferToHostRPC) handleRequest(req *openMountRequest) {
 	req.result.Files = []*os.File{fd}
 }
 
-func (rpc *goferToHostRPC) openMountThread() error {
+func (req *openMountRequest) cancel(err error) {
+	defer close(req.done)
+
+	req.done <- err
+}
+
+func (req *createDeviceRequest) handle() {
+	defer close(req.done)
+
+	path, err := sandboxsetup.CreateDevice(&req.args.Device, "/proc/fs/dev")
+	if err != nil {
+		req.done <- err
+		return
+	}
+
+	req.result.Path = path
+}
+
+func (req *createDeviceRequest) cancel(err error) {
+	defer close(req.done)
+
+	req.done <- err
+}
+
+func (rpc *goferToHostRPC) mountNSThread() error {
 	if err := unix.Unshare(unix.CLONE_FS); err != nil {
-		return fmt.Errorf("open mount thread: unshare filesystem attributes: %w", err)
+		return fmt.Errorf("mount namespace thread: unshare filesystem attributes: %w", err)
 	}
 	nsFd, err := os.Open(fmt.Sprintf("/proc/%d/ns/mnt", rpc.goferPID))
 	if err != nil {
-		return fmt.Errorf("open mount thread: open container mntns: %w", err)
+		return fmt.Errorf("mount namespace thread: open container mntns: %w", err)
 	}
 	defer nsFd.Close()
 	if err := unix.Setns(int(nsFd.Fd()), unix.CLONE_NEWNS); err != nil {
-		return fmt.Errorf("open mount thread: join container mntns: %w", err)
+		return fmt.Errorf("mount namespace thread: join container mntns: %w", err)
 	}
-	for req := range rpc.openMountRequests {
-		rpc.handleRequest(req)
+	if shouldCreateDeviceGofer(rpc.spec, rpc.conf) && !rpc.conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		if err := sandboxsetup.MountDevicesDir("/proc/fs/dev"); err != nil {
+			return fmt.Errorf("mount namespace thread: mount devices dir: %w", err)
+		}
+	}
+	for req := range rpc.mountNSRequests {
+		req.handle()
 	}
 	return nil
+}
+
+// startMountNSThread starts the thread that runs in the gofer's mount
+// namespace, unless it is running.
+func (rpc *goferToHostRPC) startMountNSThread() {
+	if rpc.mountNSRequests != nil {
+		return
+	}
+	rpc.mountNSRequests = make(chan mountNSRequest)
+	go func() {
+		// This goroutine holds the current threads forever. It
+		// never exits, because child processes can set
+		// PDEATHSIG. It can't serve other go-routines, because
+		// it does unshare CLONE_FS.
+		runtime.LockOSThread()
+		if err := rpc.mountNSThread(); err != nil {
+			for req := range rpc.mountNSRequests {
+				req.cancel(err)
+			}
+		}
+		panic("unreachable")
+	}()
 }
 
 // OpenMount opens a specified mount and returns a file descriptor to it. It is
@@ -197,28 +278,30 @@ func (rpc *goferToHostRPC) OpenMount(reqArg *OpenMountArgs, res *OpenMountResult
 	rpc.mu.Lock()
 	defer rpc.mu.Unlock()
 
-	if rpc.openMountRequests == nil {
-		rpc.openMountRequests = make(chan *openMountRequest)
-		go func() {
-			// This goroutine holds the current threads forever. It
-			// never exits, because child processes can set
-			// PDEATHSIG. It can't serve other go-routines, because
-			// it does unshare CLONE_FS.
-			runtime.LockOSThread()
-			if err := rpc.openMountThread(); err != nil {
-				for req := range rpc.openMountRequests {
-					req.done <- err
-				}
-			}
-			panic("unreachable")
-		}()
-	}
+	rpc.startMountNSThread()
 	req := openMountRequest{
 		args:   reqArg,
 		result: res,
 		done:   make(chan error),
 	}
-	rpc.openMountRequests <- &req
+	rpc.mountNSRequests <- &req
+	err := <-req.done
+	return err
+}
+
+// CreateDevice creates a specified device and returns a path to it. It is used
+// when the device can't be created in the gofer user namespace.
+func (rpc *goferToHostRPC) CreateDevice(reqArg *CreateDeviceArgs, res *CreateDeviceResult) error {
+	rpc.mu.Lock()
+	defer rpc.mu.Unlock()
+
+	rpc.startMountNSThread()
+	req := createDeviceRequest{
+		args:   reqArg,
+		result: res,
+		done:   make(chan error),
+	}
+	rpc.mountNSRequests <- &req
 	err := <-req.done
 	return err
 }

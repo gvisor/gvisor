@@ -876,10 +876,11 @@ func TestGoferWillNeedHostRPC(t *testing.T) {
 		{name: "userns mapping all IDs", spec: &specs.Spec{Linux: &specs.Linux{Namespaces: userns, UIDMappings: allIDs, GIDMappings: allIDs}}, want: partialUserNS},
 		{name: "shifted userns", spec: &specs.Spec{Linux: &specs.Linux{Namespaces: userns, UIDMappings: shifted, GIDMappings: shifted}}, want: true},
 		{name: "id-mapped mount", spec: &specs.Spec{Linux: &specs.Linux{}, Mounts: []specs.Mount{idMapped}}, want: true},
+		{name: "devices to create", spec: &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{{Path: "/dev/nvidiactl", Type: "c", Major: 195, Minor: 255}}}}, want: true},
 		{name: "host procfs mount", spec: &specs.Spec{Linux: &specs.Linux{}, Mounts: []specs.Mount{{Destination: "/mnt", Source: "/proc/1/ns", Type: "bind"}}}, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := goferWillNeedHostRPC(tc.spec)
+			got, err := goferWillNeedHostRPC(tc.spec, &config.Config{})
 			if err != nil {
 				t.Fatalf("goferWillNeedHostRPC failed: %v", err)
 			}

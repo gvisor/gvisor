@@ -16,25 +16,57 @@ package container
 
 import (
 	"slices"
-	"strings"
 	"testing"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/cgroup"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
-func TestParseDeviceMajors(t *testing.T) {
-	const procDevices = `Character devices:
-  1 mem
-195 nvidia
-235 nvidia-caps
-510 nvidia-uvm
-
-Block devices:
-  8 sd
-`
-	got, err := parseDeviceMajors(strings.NewReader(procDevices), []string{"nvidia-uvm", "nvidia-caps"})
+func TestSandboxDeviceRulesForSpecDevices(t *testing.T) {
+	// The devices may not be on the host, as when only a driver container has
+	// them, so their rules come from the spec. A fifo has no device numbers, so it
+	// gets no rule.
+	spec := &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{
+		{Path: "/dev/nvidiactl", Type: "c", Major: 195, Minor: 255},
+		{Path: "/dev/nvidia-uvm", Type: "u", Major: 511, Minor: 0},
+		{Path: "/dev/infiniband/uverbs-test", Type: "c", Major: 231, Minor: 0},
+		{Path: "/dev/test-fifo", Type: "p"},
+	}}}
+	rules, err := sandboxDeviceRules(&config.Config{Platform: "systrap"}, spec)
 	if err != nil {
-		t.Fatalf("parseDeviceMajors(): %v", err)
+		t.Fatalf("sandboxDeviceRules(): %v", err)
 	}
-	if want := []int64{235, 510}; !slices.Equal(got, want) {
-		t.Errorf("parseDeviceMajors() = %v, want %v", got, want)
+	// Only a cgroup v2 has the access to create devices.
+	want, bad := []string{"rwm"}, []string{"r", "w", "rw", "m"}
+	if !cgroup.IsOnlyV2() {
+		want, bad = []string{"rw"}, []string{"r", "w", "m", "rwm"}
+	}
+	for _, d := range []struct {
+		major, minor int64
+	}{{195, 255}, {511, 0}, {231, 0}} {
+		for _, access := range want {
+			if r := (cgroup.DeviceRule{Type: "c", Major: d.major, Minor: d.minor, Access: access}); !slices.Contains(rules, r) {
+				t.Errorf("sandboxDeviceRules() = %v, want it to include %v", rules, r)
+			}
+		}
+		for _, access := range bad {
+			if r := (cgroup.DeviceRule{Type: "c", Major: d.major, Minor: d.minor, Access: access}); slices.Contains(rules, r) {
+				t.Errorf("sandboxDeviceRules() = %v, want no rule like %v", rules, r)
+			}
+		}
+	}
+}
+
+func TestSandboxDeviceRulesUnsupportedDevice(t *testing.T) {
+	for _, dev := range []specs.LinuxDevice{
+		{Path: "/dev/test0", Type: "x", Major: 1, Minor: 0},
+		{Path: "/dev/test1", Major: 1, Minor: 1},
+		{Path: "/dev/test2", Type: "c", Major: -1, Minor: 2},
+	} {
+		spec := &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{dev}}}
+		if rules, err := sandboxDeviceRules(&config.Config{Platform: "systrap"}, spec); err == nil {
+			t.Errorf("sandboxDeviceRules() with the device %+v = %v, want an error", dev, rules)
+		}
 	}
 }
