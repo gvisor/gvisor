@@ -55,13 +55,27 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		return err
 	}
 
-	// Ensure that we have a usable pma.
+	// Ensure that we have a usable pma. A new or copied pma may merge with
+	// its neighbors, so map only what this fault adds.
 	mm.activeMu.Lock()
+	optAR := maxMapAR
+	var cowFR memmap.FileRange
+	if pseg, pgap := mm.pmas.Find(ar.Start); pgap.Ok() {
+		optAR = pgap.Range()
+	} else if at.Write && pseg.ValuePtr().needCOW {
+		optAR = hugepageAligned(ar)
+		cowFR = pseg.fileRangeOf(ar)
+	}
 	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
 	mm.mappingMu.RUnlock()
 	if err != nil {
 		mm.activeMu.Unlock()
 		return err
+	}
+	// If the write took ownership of the pma's memory instead of copying it,
+	// all of the pma is now writable, so map all of it.
+	if cowFR.Length() != 0 && pseg.fileRangeOf(ar) == cowFR {
+		optAR = maxMapAR
 	}
 
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
@@ -69,7 +83,7 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	mm.activeMu.DowngradeLock()
 
 	// Map the faulted page into the active AddressSpace.
-	err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
+	err = mm.mapASOptLocked(ctx, pseg, ar, optAR, memmap.PlatformEffectDefault)
 	mm.activeMu.RUnlock()
 	return err
 }

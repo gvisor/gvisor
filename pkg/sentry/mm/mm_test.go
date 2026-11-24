@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -1381,5 +1382,121 @@ func TestGetByteSlicePtrZeroed(t *testing.T) {
 			}
 		}
 		putByteSlicePtr(s)
+	}
+}
+
+// mapRecorder is a platform.AddressSpace that records the ranges mapped.
+type mapRecorder struct {
+	platform.NoAddressSpaceIO
+	maps []hostarch.AddrRange
+}
+
+func (r *mapRecorder) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	r.maps = append(r.maps, hostarch.AddrRange{addr, addr + hostarch.Addr(fr.Length())})
+	return nil
+}
+
+func (*mapRecorder) Unmap(hostarch.Addr, uint64)                                    {}
+func (*mapRecorder) Release()                                                       {}
+func (*mapRecorder) PreFork()                                                       {}
+func (*mapRecorder) PostFork()                                                      {}
+func (*mapRecorder) UserModifiedGS(context.Context, platform.MemoryManager) error   { return nil }
+func (*mapRecorder) PrepareForPtrace(context.Context, platform.MemoryManager) error { return nil }
+
+func TestFaultMapsOnlyNewPages(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		fork       bool
+		childExits bool
+		wantFaults int
+	}{
+		{name: "heap", wantFaults: 4},
+		{name: "cow", fork: true, wantFaults: 2},
+		{name: "cow-owned", fork: true, childExits: true, wantFaults: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			mm := testMemoryManager(ctx, t)
+			defer mm.DecUsers(ctx)
+			as := &mapRecorder{}
+			mm.activeMu.Lock()
+			if mm.as != nil {
+				mm.as.Release()
+			}
+			mm.as = as
+			mm.activeMu.Unlock()
+
+			perms := hostarch.NoAccess
+			if test.fork {
+				perms = hostarch.ReadWrite
+			}
+			addr, err := mm.MMap(ctx, memmap.MMapOpts{
+				Length:   3 * uint64(hostarch.HugePageSize),
+				Private:  true,
+				Perms:    perms,
+				MaxPerms: hostarch.AnyAccess,
+			})
+			if err != nil {
+				t.Fatalf("MMap got err %v want nil", err)
+			}
+			base, _ := addr.HugeRoundUp()
+			var touches []hostarch.Addr
+			if test.fork {
+				// Write, then fork, so the writes below break copy-on-write.
+				if _, err := mm.CopyOut(ctx, base, make([]byte, 2*hostarch.HugePageSize), usermem.IOOpts{}); err != nil {
+					t.Fatalf("CopyOut got err %v want nil", err)
+				}
+				mm2, err := mm.Fork(ctx)
+				if err != nil {
+					t.Fatalf("Fork got err %v want nil", err)
+				}
+				if test.childExits {
+					mm2.DecUsers(ctx)
+				} else {
+					defer mm2.DecUsers(ctx)
+				}
+				touches = []hostarch.Addr{base, base + hostarch.Addr(hostarch.HugePageSize)}
+			} else {
+				// Grow a heap a page at a time, as glibc does for thread arenas.
+				for i := 0; i < 4; i++ {
+					touches = append(touches, base+hostarch.Addr(i)*hostarch.Addr(hostarch.PageSize))
+				}
+			}
+			var mapped []hostarch.AddrRange
+			faults := 0
+			for _, touch := range touches {
+				if !test.fork {
+					if err := mm.MProtect(touch, uint64(hostarch.PageSize), hostarch.ReadWrite, false); err != nil {
+						t.Fatalf("MProtect(%#x) got err %v want nil", touch, err)
+					}
+				}
+				if slices.ContainsFunc(mapped, func(m hostarch.AddrRange) bool { return m.Contains(touch) }) {
+					continue
+				}
+				faults++
+				as.maps = nil
+				if err := mm.HandleUserFault(ctx, touch, hostarch.Write, 0); err != nil {
+					t.Fatalf("HandleUserFault(%#x) got err %v want nil", touch, err)
+				}
+				covered := false
+				for _, m := range as.maps {
+					if m.Contains(touch) {
+						covered = true
+					}
+					for _, old := range mapped {
+						if m.Overlaps(old) {
+							t.Errorf("fault at %#x mapped %v again (already mapped %v)", touch, m, old)
+						}
+					}
+				}
+				if !covered {
+					t.Errorf("fault at %#x mapped %v, want a range containing it", touch, as.maps)
+				}
+				mapped = append(mapped, as.maps...)
+			}
+			if faults != test.wantFaults {
+				t.Errorf("got %d faults, want %d", faults, test.wantFaults)
+			}
+		})
 	}
 }
