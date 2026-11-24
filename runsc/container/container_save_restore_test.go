@@ -3145,3 +3145,62 @@ func TestCheckpointRestoreCrossEngineChained(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckpointResumeWaitsForPostResume verifies that Checkpoint with Resume
+// waits for PostResume to finish and surfaces PostResume errors.
+func TestCheckpointResumeWaitsForPostResume(t *testing.T) {
+	runCase := func(t *testing.T, hookScript string) (string, error) {
+		t.Helper()
+		dir := makeTempDir(t, "checkpoint-post-resume-test")
+		hookLog := filepath.Join(dir, "hook.log")
+		hookPath := filepath.Join(dir, "hook.sh")
+		if err := os.WriteFile(hookPath, []byte(fmt.Sprintf(hookScript, hookLog)), 0777 /* perm */); err != nil {
+			t.Fatalf("error writing hook: %v", err)
+		}
+
+		spec, conf := sleepSpecConf(t)
+		cont := startContainer(t, conf, spec, setupBundle(t, conf, spec), nil /* mutateArgs */)
+
+		imgDir := makeTempDir(t, "checkpoint-post-resume-image")
+		checkpointErr := cont.Checkpoint(conf, imgDir, sandbox.CheckpointOpts{
+			Resume:                     true,
+			SaveRestoreExecArgv:        hookPath,
+			SaveRestoreExecTimeout:     controlapi.DefaultSaveRestoreExecTimeout,
+			SaveRestoreExecContainerID: cont.ID,
+		})
+		got, _ := os.ReadFile(hookLog)
+		return string(got), checkpointErr
+	}
+
+	t.Run("SlowResumeHook", func(t *testing.T) {
+		script := `#!/bin/sh
+if [ "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE}" = "resume" ]; then
+	sleep 2
+fi
+echo "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE}" >> %q
+`
+		got, err := runCase(t, script)
+		if err != nil {
+			t.Fatalf("Checkpoint(Resume=true) failed: %v", err)
+		}
+		if got != "save\nresume\n" {
+			t.Fatalf("hook log immediately after Checkpoint() returned = %q, want %q", got, "save\nresume\n")
+		}
+	})
+
+	t.Run("FailingResumeHook", func(t *testing.T) {
+		script := `#!/bin/sh
+echo "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE}" >> %q
+if [ "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE}" = "resume" ]; then
+	exit 1
+fi
+`
+		got, err := runCase(t, script)
+		if err == nil {
+			t.Fatalf("Checkpoint(Resume=true) succeeded despite failing resume hook, want error")
+		}
+		if got != "save\nresume\n" {
+			t.Fatalf("hook log after failed resume hook = %q, want %q", got, "save\nresume\n")
+		}
+	})
+}
