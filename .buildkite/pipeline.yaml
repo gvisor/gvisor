@@ -803,19 +803,6 @@ steps:
       arch: "amd64"
       queue: "default"
 
-  # Run basic benchmarks smoke tests (no upload).
-  - <<: *common
-    <<: *docker
-    label: ":fire: Benchmarks smoke test"
-    command: make benchmark-platforms BENCHMARKS_TARGETS=test/benchmarks/base:startup_test BENCHMARKS_FILTER=BenchmarkStartupEmpty BENCHMARKS_OPTIONS=-test.benchtime=1ns
-    # Use the opposite of the benchmarks filter.
-    if: build.branch != "master"
-    agents:
-      <<: *platform_specific_agents
-      <<: *kvm_agents
-      arch: "amd64"
-      queue: "default"
-
   # Run all benchmarks.
   - <<: *benchmarks
     label: ":bazel: ABSL build benchmarks"
