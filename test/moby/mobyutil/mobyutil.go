@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package mobyutil provides shared helpers for Moby integration tests and benchmarks.
+// Package mobyutil provides helpers to run dockerd inside a container.
 package mobyutil
 
 import (
@@ -49,7 +49,30 @@ func DockerInGvisorCapabilities() []string {
 	}
 }
 
-const cleanupTimeout = 30 * time.Second
+const (
+	cleanupTimeout = 30 * time.Second
+	dockerdTimeout = time.Minute
+)
+
+// WaitForDockerd polls `docker info` inside d until the dockerd running in
+// the container is ready to serve requests, or until dockerdTimeout passes.
+func WaitForDockerd(ctx context.Context, d *dockerutil.Container) error {
+	pollCtx, cancel := context.WithTimeout(ctx, dockerdTimeout)
+	defer cancel()
+	// The last attempt is often cut off by the deadline and has no output, so
+	// keep the last output that is not empty.
+	var lastOutput string
+	if err := testutil.PollContext(pollCtx, func() error {
+		out, err := d.Exec(pollCtx, dockerutil.ExecOpts{}, "docker", "info")
+		if out != "" {
+			lastOutput = out
+		}
+		return err
+	}); err != nil {
+		return fmt.Errorf("docker info: %w, last output: %q", err, lastOutput)
+	}
+	return nil
+}
 
 func detachedContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
@@ -86,12 +109,7 @@ func StartContainer(ctx context.Context, logger testutil.Logger, machine harness
 		return nil, fmt.Errorf("failed to spawn moby container: %w", err)
 	}
 
-	pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if err := testutil.PollContext(pollCtx, func() error {
-		_, err := d.Exec(pollCtx, dockerutil.ExecOpts{}, "docker", "info")
-		return err
-	}); err != nil {
+	if err := WaitForDockerd(ctx, d); err != nil {
 		logsCtx, logsCancel := detachedContext(ctx)
 		defer logsCancel()
 		logs, _ := d.Logs(logsCtx)

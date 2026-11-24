@@ -40,6 +40,7 @@ import (
 	yaml "gopkg.in/yaml.v3"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/test/moby/mobyutil"
 )
 
 var testAlpineImage = func() string {
@@ -456,28 +457,6 @@ func TestTcpdump(t *testing.T) {
 	}
 }
 
-func dockerInGvisorCapabilities() []string {
-	return []string{
-		"audit_write",
-		"chown",
-		"dac_override",
-		"fowner",
-		"fsetid",
-		"kill",
-		"mknod",
-		"net_admin",
-		"net_bind_service",
-		"net_raw",
-		"setfcap",
-		"setgid",
-		"setpcap",
-		"setuid",
-		"sys_admin",
-		"sys_chroot",
-		"sys_ptrace",
-	}
-}
-
 type dockerCommandOptions struct {
 	hostNetwork bool
 	privileged  bool
@@ -599,7 +578,7 @@ func startDockerdInGvisor(ctx context.Context, t *testing.T, overlay bool) *dock
 	// Start the container which starts dockerd.
 	opts := dockerutil.RunOpts{
 		Image:        "basic/docker",
-		CapAdd:       dockerInGvisorCapabilities(),
+		CapAdd:       mobyutil.DockerInGvisorCapabilities(),
 		SecurityOpts: []string{"seccomp=unconfined"},
 	}
 
@@ -626,11 +605,7 @@ func startDockerdInGvisor(ctx context.Context, t *testing.T, overlay bool) *dock
 	}
 
 	// Wait for the docker daemon.
-	cb := backoff.NewConstantBackOff(1 * time.Second)
-	if err := backoff.Retry(func() error {
-		_, err := dockerInGvisorExecOutput(ctx, d, []string{"docker", "info"})
-		return err
-	}, backoff.WithMaxRetries(cb, 30)); err != nil {
+	if err := mobyutil.WaitForDockerd(ctx, d); err != nil {
 		t.Fatalf("docker daemon failed to start: %v", err)
 	}
 
