@@ -16,6 +16,7 @@ package boot
 
 import (
 	"errors"
+	"flag"
 	"math"
 	"os"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 )
 
@@ -214,4 +216,79 @@ func TestTSCOffsetFromSnapshot(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTPUPreparationRejectsOCIPause(t *testing.T) {
+	l := &Loader{ociPauseCount: 1}
+	prepared, err := l.withTPUPreparation(func() (bool, error) {
+		t.Fatal("preparation ran while OCI-paused")
+		return true, nil
+	})
+	if prepared || !errors.Is(err, linuxerr.EBUSY) {
+		t.Fatalf("preparation = (%t, %v), want (false, EBUSY)", prepared, err)
+	}
+	// Admission must release pauseMu even on rejection.
+	l.pauseMu.Lock()
+	l.ociPauseCount = 0
+	l.pauseMu.Unlock()
+	if _, err := l.withTPUPreparation(func() (bool, error) { return false, nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOCIPauseWaitsForTPUPreparation(t *testing.T) {
+	// Loader tests install a seccomp filter compatible with systrap.
+	platformFlag := flag.Lookup("platform")
+	previous := platformFlag.Value.String()
+	if err := platformFlag.Value.Set("systrap"); err != nil {
+		t.Fatal(err)
+	}
+	defer platformFlag.Value.Set(previous)
+	k, err := testutil.Boot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Timekeeper().Destroy()
+	defer k.GlobalInit().Release(k.SupervisorContext())
+	synctest.Test(t, func(t *testing.T) {
+		l := &Loader{k: k}
+		cm := &containerManager{l: l}
+		started := make(chan struct{})
+		release := make(chan struct{})
+		done := make(chan struct{})
+		pauseDone := make(chan error, 1)
+		go func() {
+			defer close(done)
+			l.withTPUPreparation(func() (bool, error) {
+				close(started)
+				<-release
+				if k.IsPaused() {
+					t.Error("kernel paused during TPU exchange")
+				}
+				return true, nil
+			})
+		}()
+		<-started
+		go func() { pauseDone <- cm.Pause(nil, nil) }()
+		if l.pauseMu.TryLock() {
+			l.pauseMu.Unlock()
+			t.Fatal("TPU preparation did not hold pauseMu")
+		}
+		select {
+		case err := <-pauseDone:
+			t.Fatalf("Pause returned during TPU exchange: %v", err)
+		default:
+		}
+		close(release)
+		<-done
+		if err := <-pauseDone; err != nil {
+			t.Fatal(err)
+		}
+		if !k.IsPaused() {
+			t.Error("kernel did not pause after preparation")
+		}
+		if err := cm.Resume(nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

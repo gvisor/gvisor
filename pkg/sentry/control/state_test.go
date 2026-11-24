@@ -85,7 +85,7 @@ func TestSaveGraphEngineOverride(t *testing.T) {
 				t.Fatalf("ConvertToStateSaveOpts() failed: %v", err)
 			}
 			defer saveOpts.Close()
-			if _, err := Save(k, w, saveOpts, &opts.ExecOpts); err != nil {
+			if _, err := Save(k, w, saveOpts, &opts.ExecOpts, nil); err != nil {
 				t.Fatalf("Save() failed: %v", err)
 			}
 

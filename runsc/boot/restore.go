@@ -1028,13 +1028,23 @@ func (l *Loader) saveWithOptsLocked(saveOpts *state.SaveOpts, execOpts *controla
 	}
 
 	defer l.stopIfKilled()
-	prepared, err = control.Save(l.k, l.watchdog, saveOpts, execOpts)
+	prepared, err = control.Save(l.k, l.watchdog, saveOpts, execOpts, l.withTPUPreparation)
 	if err != nil && prepared {
 		if resumeErr := l.runPostResume(true /* prepared */); resumeErr != nil {
 			err = errors.Join(err, resumeErr)
 		}
 	}
 	return err
+}
+
+// withTPUPreparation prevents OCI pause from freezing a TPU control exchange.
+func (l *Loader) withTPUPreparation(prepare func() (bool, error)) (bool, error) {
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	if l.ociPauseCount != 0 {
+		return false, fmt.Errorf("cannot prepare TPU checkpoint while OCI-paused: %w", linuxerr.EBUSY)
+	}
+	return prepare()
 }
 
 // runPostResume undoes the current or deferred checkpoint preparation.

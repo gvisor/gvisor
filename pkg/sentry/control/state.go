@@ -211,8 +211,10 @@ func setSaveOptsForCheckpointGofer(o *controlapi.SaveOpts, saveOpts *state.SaveO
 
 // Save saves the running system with the given options. The returned bool
 // reports whether completed preparation requires PostResume, even on error.
-func Save(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (bool, error) {
-	prepared, err := preSave(k, saveOpts, execOpts)
+// withTPUPreparation must run its argument while excluding OCI pause transitions.
+// It may be nil only when no TPU tasks exist.
+func Save(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts, withTPUPreparation func(func() (bool, error)) (bool, error)) (bool, error) {
+	prepared, err := preSave(k, saveOpts, execOpts, withTPUPreparation)
 	if err != nil {
 		return prepared, err
 	}
@@ -221,13 +223,13 @@ func Save(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, exec
 
 // preSave reports whether at least one stage completed. Partial failures
 // within a stage require stage-specific rollback.
-func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (bool, error) {
+func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts, withTPUPreparation func(func() (bool, error)) (bool, error)) (bool, error) {
 	// A non-nil configuration identifies a save hook that completed during this
 	// checkpoint. Keep it in the image for the matching restore hook.
 	k.SaveRestoreExecConfig = nil
-	prepared, err := preSaveTPU(k)
+	prepared, err := preSaveTPU(k, withTPUPreparation)
 	if err != nil {
-		return false, err
+		return prepared, err
 	}
 
 	if execOpts.Argv != "" {

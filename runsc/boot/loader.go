@@ -313,7 +313,7 @@ type Loader struct {
 	restoring atomicbitops.Bool
 
 	// pauseMu serializes user-requested pause transitions with the decision to
-	// start post-resume cleanup.
+	// start post-resume cleanup and with TPU checkpoint preparation.
 	pauseMu sync.Mutex
 
 	// ociPauseCount is the number of outstanding OCI pauses.
