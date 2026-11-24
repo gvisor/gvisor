@@ -48,9 +48,9 @@ const (
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
 )
 
-func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
+func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) (bool, error) {
 	if o.CudaCheckpointPath == "" {
-		return nil
+		return false, nil
 	}
 
 	wasPaused := k.IsPaused()
@@ -64,11 +64,17 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		if k.IsPaused() {
 			// If the kernel is still paused, we don't understand/expect this state.
 			k.Pause() // Revert the unpause from above.
-			return fmt.Errorf("kernel is double paused before checkpoint")
+			return false, fmt.Errorf("kernel is double paused before checkpoint")
 		}
 	}
 	sctx := k.SupervisorContext()
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+	if len(cudaProcs) == 0 {
+		if wasPaused {
+			k.Pause()
+		}
+		return false, nil
+	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
@@ -82,12 +88,12 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		for _, tg := range cudaProcs {
 			tg.SigsegvUnlock()
 		}
-		return err
+		return false, err
 	}
 	k.AddStateToCheckpoint(cudaCheckpointPathKey, o.CudaCheckpointPath)
 	k.AddStateToCheckpoint(cudaCheckpointSequentialKey, o.CudaCheckpointSequential)
 	k.AddStateToCheckpoint(cudaProcsKey, cudaProcs)
-	return nil
+	return true, nil
 }
 
 // cudaProcs returns a list of all CUDA processes in the sandbox. It selects

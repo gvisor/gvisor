@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"errors"
 	"fmt"
 	"math/bits"
 	"os"
@@ -117,8 +118,19 @@ const (
 
 // SaveAsync starts a goroutine to save the kernel. Implements kernel.Saver.
 func (l *Loader) SaveAsync() (err error) {
+	// A checkpoint hook may request a save. Reject it before consuming the
+	// donated files, since this save cannot start until the hook returns.
+	if !l.saveMu.TryLock() {
+		return linuxerr.EBUSY
+	}
+	saveMuCleanup := cleanup.Make(l.saveMu.Unlock)
+	defer saveMuCleanup.Clean()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.restoring.Load() || l.state.blocksCheckpoint() || l.checkpointResumePending.Load() {
+		return linuxerr.EBUSY
+	}
 
 	cu := cleanup.Make(func() {
 		// Save failed, unblock the callers as the workload will resume.
@@ -142,12 +154,13 @@ func (l *Loader) SaveAsync() (err error) {
 	}
 	l.saveFDs = nil
 
-	go func() {
-		_ = l.save(o)
-	}()
-	// Loader.save() takes over the responsibility of calling OnCheckpointAttempt() when
-	// it completes.
+	// Loader.saveLocked takes over saveMu and the responsibility of calling
+	// OnCheckpointAttempt when it completes.
 	cu.Release()
+	saveMuCleanup.Release()
+	go func() {
+		_ = l.saveLocked(o) // +checklocksforce: SaveAsync transferred saveMu.
+	}()
 
 	return nil
 }
@@ -716,9 +729,17 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	timeline.Reached("scheduled")
 
 	fail := func(err error) {
-		r.cm.onRestoreFailed(err)
 		log.Warningf("Killing the sandbox after restore failed: %v", err)
+		r.cm.onRestoreFailed(err)
 		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		// Release OCI pauses after queuing SIGKILL so the tasks can exit.
+		l := r.cm.l
+		l.pauseMu.Lock()
+		for l.ociPauseCount != 0 {
+			k.Unpause()
+			l.ociPauseCount--
+		}
+		l.pauseMu.Unlock()
 		r.cm.l.stopIfKilled()
 	}
 	// PostRestore may wait for an application hook. Observe page loading
@@ -755,9 +776,15 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 		return
 	}
 	timeline.Reached("post restore done")
+	// Background page loads can continue while guest tasks are paused. Open the
+	// pause gate before notifying waiters. Serialize checkpoint admission with
+	// the notification so a checkpoint cannot publish its result first.
+	r.cm.l.mu.Lock()
+	r.cm.l.restoring.Store(false)
 	// The saved count predates checkpoint completion. Increment it only
 	// after post-restore work succeeds.
 	k.IncCheckpointGenOnRestore()
+	r.cm.l.mu.Unlock()
 
 	if pageLoadResult != nil {
 		if err := <-pageLoadResult; err != nil {
@@ -890,38 +917,82 @@ func tscOffsetFromSnapshot(baseCycle, baseFreq, baseRealtime, curCycle, curRealt
 }
 
 func (l *Loader) save(o *controlapi.SaveOpts) error {
+	l.saveMu.Lock()
+	if l.restoreBlocksCheckpoint() {
+		l.saveMu.Unlock()
+		return fmt.Errorf("cannot checkpoint during restore: %w", linuxerr.EBUSY)
+	}
+	if l.checkpointResumePending.Load() {
+		err := fmt.Errorf("previous checkpoint preparation must resume before another checkpoint: %w", linuxerr.EBUSY)
+		l.k.OnCheckpointAttempt(err)
+		if len(o.SplitFSCheckpointPaths) > 0 {
+			l.k.SignalAllFSSaveWaiters(err)
+		}
+		l.saveMu.Unlock()
+		return err
+	}
+	return l.saveLocked(o)
+}
+
+// saveLocked converts the options and saves an admitted checkpoint. It takes
+// ownership of saveMu and releases it when checkpoint completion is published.
+//
+// +checklocksrelease:l.saveMu
+func (l *Loader) saveLocked(o *controlapi.SaveOpts) error {
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {
 		l.k.OnCheckpointAttempt(err)
 		if len(o.SplitFSCheckpointPaths) > 0 {
 			l.k.SignalAllFSSaveWaiters(err)
 		}
+		l.saveMu.Unlock()
 		return err
 	}
 	defer saveOpts.Close()
 
-	return l.saveWithOpts(saveOpts, &o.ExecOpts)
+	return l.saveWithOptsLocked(saveOpts, &o.ExecOpts)
 }
 
 // saveWithOpts saves the kernel with the given options.
-func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (err error) {
+func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) error {
 	// Fully serialize save operations, including post-save cleanup. See
 	// Loader.saveMu.
 	l.saveMu.Lock()
-	defer l.saveMu.Unlock()
+	if l.restoreBlocksCheckpoint() {
+		l.saveMu.Unlock()
+		return fmt.Errorf("cannot checkpoint during restore: %w", linuxerr.EBUSY)
+	}
+	return l.saveWithOptsLocked(saveOpts, execOpts)
+}
 
+// saveWithOptsLocked saves the kernel with the given options. It takes
+// ownership of saveMu and releases it when checkpoint completion is published.
+//
+// +checklocksrelease:l.saveMu
+func (l *Loader) saveWithOptsLocked(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (err error) {
 	hasFSSave := saveOpts.FSSaveOpts != nil
+	var prepared bool
 	defer func() {
 		// This closure is required to capture the final value of err.
-		if err == nil && saveOpts.Resume {
-			go l.postResume()
-		} else {
+		postResume := err == nil && saveOpts.Resume
+		if !postResume {
 			l.k.OnCheckpointAttempt(err)
 		}
 		if hasFSSave {
 			l.k.SignalAllFSSaveWaiters(err)
 		}
+		if postResume {
+			go func() {
+				defer l.saveMu.Unlock()
+				l.postResume(prepared)
+			}()
+		} else {
+			l.saveMu.Unlock()
+		}
 	}()
+	if l.checkpointResumePending.Load() {
+		return fmt.Errorf("previous checkpoint preparation must resume before another checkpoint: %w", linuxerr.EBUSY)
+	}
 
 	if saveOpts.Metadata == nil {
 		saveOpts.Metadata = make(map[string]string)
@@ -957,17 +1028,46 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	}
 
 	defer l.stopIfKilled()
-	return control.Save(l.k, l.watchdog, saveOpts, execOpts)
+	prepared, err = control.Save(l.k, l.watchdog, saveOpts, execOpts, l.withTPUPreparation)
+	if err != nil && prepared {
+		if resumeErr := l.runPostResume(true /* prepared */); resumeErr != nil {
+			err = errors.Join(err, resumeErr)
+		}
+	}
+	return err
+}
+
+// withTPUPreparation prevents OCI pause from freezing a TPU control exchange.
+func (l *Loader) withTPUPreparation(prepare func() (bool, error)) (bool, error) {
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	if l.ociPauseCount != 0 {
+		return false, fmt.Errorf("cannot prepare TPU checkpoint while OCI-paused: %w", linuxerr.EBUSY)
+	}
+	return prepare()
+}
+
+// runPostResume undoes the current or deferred checkpoint preparation.
+// An outstanding OCI pause defers cleanup to the last Resume.
+func (l *Loader) runPostResume(prepared bool) error {
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	if l.ociPauseCount != 0 {
+		if prepared {
+			l.checkpointResumePending.Store(true)
+		}
+		return nil
+	}
+	if !l.checkpointResumePending.Swap(false) && !prepared {
+		return nil
+	}
+	return control.PostResume(l.k, nil)
 }
 
 // postResume runs post-resume work and then completes the checkpoint attempt.
-func (l *Loader) postResume() {
-	err := control.PostResume(l.k, nil)
-	l.k.OnCheckpointAttempt(err)
-	if err != nil {
-		log.Warningf("Killing the sandbox after post resume work failed: %v", err)
-		l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
-	}
+func (l *Loader) postResume(prepared bool) {
+	defer l.stopIfKilled()
+	l.k.OnCheckpointAttempt(l.runPostResume(prepared))
 }
 
 func procFiles(conf *config.Config) []string {
