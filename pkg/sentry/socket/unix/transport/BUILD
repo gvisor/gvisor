@@ -77,6 +77,7 @@ go_library(
         "host_iovec.go",
         "host_sender_refs.go",
         "host_unsafe.go",
+        "msgbuf.go",
         "queue.go",
         "queue_mutex.go",
         "queue_refs.go",

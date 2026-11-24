@@ -20,6 +20,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -414,6 +415,38 @@ TEST_P(StreamUnixSocketPairTest, PeerWriteShutdownWakesRdHupOnlyPoller) {
       [peer] { ASSERT_THAT(shutdown(peer, SHUT_WR), SyscallSucceeds()); });
   EXPECT_EQ(res.ret, 1);
   EXPECT_EQ(res.revents, POLLRDHUP);
+}
+
+// A message that is partly read must stay intact while later writes arrive.
+TEST_P(StreamUnixSocketPairTest, PartialReadSurvivesLaterWrites) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+  constexpr size_t kMsg = 33000;
+  constexpr size_t kMsgs = 6;
+  // The first read ends in the middle of the second message.
+  constexpr size_t kPartial = 50000;
+  std::vector<char> want(kMsgs * kMsg);
+  std::vector<char> got(want.size());
+
+  // Message buffers may be reused in any order, so try several rounds.
+  for (int round = 0; round < 50; round++) {
+    for (size_t i = 0; i < kMsgs; i++) {
+      std::fill_n(want.begin() + i * kMsg, kMsg, 'a' + (round + i) % 26);
+    }
+    for (size_t i = 0; i < 4; i++) {
+      ASSERT_THAT(WriteFd(sockets->first_fd(), want.data() + i * kMsg, kMsg),
+                  SyscallSucceedsWithValue(kMsg));
+    }
+    ASSERT_THAT(ReadFd(sockets->second_fd(), got.data(), kPartial),
+                SyscallSucceedsWithValue(kPartial));
+    for (size_t i = 4; i < kMsgs; i++) {
+      ASSERT_THAT(WriteFd(sockets->first_fd(), want.data() + i * kMsg, kMsg),
+                  SyscallSucceedsWithValue(kMsg));
+    }
+    ASSERT_THAT(ReadFd(sockets->second_fd(), got.data() + kPartial,
+                       got.size() - kPartial),
+                SyscallSucceedsWithValue(got.size() - kPartial));
+    ASSERT_EQ(memcmp(got.data(), want.data(), got.size()), 0);
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(
