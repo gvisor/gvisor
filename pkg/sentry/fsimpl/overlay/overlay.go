@@ -755,6 +755,11 @@ type dentry struct {
 	children map[string]*dentry
 	dirents  []vfs.Dirent
 
+	// direntsFDs is the number of directoryFDs holding dirents. dirents is nil
+	// when it is zero, so a listing does not outlive the FDs that read it.
+	// direntsFDs is protected by dirMu.
+	direntsFDs int
+
 	// direntsStale is set without dirMu when copy-up changes a child's inode
 	// number; getDirentsLocked then rebuilds dirents.
 	direntsStale atomicbitops.Bool

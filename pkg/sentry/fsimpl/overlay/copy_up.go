@@ -527,6 +527,10 @@ func (d *dentry) copyUpDescendantsLocked(ctx context.Context, ds **[]*dentry) er
 	if err != nil {
 		return err
 	}
+	if d.direntsFDs == 0 {
+		// No directoryFD holds the listing, so it must not stay cached.
+		d.dirents = nil
+	}
 	for _, dirent := range dirents {
 		if dirent.Name == "." || dirent.Name == ".." {
 			continue
