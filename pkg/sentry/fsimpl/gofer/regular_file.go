@@ -750,9 +750,17 @@ func (d *dentry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR,
 
 // Translate implements memmap.Mappable.Translate.
 func (d *dentry) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
-	d.inode.handleMu.RLock()
+	// handleMu writers may hold it across an RPC to the gofer, as may
+	// translationFault.Wait while a writer waits for it. Wait for them in
+	// translationFault.Wait, without the caller's MM locks.
+	if !d.inode.handleMu.TryRLock() {
+		if memmap.TranslationFaultsAllowed(ctx) {
+			return nil, &translationFault{d: d, required: required, optional: optional}
+		}
+		d.inode.handleMu.RLock()
+	}
 	defer d.inode.handleMu.RUnlock()
-	if d.inode.mmapFD.RacyLoad() >= 0 && !d.inode.fs.opts.forcePageCache {
+	if d.inode.translatesHostFD() {
 		mr := optional
 		if d.inode.fs.opts.limitHostFDTranslation {
 			mr = maxFillRange(required, optional)
@@ -766,9 +774,26 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 			},
 		}, nil
 	}
+	return d.translateCacheLocked(ctx, required, optional, at)
+}
 
-	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
-	d.inode.dataMu.Lock()
+// translateCacheLocked implements Translate for files mapped through
+// d.inode.cache.
+//
+// Preconditions: d.inode.handleMu must be locked.
+func (d *dentry) translateCacheLocked(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	// Without a host FD, filling the cache is an RPC to the gofer, and a
+	// dataMu holder may be filling it. Like Linux's filemap_fault() dropping
+	// mmap_lock for I/O and returning VM_FAULT_RETRY, translate only the
+	// cached prefix and let the caller wait or fill the rest through
+	// translationFault.Wait without its MM locks.
+	h := d.inode.readHandle()
+	if !d.inode.dataMu.TryLock() {
+		if h.fd < 0 && memmap.TranslationFaultsAllowed(ctx) {
+			return nil, &translationFault{d: d, required: required, optional: optional}
+		}
+		d.inode.dataMu.Lock()
+	}
 	defer d.inode.dataMu.Unlock()
 
 	// Constrain translations to d.inode.size (rounded up) to prevent translation to
@@ -786,14 +811,15 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		optional.End = pgend
 	}
 
-	mf := d.inode.fs.mf
-	h := d.inode.readHandle()
-	_, cerr := d.inode.cache.Fill(ctx, required, maxFillRange(required, optional), d.inode.size.Load(), mf, pgalloc.AllocOpts{
-		Kind:    usage.PageCache,
-		MemCgID: memCgID,
-		Mode:    pgalloc.AllocateAndWritePopulate,
-	}, h.readToBlocksAt)
+	// Filling does nothing if required is already cached.
+	var cerr error
+	cached := d.inode.cache.SpanRange(required) == required.Length()
+	deferFill := !cached && h.fd < 0 && memmap.TranslationFaultsAllowed(ctx)
+	if !cached && !deferFill {
+		cerr = d.fillCacheLocked(ctx, h, required, optional)
+	}
 
+	mf := d.inode.fs.mf
 	var ts []memmap.Translation
 	var translatedEnd uint64
 	for seg := d.inode.cache.FindSegment(required.Start); seg.Ok() && seg.Start() < required.End; seg, _ = seg.NextNonEmpty() {
@@ -816,6 +842,9 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		translatedEnd = segMR.End
 	}
 
+	if deferFill {
+		return ts, &translationFault{d: d, required: required, optional: optional}
+	}
 	// Don't return the error returned by c.cache.Fill if it occurred outside
 	// of required.
 	if translatedEnd < required.End && cerr != nil {
@@ -825,6 +854,72 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		return ts, &memmap.BusError{io.EOF}
 	}
 	return ts, nil
+}
+
+// fillCacheLocked reads the uncached parts of required, and of optional up to
+// the readahead limit, into d.inode.cache from h.
+//
+// Preconditions:
+//   - d.inode.handleMu must be locked.
+//   - d.inode.dataMu must be locked for writing.
+func (d *dentry) fillCacheLocked(ctx context.Context, h handle, required, optional memmap.MappableRange) error {
+	_, err := d.inode.cache.Fill(ctx, required, maxFillRange(required, optional), d.inode.size.Load(), d.inode.fs.mf, pgalloc.AllocOpts{
+		Kind:    usage.PageCache,
+		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
+		Mode:    pgalloc.AllocateAndWritePopulate,
+	}, h.readToBlocksAt)
+	return err
+}
+
+// translatesHostFD returns true if Translate maps i.mmapFD rather than the
+// page cache.
+//
+// Preconditions: i.handleMu must be locked.
+func (i *inode) translatesHostFD() bool {
+	return i.mmapFD.RacyLoad() >= 0 && !i.fs.opts.forcePageCache
+}
+
+// translationFault is returned by dentry.Translate when translating the
+// required range would wait for an RPC to the gofer: a page cache fill, or a
+// concurrent holder of handleMu or dataMu.
+type translationFault struct {
+	d        *dentry
+	required memmap.MappableRange
+	optional memmap.MappableRange
+}
+
+// Error implements error.Error.
+func (*translationFault) Error() string {
+	return "gofer page cache fill required"
+}
+
+// Wait implements memmap.TranslationFault.Wait. lisafs reads can't be
+// cancelled, so Wait is uninterruptible even if interruptible is true.
+func (f *translationFault) Wait(ctx context.Context, interruptible bool) error {
+	d := f.d
+	d.inode.handleMu.RLock()
+	defer d.inode.handleMu.RUnlock()
+	if d.inode.translatesHostFD() {
+		return nil
+	}
+	d.inode.dataMu.Lock()
+	defer d.inode.dataMu.Unlock()
+
+	// The file may have been truncated since Translate. Fill reads only the
+	// parts of required and optional that are still uncached.
+	required, optional := f.required, f.optional
+	pgend, _ := hostarch.PageRoundUp(d.inode.size.Load())
+	if required.Start >= pgend {
+		return &memmap.BusError{io.EOF}
+	}
+	required.End = min(required.End, pgend)
+	optional.End = min(optional.End, pgend)
+
+	// As in Translate, ignore errors outside of required.
+	if err := d.fillCacheLocked(ctx, d.inode.readHandle(), required, optional); err != nil && d.inode.cache.SpanRange(required) != required.Length() {
+		return &memmap.BusError{err}
+	}
+	return nil
 }
 
 func maxFillRange(required, optional memmap.MappableRange) memmap.MappableRange {

@@ -92,6 +92,11 @@ type Mappable interface {
 	//		synchronize with invalidation.
 	//
 	// Postconditions: See CheckTranslateResult.
+	//
+	// A TranslationFault indicates temporarily unavailable backing. The caller
+	// must release MM locks before Wait, then revalidate mappings and retry.
+	// Translate must not return a TranslationFault if
+	// TranslationFaultsAllowed(ctx) is false.
 	Translate(ctx context.Context, required, optional MappableRange, at hostarch.AccessType) ([]Translation, error)
 
 	// MayUseHugepages returns true if hugepage-aligned ranges in the Mappable
@@ -120,6 +125,37 @@ type Translation struct {
 	// Perms is the set of permissions for which platform.AddressSpace.MapFile
 	// and platform.AddressSpace.MapInternal on this Translation is permitted.
 	Perms hostarch.AccessType
+}
+
+// TranslationFault is a transient Translate error, possibly following an
+// available prefix. Translate must not start acquisition or wait for it.
+// Wait starts or joins acquisition without MM locks. User faults may wait
+// interruptibly; kernel-side memory access must finish the wait without exposing
+// ordinary signal interruption to the syscall.
+// On success, the caller must revalidate its VMAs and retry translation; saved
+// iterators and translations cannot be reused across the wait. On failure, Wait
+// returns the acquisition error, or linuxerr.ErrInterrupted if interruptible.
+type TranslationFault interface {
+	error
+	// Wait must not return linuxerr.ErrInterrupted when interruptible is false.
+	Wait(ctx context.Context, interruptible bool) error
+}
+
+// noTranslationFaultsKey is the context.Context.Value key set by
+// WithoutTranslationFaults.
+type noTranslationFaultsKey struct{}
+
+// WithoutTranslationFaults returns a context derived from ctx in which
+// Mappable.Translate must obtain the required range itself, blocking if
+// necessary, rather than return a TranslationFault.
+func WithoutTranslationFaults(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noTranslationFaultsKey{}, true)
+}
+
+// TranslationFaultsAllowed returns false if Mappable.Translate must not return
+// a TranslationFault for ctx.
+func TranslationFaultsAllowed(ctx context.Context) bool {
+	return ctx.Value(noTranslationFaultsKey{}) == nil
 }
 
 // FileRange returns the FileRange represented by t.
