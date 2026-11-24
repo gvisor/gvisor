@@ -1128,9 +1128,6 @@ TEST(NetlinkRouteTest, AddAndRemoveAddr) {
 TEST(NetlinkRouteTest, LinkedToNetns) {
   SKIP_IF(IsRunningWithHostinet());
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
-  // Don't do cooperative save/restore because netstack state is not restored.
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   FileDescriptor root_netns_nlsk =
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
@@ -1666,7 +1663,6 @@ TEST(NetlinkRouteTest, GetRoutePrefSrc) {
 TEST(NetlinkRouteTest, GetRouteUnreachable) {
   SKIP_IF(IsRunningWithHostinet());
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
-  const DisableSave ds;
 
   const FileDescriptor nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -1734,7 +1730,8 @@ TEST_P(NetlinkRouteIpInvariantTest, NewRoute) {
   // CAP_NET_ADMIN is required to modify the routing table.
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(!IsRunningOnGvisor());
-  // Routes are not savable.
+  // Restore rebuilds root namespace routes and addresses from the sandbox
+  // network configuration.
   DisableSave ds;
 
   const std::string dst_v4_address = "192.0.2.0";
@@ -1831,7 +1828,8 @@ TEST_P(NetlinkRouteIpInvariantTest, DeleteRoute) {
   // CAP_NET_ADMIN is required to modify the routing table.
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(!IsRunningOnGvisor());
-  // Routes are not savable.
+  // Restore rebuilds root namespace routes and addresses from the sandbox
+  // network configuration.
   DisableSave ds;
 
   const std::string dst_v4_address = "192.0.3.0";
@@ -1974,7 +1972,8 @@ TEST_P(NetlinkRouteIpInvariantTest, DumpFiltersFamily) {
 TEST_P(NetlinkRouteIpInvariantTest, GetRouteDumpOrder) {
   const int family = GetParam();
   const int addr_len = family == AF_INET ? 4 : 16;
-  // Routes are not savable.
+  // Restore rebuilds root namespace routes and addresses from the sandbox
+  // network configuration.
   DisableSave ds;
 
   std::vector<Cleanup> route_cleanups;
@@ -3761,8 +3760,6 @@ TEST(NetlinkRouteTest, VethAdd) {
 TEST(NetlinkRouteTest, DeleteRouteRemovesFirstMatchOnly) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // Routes are not savable.
-  DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -3859,7 +3856,6 @@ TEST(NetlinkRouteTest, DeleteRouteRemovesFirstMatchOnly) {
 TEST(NetlinkRouteTest, VethOperStateUpWhenBothEndsUp) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4085,8 +4081,6 @@ PosixError WaitBindable(const struct sockaddr_in6& addr) {
 TEST(NetlinkRouteTest, VethLinkLocalAddrOnUpDown) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4172,7 +4166,6 @@ TEST(NetlinkRouteTest, BridgeAddUnnamed) {
 TEST(NetlinkRouteTest, LinkInfoKind) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4299,8 +4292,6 @@ TEST(NetlinkRouteTest, NewRouteGatewayNotOnLink) {
 TEST(NetlinkRouteTest, NewRouteGatewayOnLink) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4380,7 +4371,6 @@ TEST(NetlinkRouteTest, NewRouteGatewayOnOtherLink) {
 TEST(NetlinkRouteTest, NewRouteLinkLocalGateway) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4432,7 +4422,6 @@ PosixError AddNoDadAddr(FileDescriptor& fd, int index, int family,
 TEST_P(NetlinkRouteIpInvariantTest, NewRouteWithoutOif) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4491,7 +4480,6 @@ TEST_P(NetlinkRouteIpInvariantTest, NewRouteWithoutOif) {
 TEST_P(NetlinkRouteIpInvariantTest, NewRouteViaAddress) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4540,7 +4528,6 @@ TEST_P(NetlinkRouteIpInvariantTest, NewRouteViaAddress) {
 TEST_P(NetlinkRouteIpInvariantTest, NewRouteLowestIndex) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -4731,8 +4718,6 @@ struct NetNSRequest GetNetNSRequest(uint32_t seq, int if_index, int ns_fd) {
 TEST(NetlinkRouteTest, ChangeNetnsAndOtherAttrsTogether) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   // Running the test in an ephemeral netns allows it to not interfere with
   // other tests that also want to create veth pairs with the same names.
@@ -5077,7 +5062,8 @@ PosixErrorOr<McastObservers> MakeMcastObservers(unsigned int bind_groups,
 TEST_P(NetlinkRouteIpInvariantTest, AddressMulticastGroup) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // Netstack state is not restored.
+  // Restore rebuilds root namespace routes and addresses from the sandbox
+  // network configuration.
   const DisableSave ds;
 
   const int family = GetParam();
@@ -5160,7 +5146,8 @@ TEST_P(NetlinkRouteIpInvariantTest, AddressMulticastGroup) {
 TEST_P(NetlinkRouteIpInvariantTest, AddressPrefixRouteMulticastGroup) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // Netstack state is not restored.
+  // Restore rebuilds root namespace routes and addresses from the sandbox
+  // network configuration.
   const DisableSave ds;
 
   const int family = GetParam();
@@ -5221,7 +5208,8 @@ TEST_P(NetlinkRouteIpInvariantTest, AddressPrefixRouteMulticastGroup) {
 TEST_P(NetlinkRouteIpInvariantTest, RouteMulticastGroup) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // Routes are not savable.
+  // Restore rebuilds root namespace routes and addresses from the sandbox
+  // network configuration.
   const DisableSave ds;
 
   const int family = GetParam();
@@ -5290,8 +5278,6 @@ TEST_P(NetlinkRouteIpInvariantTest, RouteMulticastGroup) {
 TEST(NetlinkRouteTest, LinkDownIPv6MulticastGroups) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   const FileDescriptor curr_nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -5354,8 +5340,6 @@ PosixErrorOr<std::pair<int, int>> UpVethPair() {
 TEST_P(NetlinkRouteIpInvariantTest, RouteMulticastGroupSameDestination) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // Routes are not savable.
-  const DisableSave ds;
 
   const FileDescriptor nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -5404,8 +5388,6 @@ TEST_P(NetlinkRouteIpInvariantTest, RouteMulticastGroupSameDestination) {
 TEST_P(NetlinkRouteIpInvariantTest, RouteMulticastGroupReplace) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // Routes are not savable.
-  const DisableSave ds;
 
   const FileDescriptor nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
@@ -5452,8 +5434,6 @@ TEST_P(NetlinkRouteIpInvariantTest, RouteMulticastGroupReplace) {
 TEST(NetlinkRouteTest, LinkMulticastGroupNamespaced) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   SKIP_IF(IsRunningWithHostinet());
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   // Running the test in an ephemeral netns allows it to not interfere with
   // other tests that also want to create veth pairs with the same names.

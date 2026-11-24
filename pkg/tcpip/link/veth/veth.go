@@ -16,6 +16,10 @@
 package veth
 
 import (
+	"context"
+	"fmt"
+
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -24,8 +28,18 @@ import (
 // DefaultBacklogSize is the default size of a veth device's buffer.
 const DefaultBacklogSize = 1000
 
+// MaxBacklogSize is the largest backlog size of a veth device.
+const MaxBacklogSize = DefaultBacklogSize
+
 var _ stack.LinkEndpoint = (*Endpoint)(nil)
+var _ stack.PausableLinkEndpoint = (*Endpoint)(nil)
 var _ stack.GSOEndpoint = (*Endpoint)(nil)
+
+// +stateify savable
+type savedVethBacklog struct {
+	packets  []vethPacket
+	capacity int
+}
 
 // +stateify savable
 type veth struct {
@@ -34,7 +48,20 @@ type veth struct {
 	// +checklocks:mu
 	closed bool
 
-	backlogQueue chan vethPacket `state:"nosave"`
+	// paused is true once a stop is requested for the current worker. The
+	// worker can still run until it receives the stop packet and wg.Wait
+	// returns.
+	//
+	// +checklocks:mu
+	paused bool `state:"nosave"`
+
+	// backlogQueue holds packets for the worker to deliver. A vethPacket with
+	// a nil e is a stop packet: the worker exits when it receives one. At most
+	// one stop packet exists per worker. backlogQueue is never closed.
+	//
+	// +checklocks:mu
+	backlogQueue chan vethPacket `state:".(savedVethBacklog)"`
+	wg           sync.WaitGroup  `state:"nosave"`
 
 	// +checklocks:mu
 	mtu uint32
@@ -42,18 +69,140 @@ type veth struct {
 	endpoints [2]Endpoint
 }
 
-// close shuts down both endpoints, invoking close callbacks after unlocking.
+func (v *veth) worker(ch <-chan vethPacket) {
+	defer v.wg.Done()
+	for t := range ch {
+		if t.e == nil {
+			return
+		}
+		t.e.InjectInbound(t.protocol, t.pkt)
+		t.pkt.DecRef()
+	}
+}
+
+// stopWorker sends a stop packet to the worker through q. q is
+// v.backlogQueue, which the caller reads while it holds v.mu, because the send
+// must not hold v.mu. The send blocks until the queue has space. When the queue is
+// full, the Go runtime gives the next free slot to a blocked send before any
+// non-blocking send in WritePackets, so WritePackets cannot starve it. The
+// worker delivers the packets that are ahead of the stop packet and then
+// exits. Packets behind the stop packet stay in the queue.
 //
-// The caller must not hold either endpoint's mutex. checklocks cannot name
-// those mutexes through the endpoints array.
+// The caller must set v.paused before it calls stopWorker.
+//
+// +checklocksexclude:v.mu
+func (v *veth) stopWorker(q chan<- vethPacket) {
+	q <- vethPacket{}
+}
+
+// pause stops the worker goroutine and waits for it to exit. The worker first
+// delivers the packets that are ahead of the stop packet, unless close
+// discards them.
+//
+// Callers must not hold any lock that the inbound delivery path can acquire
+// (such as Stack.mu or BridgeEndpoint.mu), and pause must not run concurrently
+// with resume (otherwise resume could start a second worker that receives the
+// stop packet, so that the first worker never exits and pause blocks
+// indefinitely).
+//
+// +checklocksexclude:v.mu
+func (v *veth) pause() {
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return
+	}
+	stop := !v.paused
+	v.paused = true
+	q := v.backlogQueue
+	v.mu.Unlock()
+
+	if stop {
+		v.stopWorker(q)
+	}
+	v.wg.Wait()
+}
+
+// resume starts a new worker goroutine to drain backlogQueue.
+//
+// resume must not run concurrently with pause; see pause.
+//
+// +checklocksexclude:v.mu
+func (v *veth) resume() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed || !v.paused {
+		return
+	}
+	v.paused = false
+	v.wg.Add(1)
+	go v.worker(v.backlogQueue)
+}
+
+// takeQueued removes and returns the packets in backlogQueue without blocking.
+// It is safe to call while the worker runs.
+//
+// +checklocks:v.mu
+func (v *veth) takeQueued() []vethPacket {
+	var queued []vethPacket
+	for {
+		select {
+		case t := <-v.backlogQueue:
+			queued = append(queued, t)
+		default:
+			return queued
+		}
+	}
+}
+
+// discardQueue removes all packets from backlogQueue and releases them. It
+// returns true if it removed a stop packet.
+//
+// +checklocks:v.mu
+func (v *veth) discardQueue() bool {
+	removedStop := false
+	for _, t := range v.takeQueued() {
+		if t.e == nil {
+			removedStop = true
+			continue
+		}
+		t.pkt.DecRef()
+	}
+	return removedStop
+}
+
+// close shuts down both endpoints, waiting for the worker goroutine to exit,
+// discarding queued packets, and invoking close callbacks.
+//
+// Because close blocks on v.wg.Wait until the worker exits, the caller must
+// not hold any lock that the inbound delivery path can acquire (such as
+// Stack.mu or BridgeEndpoint.mu), nor either endpoint's mutex. checklocks
+// cannot name the endpoint mutexes through the endpoints array.
 //
 // +checklocksexclude:v.mu
 func (v *veth) close() {
 	v.mu.Lock()
-	closed := v.closed
-	v.closed = true
+	alreadyClosed := v.closed
+	stop := false
+	if !alreadyClosed {
+		v.closed = true
+		// WritePackets cannot add packets after closed is set. Discard the
+		// queued packets so that the worker does not deliver them. If a
+		// concurrent pause already sent its stop packet, it can be among the
+		// discarded packets, so send a new one.
+		removedStop := v.discardQueue()
+		stop = !v.paused || removedStop
+		v.paused = true
+	}
+	q := v.backlogQueue
 	v.mu.Unlock()
-	if closed {
+
+	if stop {
+		v.stopWorker(q)
+	}
+	v.wg.Wait()
+
+	if alreadyClosed {
 		return
 	}
 
@@ -67,7 +216,56 @@ func (v *veth) close() {
 			action()
 		}
 	}
-	close(v.backlogQueue)
+}
+
+// saveBacklogQueue saves the queued packets. pause or close must have returned
+// before saveBacklogQueue is called, so that no stop packet is queued or being
+// sent. If this is true, saveBacklogQueue takes at most cap(v.backlogQueue)
+// packets, so the sends that put them back do not block.
+//
+// +checklocksexclude:v.mu
+func (v *veth) saveBacklogQueue() savedVethBacklog {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	sb := savedVethBacklog{
+		capacity: cap(v.backlogQueue),
+	}
+	for _, t := range v.takeQueued() {
+		if t.e == nil {
+			panic("veth: save while a worker stop is pending")
+		}
+		v.backlogQueue <- t
+		sb.packets = append(sb.packets, t)
+	}
+	return sb
+}
+
+// +checklocksexclude:v.mu
+func (v *veth) loadBacklogQueue(_ context.Context, sb savedVethBacklog) {
+	if sb.capacity < 0 || sb.capacity > MaxBacklogSize || len(sb.packets) > sb.capacity {
+		panic(fmt.Sprintf("invalid saved veth backlog: %d packets, capacity %d", len(sb.packets), sb.capacity))
+	}
+	for i, t := range sb.packets {
+		if t.e == nil || t.pkt == nil {
+			panic(fmt.Sprintf("invalid saved veth backlog: packet %d has no endpoint or no packet buffer", i))
+		}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.backlogQueue = make(chan vethPacket, sb.capacity)
+	for _, t := range sb.packets {
+		v.backlogQueue <- t
+	}
+}
+
+// afterLoad is invoked by stateify.
+//
+// +checklocksexclude:v.mu
+func (v *veth) afterLoad(context.Context) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.paused = true
 }
 
 // +stateify savable
@@ -96,10 +294,13 @@ type Endpoint struct {
 	onCloseAction func() `state:"nosave"`
 }
 
-// NewPair creates a new veth pair.
+// NewPair creates a new veth pair. A backlogQueueSize larger than
+// MaxBacklogSize is clamped to MaxBacklogSize.
 func NewPair(mtu, backlogQueueSize uint32) (*Endpoint, *Endpoint) {
-	veth := veth{
-		backlogQueue: make(chan vethPacket, backlogQueueSize),
+	backlogQueueSize = min(backlogQueueSize, MaxBacklogSize)
+	q := make(chan vethPacket, backlogQueueSize)
+	v := &veth{
+		backlogQueue: q,
 		mtu:          mtu,
 		endpoints: [2]Endpoint{
 			{
@@ -110,24 +311,22 @@ func NewPair(mtu, backlogQueueSize uint32) (*Endpoint, *Endpoint) {
 			},
 		},
 	}
-	a := &veth.endpoints[0]
-	b := &veth.endpoints[1]
+	a := &v.endpoints[0]
+	b := &v.endpoints[1]
 	a.peer = b
 	b.peer = a
-	a.veth = &veth
-	b.veth = &veth
-	go func() {
-		for t := range veth.backlogQueue {
-			t.e.InjectInbound(t.protocol, t.pkt)
-			t.pkt.DecRef()
-		}
-
-	}()
+	a.veth = v
+	b.veth = v
+	v.wg.Add(1)
+	go v.worker(q)
 	return a, b
 }
 
-// Close closes e. Further packet injections will return an error, and all pending
-// packets are discarded. Close may be called concurrently with WritePackets.
+// Close closes e. Further packet injections will return an error, and all
+// pending packets are discarded. Close may be called concurrently with
+// WritePackets, and blocks until the background worker finishes any in-flight
+// InjectInbound delivery, so callers must not hold locks that inbound delivery
+// can acquire (such as Stack.mu or BridgeEndpoint.mu).
 //
 // +checklocksexclude:e.veth.mu
 // +checklocksexclude:e.mu
@@ -266,8 +465,21 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	return n, nil
 }
 
-// Wait implements stack.LinkEndpoint.Wait.
-func (*Endpoint) Wait() {}
+// Wait implements stack.LinkEndpoint.Wait. It blocks until close or pause
+// exits the worker.
+func (e *Endpoint) Wait() {
+	e.veth.wg.Wait()
+}
+
+// Pause implements stack.PausableLinkEndpoint.Pause.
+func (e *Endpoint) Pause() {
+	e.veth.pause()
+}
+
+// Resume implements stack.PausableLinkEndpoint.Resume.
+func (e *Endpoint) Resume() {
+	e.veth.resume()
+}
 
 // ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
 func (*Endpoint) ARPHardwareType() header.ARPHardwareType {

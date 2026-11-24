@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -38,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/nftables"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
@@ -126,14 +128,22 @@ func (s *Stack) sendRouteEvent(ctx context.Context, rt tcpip.Route, added bool, 
 
 // Destroy implements inet.Stack.Destroy.
 func (s *Stack) Destroy() {
-	if s.Stack != nil {
-		s.Stack.Close()
-		refs.CleanupSync.Add(1)
-		go func() {
-			s.Stack.Wait()
-			refs.CleanupSync.Done()
-		}()
+	s.DestroyAsync(func() {})
+}
+
+// DestroyAsync implements inet.AsyncDestroyer.DestroyAsync.
+func (s *Stack) DestroyAsync(done func()) {
+	if s.Stack == nil {
+		done()
+		return
 	}
+	s.Stack.Close()
+	refs.CleanupSync.Add(1)
+	go func() {
+		s.Stack.Wait()
+		done()
+		refs.CleanupSync.Done()
+	}()
 }
 
 // SupportsIPv6 implements Stack.SupportsIPv6.
@@ -361,9 +371,24 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 		dst = dstNs.Stack().(*Stack)
 	}
 	if dst != src {
+		// stack.Stack.SetNICStack does not move a loopback or bridge
+		// device. Check it here first to return the Linux errno before
+		// any other change.
+		if nicInfo.Flags.Loopback || nicInfo.Kind == stack.NICKindBridge {
+			return syserr.ErrInvalidArgument
+		}
+		// The device keeps its name in the move if the name is free in
+		// dst. Otherwise it gets the IFLA_IFNAME name, if any, in the move.
+		// nicInfo is read again after the move, so the IFLA_IFNAME case
+		// below renames the device only if it kept its name.
 		var err tcpip.Error
 		oldID := id
-		id, err = src.Stack.SetNICStack(id, dst.Stack)
+		id, err = src.Stack.SetNICStack(oldID, dst.Stack, "")
+		if _, dup := err.(*tcpip.ErrDuplicateNICID); dup {
+			if v, ok := linkAttrs[linux.IFLA_IFNAME]; ok {
+				id, err = src.Stack.SetNICStack(oldID, dst.Stack, v.String())
+			}
+		}
 		if err != nil {
 			return syserr.TranslateNetstackError(err)
 		}
@@ -376,6 +401,12 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 			// Because we hold dst.linkMu, this should never happen.
 			ctx.Warningf("Newly rehomed NIC %d not found in new stack %p", id, dst.Stack)
 			return syserr.ErrUnknownNICID
+		}
+		if setFlags {
+			var flagErr *syserr.Error
+			if want, flagErr = combineLinkFlags(nicInfo.Flags, flags, change); flagErr != nil {
+				return flagErr
+			}
 		}
 		src = dst
 
@@ -755,13 +786,14 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	id := s.Stack.NextNICID()
 	peerID := peerStack.Stack.NextNICID()
 	if ifname == "" {
-		ifname = s.allocDeviceName("veth", dstNs)
+		ifname = s.allocDeviceName(stack.NICKindVeth, dstNs)
 	}
 	// Linux's veth_setup uses ether_setup, which sets IFF_MULTICAST.
 	err := s.Stack.CreateNICWithOptions(id, packetsocket.New(ethernet.NewWithNetworkMTU(ep)), stack.NICOptions{
 		Name:      ifname,
-		Kind:      "veth",
+		Kind:      stack.NICKindVeth,
 		Multicast: true,
+		Preserve:  true,
 	})
 	if err != nil {
 		s.unlockSrcAndDst(ctx, dstNs)
@@ -783,13 +815,14 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	defer peerStack.unlockSrcAndDst(ctx, peerDstNs)
 
 	if peerName == "" {
-		peerName = peerStack.allocDeviceName("veth", peerDstNs)
+		peerName = peerStack.allocDeviceName(stack.NICKindVeth, peerDstNs)
 	}
 
 	err = peerStack.Stack.CreateNICWithOptions(peerID, packetsocket.New(ethernet.NewWithNetworkMTU(peerEP)), stack.NICOptions{
 		Name:      peerName,
-		Kind:      "veth",
+		Kind:      stack.NICKindVeth,
 		Multicast: true,
+		Preserve:  true,
 	})
 	if err != nil {
 		peerEP.Close()
@@ -819,15 +852,16 @@ func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesV
 		ifname = v.String()
 	}
 	if ifname == "" {
-		ifname = s.allocDeviceName("bridge", dstNs)
+		ifname = s.allocDeviceName(stack.NICKindBridge, dstNs)
 	}
 	ep := stack.NewBridgeEndpoint(defaultMTU)
 	id := s.Stack.NextNICID()
 	// Linux's br_dev_setup also inherits IFF_MULTICAST from ether_setup.
 	err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{
 		Name:      ifname,
-		Kind:      "bridge",
+		Kind:      stack.NICKindBridge,
 		Multicast: true,
+		Preserve:  true,
 	})
 	if err != nil {
 		return syserr.TranslateNetstackError(err)
@@ -868,9 +902,9 @@ func (s *Stack) newInterface(ctx context.Context, msg *nlmsg.Message, linkAttrs 
 	switch kind {
 	case "":
 		return syserr.ErrInvalidArgument
-	case "bridge":
+	case stack.NICKindBridge:
 		return s.newBridge(ctx, linkAttrs, linkInfoAttrs)
-	case "veth":
+	case stack.NICKindVeth:
 		return s.newVeth(ctx, linkAttrs, linkInfoAttrs)
 	}
 	return syserr.ErrNotSupported
@@ -1620,9 +1654,91 @@ func (s *Stack) Pause() {
 	s.Stack.Pause()
 }
 
-// Restore implements inet.Stack.Restore.
-func (s *Stack) Restore() {
-	s.Stack.Restore()
+// InitDefaultTables initializes default Linux iptables and nftables on s.Stack
+// if they have not already been initialized.
+func (s *Stack) InitDefaultTables() {
+	if s.Stack.IPTables() == nil {
+		s.Stack.SetIPTables(netfilter.DefaultLinuxTables(s.Stack.Clock(), s.Stack.InsecureRNG()))
+	}
+	if s.Stack.NFTables() == nil && nftables.IsNFTablesEnabled() {
+		s.Stack.SetNFTables(nftables.NewNFTables(s.Stack, s.Stack.Clock(), s.Stack.SecureRNG()))
+	}
+}
+
+// CheckRestorable implements inet.Stack.CheckRestorable.
+//
+// Restore installs the default tables in every stack and keeps only preserved
+// NICs. Restore recreates the other root NICs from the sandbox network
+// configuration. Thus CheckRestorable returns an error if:
+//   - a non-root stack has a NIC that is not preserved and not loopback;
+//     restore would move such a NIC to the root stack.
+//   - a preserved NIC, such as a bridge, has a port NIC that is not preserved;
+//     restore would remove the port.
+//   - a non-root stack has modified rules.
+//   - the root stack has modified rules that can filter packets and a
+//     preserved NIC other than loopback or tun.
+//
+// In the root stack, iptables NAT rules that do not filter packets (see
+// netfilter.NATTableCanFilter), for example SNAT rules that give containers
+// external access, are lost on restore without an error, as are modified
+// rules when the only preserved NICs are tun NICs. The check allows this, so
+// that such checkpoints continue to work.
+func (s *Stack) CheckRestorable(isRoot bool) error {
+	if !isRoot && s.Stack.HasUnpreservedNICOtherThanLoopback() {
+		return fmt.Errorf("a non-root network namespace has a network device from the sandbox network configuration: checkpoints cannot restore it in that namespace")
+	}
+	if s.Stack.HasPreservedBridgeWithUnpreservedPort() {
+		return fmt.Errorf("a bridge has a port from the sandbox network configuration: checkpoints cannot restore the port")
+	}
+	if !s.Stack.HasModifiedFilterRules() {
+		return nil
+	}
+	if !isRoot {
+		return fmt.Errorf("a non-root network namespace has modified iptables or nftables rules: checkpoints do not save these rules")
+	}
+	if s.rootRulesCanFilter() && s.Stack.HasPreservedNICOtherThanLoopbackOrTun() {
+		return fmt.Errorf("the root network namespace has modified iptables or nftables rules that can filter packets, and veth or bridge devices: checkpoints do not save these rules")
+	}
+	return nil
+}
+
+// rootRulesCanFilter reports whether s has nftables rules, a replaced
+// iptables table other than the NAT table, or a replaced NAT table that can
+// filter packets (see netfilter.NATTableCanFilter).
+func (s *Stack) rootRulesCanFilter() bool {
+	if s.Stack.IsNFTablesConfigured() {
+		return true
+	}
+	tables := s.Stack.IPTables()
+	if tables == nil {
+		return false
+	}
+	for id := stack.TableID(0); id < stack.NumTables; id++ {
+		if !tables.TableModified(id) {
+			continue
+		}
+		if id != stack.NATID {
+			return true
+		}
+		if netfilter.NATTableCanFilter(tables.GetTable(id, false /* ipv6 */)) || netfilter.NATTableCanFilter(tables.GetTable(id, true /* ipv6 */)) {
+			return true
+		}
+	}
+	return false
+}
+
+// RestoreNICsAndEndpoints implements inet.Stack.RestoreNICsAndEndpoints. It
+// restores preserved NICs, routes, and transport endpoints on the stack.
+func (s *Stack) RestoreNICsAndEndpoints() {
+	// Checkpoints do not save tables, and ConfigureNetwork runs only on the
+	// root stack. Thus set the default Linux tables here.
+	s.InitDefaultTables()
+	s.Stack.RestoreNICsAndEndpoints()
+}
+
+// RestoreBackgroundWorkers implements inet.Stack.RestoreBackgroundWorkers.
+func (s *Stack) RestoreBackgroundWorkers() {
+	s.Stack.RestoreBackgroundWorkers()
 }
 
 // ResetConfig implements inet.Stack.ResetConfig.
@@ -1638,9 +1754,14 @@ func (s *Stack) ReplaceConfig(st inet.Stack) {
 	s.Stack.ReplaceConfig(st.(*Stack).Stack)
 }
 
-// Resume implements inet.Stack.Resume.
-func (s *Stack) Resume() {
-	s.Stack.Resume()
+// ResumeEndpoints implements inet.Stack.ResumeEndpoints.
+func (s *Stack) ResumeEndpoints() {
+	s.Stack.ResumeEndpoints()
+}
+
+// ResumeLinkEndpoints implements inet.Stack.ResumeLinkEndpoints.
+func (s *Stack) ResumeLinkEndpoints() {
+	s.Stack.ResumeLinkEndpoints()
 }
 
 // RegisteredEndpoints implements inet.Stack.RegisteredEndpoints.

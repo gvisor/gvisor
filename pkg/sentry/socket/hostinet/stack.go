@@ -485,10 +485,18 @@ func (*Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
 // Pause implements inet.Stack.Pause.
 func (*Stack) Pause() {}
 
-// Restore implements inet.Stack.Restore.
-func (*Stack) Restore() {
+// CheckRestorable implements inet.Stack.CheckRestorable.
+func (*Stack) CheckRestorable(bool) error {
+	return nil
+}
+
+// RestoreNICsAndEndpoints implements inet.Stack.RestoreNICsAndEndpoints.
+func (*Stack) RestoreNICsAndEndpoints() {
 	restoreListeners()
 }
+
+// RestoreBackgroundWorkers implements inet.Stack.RestoreBackgroundWorkers.
+func (*Stack) RestoreBackgroundWorkers() {}
 
 // ResetConfig implements inet.Stack.ResetConfig.
 func (s *Stack) ResetConfig() {
@@ -513,8 +521,11 @@ func (s *Stack) SetHostConfig(netDev, netSNMP *os.File, ports [2]uint16) {
 	s.portRange = ports
 }
 
-// Resume implements inet.Stack.Resume.
-func (*Stack) Resume() {}
+// ResumeEndpoints implements inet.Stack.ResumeEndpoints.
+func (*Stack) ResumeEndpoints() {}
+
+// ResumeLinkEndpoints implements inet.Stack.ResumeLinkEndpoints.
+func (*Stack) ResumeLinkEndpoints() {}
 
 // RegisteredEndpoints implements inet.Stack.RegisteredEndpoints.
 func (*Stack) RegisteredEndpoints() []stack.TransportEndpoint { return nil }

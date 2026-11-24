@@ -99,11 +99,6 @@ TEST(NetworkNamespaceTest, HostinetChildHasOnlyLoopback) {
 TEST(NetworkNamespaceTest, LoopbackStartsDown) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
-  // Non-root network namespaces are recreated from scratch on restore, so
-  // interface state does not survive save/restore.
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
-
   ScopedThread t([&] {
     ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
 
@@ -124,11 +119,6 @@ TEST(NetworkNamespaceTest, LoopbackStartsDown) {
 // addresses; the kernel assigns 127.0.0.1/8 and ::1/128 when it is brought up.
 TEST(NetworkNamespaceTest, LoopbackAddressesAddedOnUp) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
-
-  // Non-root network namespaces are recreated from scratch on restore, so
-  // interface state does not survive save/restore.
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   ScopedThread t([&] {
     ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
@@ -202,11 +192,6 @@ TEST(NetworkNamespaceTest, LoopbackAddressesAddedOnUp) {
 // recreated.
 TEST(NetworkNamespaceTest, IPv6FlushedOnDown) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
-
-  // Non-root network namespaces are recreated from scratch on restore, so
-  // interface state does not survive save/restore.
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
 
   ScopedThread t([&] {
     ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
@@ -295,11 +280,6 @@ TEST(NetworkNamespaceTest, IPv6FlushedOnDown) {
 TEST(NetworkNamespaceTest, LinkChangeFlagsLikeLinux) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
-  // Non-root network namespaces are recreated from scratch on restore, so
-  // interface state does not survive save/restore.
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds;
-
   ScopedThread t([&] {
     ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
 
@@ -330,30 +310,53 @@ TEST(NetworkNamespaceTest, LinkChangeFlagsLikeLinux) {
   });
 }
 
-// The loopback interface of a network namespace stays UP, with the default
-// loopback addresses, across save/restore.
-//
-// TODO(gvisor.dev/issue/4595): Also check that an interface that is DOWN stays
-// DOWN, once non-root network namespaces are restored from their saved state.
-TEST(NetworkNamespaceTest, LoopbackUpAcrossSave) {
+// The loopback interface of a network namespace preserves its UP/DOWN state,
+// default loopback addresses, and bound sockets across save/restore.
+TEST(NetworkNamespaceTest, LoopbackStateAcrossSave) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
   ScopedThread t([&] {
     ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
 
     Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+    EXPECT_EQ(lo.flags & IFF_UP, 0u);
+    MaybeSave();
+    lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+    EXPECT_EQ(lo.flags & IFF_UP, 0u);
+
     ASSERT_NO_ERRNO(LinkChangeFlags(lo.index, IFF_UP, IFF_UP));
+
+    struct sockaddr_in listen_addr = {};
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    FileDescriptor listener =
+        ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_THAT(
+        bind(listener.get(), AsSockAddr(&listen_addr), sizeof(listen_addr)),
+        SyscallSucceeds());
+    ASSERT_THAT(listen(listener.get(), 1), SyscallSucceeds());
+    socklen_t listen_len = sizeof(listen_addr);
+    ASSERT_THAT(
+        getsockname(listener.get(), AsSockAddr(&listen_addr), &listen_len),
+        SyscallSucceeds());
 
     MaybeSave();
 
-    // A restored network namespace gets a new network stack, so sockets that
-    // exist across a save do not work after the restore
-    // (gvisor.dev/issue/4595). Disable saves so that the sockets below use
-    // the network stack of the restored namespace.
-    const DisableSave ds;
-
     lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
     EXPECT_NE(lo.flags & IFF_UP, 0u);
+
+    FileDescriptor client =
+        ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_THAT(RetryEINTR(connect)(client.get(), AsSockAddr(&listen_addr),
+                                    sizeof(listen_addr)),
+                SyscallSucceeds());
+    FileDescriptor accepted =
+        ASSERT_NO_ERRNO_AND_VALUE(Accept(listener.get(), nullptr, nullptr));
+    constexpr char kProbe = 'x';
+    char got = 0;
+    ASSERT_THAT(WriteFd(client.get(), &kProbe, 1), SyscallSucceedsWithValue(1));
+    ASSERT_THAT(ReadFd(accepted.get(), &got, 1), SyscallSucceedsWithValue(1));
+    EXPECT_EQ(got, kProbe);
 
     struct sockaddr_in addr4 = {};
     addr4.sin_family = AF_INET;

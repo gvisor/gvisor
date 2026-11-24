@@ -3145,3 +3145,311 @@ func TestCheckpointRestoreCrossEngineChained(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckpointNetworkFilterRules tests that a checkpoint of a sandbox with a
+// veth pair keeps the veth pair across restore, and that a checkpoint fails if
+// the sandbox also has iptables rules that restore would lose.
+func TestCheckpointNetworkFilterRules(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	if _, err := os.Stat("/usr/sbin/iptables-legacy"); err != nil {
+		t.Skipf("iptables-legacy not available: %v", err)
+	}
+
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			// iptables needs raw sockets.
+			conf.EnableRaw = true
+			start := func() (*Container, string, func()) {
+				spec, _ := sleepSpecConf(t)
+				// iptables writes its lock file in /run.
+				spec.Mounts = append(spec.Mounts, specs.Mount{Destination: "/run", Type: "tmpfs"})
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+				if err != nil {
+					t.Fatalf("error setting up container: %v", err)
+				}
+				cont, err := New(conf, Args{
+					ID:        testutil.RandomContainerID(),
+					Spec:      spec,
+					BundleDir: bundleDir,
+				})
+				if err != nil {
+					cleanup()
+					t.Fatalf("error creating container: %v", err)
+				}
+				if err := cont.Start(conf); err != nil {
+					cont.Destroy()
+					cleanup()
+					t.Fatalf("error starting container: %v", err)
+				}
+				return cont, bundleDir, func() {
+					cont.Destroy()
+					cleanup()
+				}
+			}
+			const vethCmd = "ip link add v0 type veth peer name v1 && ip addr add 10.11.0.1/24 dev v0 && ip link set v0 up"
+
+			t.Run("veth without rules", func(t *testing.T) {
+				cont, bundleDir, cleanup := start()
+				defer cleanup()
+				if out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", vethCmd); err != nil {
+					t.Fatalf("failed to create the veth pair: %v (output: %s)", err, out)
+				}
+				checkpointDir := makeTempDir(t, "checkpoint-veth-test")
+				if err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{}); err != nil {
+					t.Fatalf("error checkpointing container: %v", err)
+				}
+				cont.Destroy()
+
+				cont2, err := New(conf, Args{
+					ID:        testutil.RandomContainerID(),
+					Spec:      cont.Spec,
+					BundleDir: bundleDir,
+				})
+				if err != nil {
+					t.Fatalf("error creating restored container: %v", err)
+				}
+				defer cont2.Destroy()
+				if err := cont2.Restore(conf, checkpointDir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+					t.Fatalf("error restoring container: %v", err)
+				}
+				out, err := executeCombinedOutput(conf, cont2, nil, "/bin/sh", "-c", "ip addr show dev v0 && ip link show dev v1")
+				if err != nil {
+					t.Fatalf("failed to query the veth pair after restore: %v (output: %s)", err, out)
+				}
+				if !strings.Contains(string(out), "10.11.0.1/24") {
+					t.Fatalf("unexpected v0 addresses after restore: %s", out)
+				}
+			})
+
+			for _, nc := range []struct {
+				name  string
+				rules string
+			}{
+				{
+					// Like images/basic/docker/start-dockerd.sh, which gives
+					// containers external access.
+					name:  "veth with NAT rules that do not filter packets",
+					rules: "iptables-legacy -t nat -A POSTROUTING -o v0 -j SNAT --to-source 10.11.0.1 -p tcp",
+				},
+				{
+					name:  "veth with a NAT user chain and MASQUERADE",
+					rules: "iptables-legacy -t nat -N C && iptables-legacy -t nat -A POSTROUTING -p tcp -j C && iptables-legacy -t nat -A C -o v0 -p tcp -j MASQUERADE",
+				},
+			} {
+				t.Run(nc.name, func(t *testing.T) {
+					cont, bundleDir, cleanup := start()
+					defer cleanup()
+					cmd := vethCmd + " && " + nc.rules
+					if out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", cmd); err != nil {
+						t.Fatalf("failed to set up the veth pair and NAT rules: %v (output: %s)", err, out)
+					}
+					checkpointDir := makeTempDir(t, "checkpoint-veth-nat-test")
+					if err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{}); err != nil {
+						t.Fatalf("error checkpointing container: %v", err)
+					}
+					cont.Destroy()
+
+					cont2, err := New(conf, Args{
+						ID:        testutil.RandomContainerID(),
+						Spec:      cont.Spec,
+						BundleDir: bundleDir,
+					})
+					if err != nil {
+						t.Fatalf("error creating restored container: %v", err)
+					}
+					defer cont2.Destroy()
+					if err := cont2.Restore(conf, checkpointDir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+						t.Fatalf("error restoring container: %v", err)
+					}
+					out, err := executeCombinedOutput(conf, cont2, nil, "/bin/sh", "-c", "ip addr show dev v0")
+					if err != nil {
+						t.Fatalf("failed to query v0 after restore: %v (output: %s)", err, out)
+					}
+					if !strings.Contains(string(out), "10.11.0.1/24") {
+						t.Fatalf("unexpected v0 addresses after restore: %s", out)
+					}
+				})
+			}
+
+			t.Run("veth with a NAT DROP policy", func(t *testing.T) {
+				cont, _, cleanup := start()
+				defer cleanup()
+				// iptables refuses DROP in the NAT table, but
+				// iptables-restore sets chain policies without that check.
+				cmd := vethCmd + ` && printf '*nat\n:PREROUTING DROP [0:0]\nCOMMIT\n' | iptables-legacy-restore --noflush`
+				if out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", cmd); err != nil {
+					t.Fatalf("failed to set up the veth pair and NAT policy: %v (output: %s)", err, out)
+				}
+				checkpointDir := makeTempDir(t, "checkpoint-veth-nat-drop-test")
+				err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{Resume: true})
+				if err == nil {
+					t.Fatal("checkpoint with a NAT DROP policy and a veth pair succeeded, want error")
+				}
+				if !strings.Contains(err.Error(), "iptables or nftables rules") {
+					t.Fatalf("checkpoint error = %v, want an error about iptables or nftables rules", err)
+				}
+			})
+
+			t.Run("veth with a NAT DNAT rule", func(t *testing.T) {
+				cont, _, cleanup := start()
+				defer cleanup()
+				// DNAT can hide an address from containers, so restore
+				// without it changes what they can reach.
+				cmd := vethCmd + " && iptables-legacy -t nat -A PREROUTING -d 169.254.169.254 -p tcp -j DNAT --to-destination 127.0.0.1:9"
+				if out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", cmd); err != nil {
+					t.Fatalf("failed to set up the veth pair and DNAT rule: %v (output: %s)", err, out)
+				}
+				checkpointDir := makeTempDir(t, "checkpoint-veth-nat-dnat-test")
+				err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{Resume: true})
+				if err == nil {
+					t.Fatal("checkpoint with a DNAT rule and a veth pair succeeded, want error")
+				}
+				if !strings.Contains(err.Error(), "iptables or nftables rules") {
+					t.Fatalf("checkpoint error = %v, want an error about iptables or nftables rules", err)
+				}
+			})
+
+			t.Run("veth with iptables rules", func(t *testing.T) {
+				cont, _, cleanup := start()
+				defer cleanup()
+				cmd := vethCmd + " && iptables-legacy -A INPUT -i v0 -j DROP"
+				if out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", cmd); err != nil {
+					t.Fatalf("failed to set up the veth pair and rules: %v (output: %s)", err, out)
+				}
+				// Checkpoint with resume, so that the sandbox keeps running
+				// after the checkpoint fails.
+				checkpointDir := makeTempDir(t, "checkpoint-veth-rules-test")
+				err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{Resume: true})
+				if err == nil {
+					t.Fatal("checkpoint with iptables rules and a veth pair succeeded, want error")
+				}
+				if !strings.Contains(err.Error(), "iptables or nftables rules") {
+					t.Fatalf("checkpoint error = %v, want an error about iptables or nftables rules", err)
+				}
+				// The sandbox keeps running after the failed checkpoint.
+				if out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", "ip link show dev v0"); err != nil {
+					t.Fatalf("container does not run after the failed checkpoint: %v (output: %s)", err, out)
+				}
+			})
+		})
+	}
+}
+
+// TestCheckpointRestoreHostinetChildNetns checks that with host networking, a
+// child network namespace keeps its loopback device and a listening socket
+// across checkpoint and restore.
+func TestCheckpointRestoreHostinetChildNetns(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	for _, bin := range []string{"/usr/bin/unshare", "/usr/bin/python3"} {
+		if _, err := os.Stat(bin); err != nil {
+			t.Skipf("%s not available: %v", bin, err)
+		}
+	}
+
+	// server runs in the child network namespace. It listens on
+	// 127.0.0.1:9000 and writes "ok" to each connection. When /run/check
+	// appears, it writes the state of the loopback device and the answer of
+	// its own listener to /run/result, and then continues to run.
+	const server = `import os, socket, subprocess, threading, time
+s = socket.socket()
+s.bind(("127.0.0.1", 9000))
+s.listen(8)
+def serve():
+    while True:
+        c, _ = s.accept()
+        c.sendall(b"ok")
+        c.close()
+threading.Thread(target=serve, daemon=True).start()
+open("/run/ready", "w").close()
+while not os.path.exists("/run/check"):
+    time.sleep(0.1)
+try:
+    out = subprocess.run(["ip", "link", "show", "dev", "lo"], capture_output=True, text=True).stdout
+    c = socket.create_connection(("127.0.0.1", 9000), timeout=10)
+    out += "answer: " + c.recv(2).decode()
+except Exception as e:
+    out = "error: %r" % e
+with open("/run/result.tmp", "w") as f:
+    f.write(out)
+os.rename("/run/result.tmp", "/run/result")
+while True:
+    time.sleep(1000)
+`
+	for name, conf := range configs(t, true /* noOverlay */) {
+		conf.Network = config.NetworkHost
+		t.Run(name, func(t *testing.T) {
+			scriptDir := makeTempDir(t, "hostinet-netns-scripts")
+			serverPath := filepath.Join(scriptDir, "server.py")
+			if err := os.WriteFile(serverPath, []byte(server), 0644); err != nil {
+				t.Fatalf("os.WriteFile(%s): %v", serverPath, err)
+			}
+			// The server is the container's main process, so that it keeps
+			// running after exec sessions end.
+			spec, _ := sleepSpecConf(t)
+			spec.Process.Args = []string{"/usr/bin/unshare", "-n", "/bin/sh", "-c", "ip link set lo up && exec python3 " + serverPath}
+			spec.Mounts = append(spec.Mounts,
+				specs.Mount{Destination: "/run", Type: "tmpfs"},
+				// The root file system is read-only, so mount the script at a
+				// path that exists in it.
+				specs.Mount{Destination: scriptDir, Source: scriptDir, Type: "bind", Options: []string{"ro"}},
+			)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+			cont, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			waitCmd := "for i in $(seq 100); do [ -e /run/ready ] && exit 0; sleep 0.1; done; exit 1"
+			if out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", waitCmd); err != nil {
+				t.Fatalf("server in the child network namespace did not start: %v (output: %s)", err, out)
+			}
+
+			checkpointDir := makeTempDir(t, "checkpoint-hostinet-netns-test")
+			if err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			cont.Destroy()
+
+			cont2, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      cont.Spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating restored container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, checkpointDir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+
+			const checkCmd = "touch /run/check && for i in $(seq 200); do [ -e /run/result ] && exec cat /run/result; sleep 0.1; done; exit 1"
+			out, err := executeCombinedOutput(conf, cont2, nil, "/bin/sh", "-c", checkCmd)
+			if err != nil {
+				t.Fatalf("server in the child network namespace did not report after restore: %v (output: %s)", err, out)
+			}
+			if !strings.Contains(string(out), ",UP") {
+				t.Errorf("loopback device of the child network namespace is not UP after restore: %s", out)
+			}
+			if !strings.Contains(string(out), "answer: ok") {
+				t.Errorf("listener in the child network namespace did not answer after restore: %s", out)
+			}
+		})
+	}
+}

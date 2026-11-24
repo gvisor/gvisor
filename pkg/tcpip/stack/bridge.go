@@ -15,6 +15,9 @@
 package stack
 
 import (
+	"context"
+	"maps"
+
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -36,6 +39,8 @@ type bridgePort struct {
 type BridgeFDBKey tcpip.LinkAddress
 
 // BridgeFDBEntry consists of all metadata for a FDB record.
+//
+// +stateify savable
 type BridgeFDBEntry struct {
 	port *bridgePort
 }
@@ -151,18 +156,26 @@ func NewBridgeEndpoint(mtu uint32) *BridgeEndpoint {
 	return b
 }
 
+// bridgePorts and bridgeFDBTable name the saved types of BridgeEndpoint.ports
+// and BridgeEndpoint.fdbTable. The state code for this package does not import
+// package tcpip, so it cannot name tcpip.NICID.
+type (
+	bridgePorts    = map[tcpip.NICID]*bridgePort
+	bridgeFDBTable = map[BridgeFDBKey]BridgeFDBEntry
+)
+
 // BridgeEndpoint is a bridge endpoint.
 //
 // +stateify savable
 type BridgeEndpoint struct {
 	mu bridgeRWMutex `state:"nosave"`
 	// +checklocks:mu
-	ports map[tcpip.NICID]*bridgePort
+	ports map[tcpip.NICID]*bridgePort `state:".(bridgePorts)"`
 	// localAddrs counts the ports with each link address, like the
 	// BR_FDB_LOCAL entries Linux keeps for its ports.
 	//
 	// +checklocks:mu
-	localAddrs map[tcpip.LinkAddress]int
+	localAddrs map[tcpip.LinkAddress]int `state:"nosave"`
 	// +checklocks:mu
 	dispatcher NetworkDispatcher
 	// +checklocks:mu
@@ -172,7 +185,7 @@ type BridgeEndpoint struct {
 	// +checklocks:mu
 	mtu uint32
 	// +checklocks:mu
-	fdbTable        map[BridgeFDBKey]BridgeFDBEntry
+	fdbTable        map[BridgeFDBKey]BridgeFDBEntry `state:".(bridgeFDBTable)"`
 	maxHeaderLength atomicbitops.Uint32
 }
 
@@ -313,6 +326,7 @@ func (b *BridgeEndpoint) Attach(dispatcher NetworkDispatcher) {
 	defer b.mu.Unlock()
 	for _, p := range b.ports {
 		p.nic.Primary = nil
+		p.nic.NetworkLinkEndpoint.Attach(p.nic)
 	}
 	b.dispatcher = dispatcher
 	b.ports = make(map[tcpip.NICID]*bridgePort)
@@ -394,4 +408,69 @@ func (b *BridgeEndpoint) FindFDBEntry(addr tcpip.LinkAddress) BridgeFDBEntry {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.fdbTable[BridgeFDBKey(addr)]
+}
+
+// hasUnpreservedPort reports whether b has a port NIC that savePorts omits.
+//
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) hasUnpreservedPort() bool {
+	b.mu.RLock()
+	ports := maps.Clone(b.ports)
+	b.mu.RUnlock()
+	for _, port := range ports {
+		if !port.nic.isPreserved() {
+			return true
+		}
+	}
+	return false
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) savePorts() bridgePorts {
+	b.mu.RLock()
+	ports := maps.Clone(b.ports)
+	b.mu.RUnlock()
+	for id, port := range ports {
+		if !port.nic.isPreserved() {
+			delete(ports, id)
+		}
+	}
+	return ports
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) loadPorts(_ context.Context, ports bridgePorts) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ports == nil {
+		ports = make(bridgePorts)
+	}
+	b.ports = ports
+	b.localAddrs = make(map[tcpip.LinkAddress]int, len(ports))
+	for _, port := range ports {
+		b.localAddrs[port.addr]++ // +checklocksforce: port.bridge is b.
+	}
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) saveFdbTable() bridgeFDBTable {
+	b.mu.RLock()
+	fdb := maps.Clone(b.fdbTable)
+	b.mu.RUnlock()
+	for k, entry := range fdb {
+		if entry.port == nil || !entry.port.nic.isPreserved() {
+			delete(fdb, k)
+		}
+	}
+	return fdb
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) loadFdbTable(_ context.Context, fdb bridgeFDBTable) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if fdb == nil {
+		fdb = make(map[BridgeFDBKey]BridgeFDBEntry)
+	}
+	b.fdbTable = fdb
 }

@@ -256,7 +256,22 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		// Unregister the endpoint before registering again during Connect.
 		e.stack.UnregisterTransportEndpoint(e.effectiveNetProtos, header.TCPProtocolNumber, e.TransportEndpointInfo.ID, e, e.boundPortFlags, e.boundBindToDevice)
 		e.mu.Lock()
+		// An accepted endpoint is bound to the NIC that its SYN arrived
+		// on. For a connection to a local address, this is the loopback
+		// NIC, and the route needs a temporary loopback address that only
+		// a route lookup without a NIC creates. The other end of the
+		// connection can restore after this endpoint, so look up the route
+		// without a NIC. Every connection that a loopback-bound endpoint
+		// can have goes to a local address, so this lookup also gives a
+		// route through the loopback NIC.
+		boundNICID := e.boundNICID
+		if boundNICID != 0 {
+			if nic, err := e.stack.GetNICByID(boundNICID); err == nil && nic.IsLoopback() {
+				e.boundNICID = 0
+			}
+		}
 		err := e.connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.TransportEndpointInfo.ID.RemotePort}, false /* handshake */)
+		e.boundNICID = boundNICID
 		if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
 			log.Warningf("TCP endpoint connect failed for connected endpoint with ID: %+v err: %v", id, err)
 			e.mu.Unlock()

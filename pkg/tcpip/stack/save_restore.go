@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"math/rand"
 
+	"gvisor.dev/gvisor/pkg/log"
 	cryptorand "gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -27,6 +28,9 @@ import (
 func (s *Stack) beforeSave() {
 	// removeConf will be set only in case of save/restore.
 	s.mu.Lock()
+	if s.hasModifiedFilterRulesLocked() {
+		log.Infof("Saving network stack with modified iptables or nftables rules; the rules are not saved")
+	}
 	s.routeMu.RLock()
 	s.preservedRoutes = nil
 	for r := s.routeTable.Front(); r != nil; r = r.Next() {
@@ -100,6 +104,9 @@ func (s *Stack) afterLoad(context.Context) {
 	s.ensureRNG()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.nics == nil {
+		s.nics = make(map[tcpip.NICID]*nic)
+	}
 	if s.preservedNICs == nil {
 		s.preservedNICs = make(map[tcpip.NICID]*nic)
 	}

@@ -44,6 +44,8 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -388,9 +390,6 @@ class BridgeLocalDeliveryTest : public ::testing::Test {
     }
   }
 
-  // Don't do cooperative save/restore because netstack state is not restored.
-  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
-  const DisableSave ds_;
   FileDescriptor netns_;
   FileDescriptor sender_;
   FileDescriptor udp_;
@@ -470,6 +469,618 @@ TEST_F(BridgeLocalDeliveryTest, PortAddressChangeIsTracked) {
   ASSERT_NO_FATAL_FAILURE(Deliver(port_b_mac_, &delivered, &forwarded));
   EXPECT_FALSE(delivered) << "old other-port address";
   EXPECT_TRUE(forwarded) << "old other-port address";
+}
+
+// NetnsRestoringTest records the calling thread's original network namespace
+// in SetUp and returns to it in TearDown, so tests that create network
+// namespaces do not leak namespace state.
+class NetnsRestoringTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    SKIP_IF(IsRunningWithHostinet());
+    SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+    SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+    orig_netns_ =
+        ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  }
+
+  void TearDown() override {
+    if (orig_netns_.get() >= 0) {
+      EXPECT_THAT(setns(orig_netns_.get(), CLONE_NEWNET), SyscallSucceeds());
+    }
+  }
+
+ private:
+  FileDescriptor orig_netns_;
+};
+
+// BridgeSaveRestoreTest tests bridge and veth state across save and restore.
+class BridgeSaveRestoreTest : public NetnsRestoringTest {};
+
+TEST_F(BridgeSaveRestoreTest, BridgeVethChildNetnsTCPAndUDPAcrossSave) {
+  // Create an outer ephemeral network namespace holding br0 and one end of the
+  // veth pair, and an inner child network namespace holding the peer veth.
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor outer_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  Link outer_lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  ASSERT_NO_ERRNO(LinkChangeFlags(outer_lo.index, IFF_UP, IFF_UP));
+
+  PosixError err = NewLink(outer_nl, kSeq + 100, "bridge", "br0", nullptr);
+  SKIP_IF(!IsRunningOnGvisor() && err.errno_value() == EOPNOTSUPP);
+  ASSERT_NO_ERRNO(err);
+  ASSERT_NO_ERRNO(NewLink(outer_nl, kSeq + 101, "veth", "veth_br", "veth_c"));
+
+  const int br_idx = if_nametoindex("br0");
+  ASSERT_NE(br_idx, 0);
+  const int veth_br_idx = if_nametoindex("veth_br");
+  ASSERT_NE(veth_br_idx, 0);
+  const int veth_c_idx = if_nametoindex("veth_c");
+  ASSERT_NE(veth_c_idx, 0);
+
+  ASSERT_NO_ERRNO(SetLinkAttr(outer_nl, kSeq + 102, veth_br_idx, IFLA_MASTER,
+                              &br_idx, sizeof(br_idx)));
+  ASSERT_NO_ERRNO(LinkChangeFlags(br_idx, IFF_UP, IFF_UP));
+  ASSERT_NO_ERRNO(LinkChangeFlags(veth_br_idx, IFF_UP, IFF_UP));
+
+  struct in_addr br_ip = {};
+  ASSERT_EQ(inet_pton(AF_INET, "10.200.0.1", &br_ip), 1);
+  ASSERT_NO_ERRNO(
+      LinkAddLocalAddr(outer_nl, br_idx, AF_INET, 24, &br_ip, sizeof(br_ip)));
+
+  // Create the inner child namespace and move veth_c into it while renaming it
+  // to eth0 in a single RTM_NEWLINK request.
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor inner_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  {
+    LinkRequest move_req = {};
+    move_req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(move_req.ifm));
+    move_req.hdr.nlmsg_type = RTM_NEWLINK;
+    move_req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    move_req.hdr.nlmsg_seq = kSeq + 103;
+    move_req.ifm.ifi_index = veth_c_idx;
+    int nsfd = inner_netns.get();
+    AddAttr(&move_req, IFLA_NET_NS_FD, &nsfd, sizeof(nsfd));
+    AddAttr(&move_req, IFLA_IFNAME, "eth0", strlen("eth0"));
+    ASSERT_NO_ERRNO(NetlinkRequestAckOrError(outer_nl, kSeq + 103, &move_req,
+                                             move_req.hdr.nlmsg_len));
+  }
+
+  // Moving a link to another namespace leaves it administratively DOWN.
+  std::vector<Link> inner_links =
+      ASSERT_NO_ERRNO_AND_VALUE(DumpLinks(inner_nl));
+  int eth0_idx = 0;
+  for (const Link& link : inner_links) {
+    if (link.name == "eth0") {
+      eth0_idx = link.index;
+      EXPECT_EQ(link.flags & IFF_UP, 0u);
+    }
+  }
+  ASSERT_NE(eth0_idx, 0);
+
+  Link inner_lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  ASSERT_NO_ERRNO(LinkChangeFlags(inner_lo.index, IFF_UP, IFF_UP));
+  ASSERT_NO_ERRNO(LinkChangeFlags(eth0_idx, IFF_UP, IFF_UP));
+
+  struct in_addr inner_ip = {};
+  ASSERT_EQ(inet_pton(AF_INET, "10.200.0.2", &inner_ip), 1);
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(inner_nl, eth0_idx, AF_INET, 24, &inner_ip,
+                                   sizeof(inner_ip)));
+
+  // Wait for bridge forwarding readiness using UDP sockets across namespaces.
+  FileDescriptor inner_udp =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
+  struct sockaddr_in inner_udp_addr = {};
+  inner_udp_addr.sin_family = AF_INET;
+  inner_udp_addr.sin_addr = inner_ip;
+  ASSERT_THAT(bind(inner_udp.get(), AsSockAddr(&inner_udp_addr),
+                   sizeof(inner_udp_addr)),
+              SyscallSucceeds());
+  socklen_t addrlen = sizeof(inner_udp_addr);
+  ASSERT_THAT(
+      getsockname(inner_udp.get(), AsSockAddr(&inner_udp_addr), &addrlen),
+      SyscallSucceeds());
+
+  // Bind a listening TCP socket in inner_netns before switching back to
+  // outer_netns.
+  FileDescriptor inner_listen =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
+  struct sockaddr_in inner_tcp_addr = {};
+  inner_tcp_addr.sin_family = AF_INET;
+  inner_tcp_addr.sin_addr = inner_ip;
+  ASSERT_THAT(bind(inner_listen.get(), AsSockAddr(&inner_tcp_addr),
+                   sizeof(inner_tcp_addr)),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(inner_listen.get(), 4), SyscallSucceeds());
+  addrlen = sizeof(inner_tcp_addr);
+  ASSERT_THAT(
+      getsockname(inner_listen.get(), AsSockAddr(&inner_tcp_addr), &addrlen),
+      SyscallSucceeds());
+
+  ASSERT_THAT(setns(outer_netns.get(), CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_udp =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
+  const absl::Time ready_deadline = absl::Now() + absl::Seconds(10);
+  bool bridge_ready = false;
+  while (!bridge_ready && absl::Now() < ready_deadline) {
+    const char probe[] = "ready";
+    ASSERT_THAT(sendto(outer_udp.get(), probe, sizeof(probe), 0,
+                       AsSockAddr(&inner_udp_addr), sizeof(inner_udp_addr)),
+                SyscallSucceedsWithValue(sizeof(probe)));
+    struct pollfd pfd = {.fd = inner_udp.get(), .events = POLLIN};
+    if (RetryEINTR(poll)(&pfd, 1, 100) == 1) {
+      char buf[16] = {};
+      ASSERT_THAT(recv(inner_udp.get(), buf, sizeof(buf), 0),
+                  SyscallSucceedsWithValue(sizeof(probe)));
+      bridge_ready = true;
+    }
+  }
+  ASSERT_TRUE(bridge_ready) << "bridge -> veth -> child netns did not forward";
+
+  // Bind a listening TCP socket on br0 in outer_netns and connect a pre-save
+  // TCP stream across br0 <-> eth0.
+  FileDescriptor outer_listen =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
+  struct sockaddr_in outer_tcp_addr = {};
+  outer_tcp_addr.sin_family = AF_INET;
+  outer_tcp_addr.sin_addr = br_ip;
+  ASSERT_THAT(bind(outer_listen.get(), AsSockAddr(&outer_tcp_addr),
+                   sizeof(outer_tcp_addr)),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(outer_listen.get(), 4), SyscallSucceeds());
+  addrlen = sizeof(outer_tcp_addr);
+  ASSERT_THAT(
+      getsockname(outer_listen.get(), AsSockAddr(&outer_tcp_addr), &addrlen),
+      SyscallSucceeds());
+
+  FileDescriptor outer_client =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
+  ASSERT_THAT(
+      RetryEINTR(connect)(outer_client.get(), AsSockAddr(&inner_tcp_addr),
+                          sizeof(inner_tcp_addr)),
+      SyscallSucceeds());
+  FileDescriptor inner_accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(inner_listen.get(), nullptr, nullptr));
+
+  constexpr std::string_view kPreMsg = "pre-save-bridge-veth";
+  ASSERT_THAT(WriteFd(outer_client.get(), kPreMsg.data(), kPreMsg.size()),
+              SyscallSucceedsWithValue(kPreMsg.size()));
+  std::string recv_buf(kPreMsg.size(), '\0');
+  ASSERT_THAT(ReadFd(inner_accepted.get(), recv_buf.data(), recv_buf.size()),
+              SyscallSucceedsWithValue(recv_buf.size()));
+  EXPECT_EQ(recv_buf, kPreMsg);
+
+  MaybeSave();
+
+  // Verify UDP datagram delivery across br0 <-> eth0 on pre-save UDP sockets
+  // after checkpoint/restore.
+  constexpr std::string_view kPostUdpMsg = "post-save-udp";
+  ASSERT_THAT(sendto(outer_udp.get(), kPostUdpMsg.data(), kPostUdpMsg.size(), 0,
+                     AsSockAddr(&inner_udp_addr), sizeof(inner_udp_addr)),
+              SyscallSucceedsWithValue(kPostUdpMsg.size()));
+  // Probes from the readiness loop above can still be queued on inner_udp.
+  // Skip them until the post-save datagram arrives.
+  const absl::Time udp_deadline = absl::Now() + absl::Seconds(10);
+  bool got_post_udp = false;
+  while (!got_post_udp && absl::Now() < udp_deadline) {
+    struct pollfd pfd = {.fd = inner_udp.get(), .events = POLLIN};
+    if (RetryEINTR(poll)(&pfd, 1, 1000) != 1) {
+      continue;
+    }
+    char buf[32] = {};
+    int n;
+    ASSERT_THAT(n = recv(inner_udp.get(), buf, sizeof(buf), 0),
+                SyscallSucceeds());
+    if (std::string_view(buf, n) == kPostUdpMsg) {
+      got_post_udp = true;
+    } else {
+      ASSERT_EQ(std::string_view(buf, n), std::string_view("ready", 6));
+    }
+  }
+  ASSERT_TRUE(got_post_udp) << "post-save UDP datagram did not arrive";
+
+  // Transfer more than one MTU (8 KiB) in each direction on the connection
+  // made before save.
+  const std::string large_payload(8192, 'Z');
+  ASSERT_THAT(
+      WriteFd(inner_accepted.get(), large_payload.data(), large_payload.size()),
+      SyscallSucceedsWithValue(large_payload.size()));
+  std::string large_recv(large_payload.size(), '\0');
+  ASSERT_THAT(ReadFd(outer_client.get(), large_recv.data(), large_recv.size()),
+              SyscallSucceedsWithValue(large_recv.size()));
+  EXPECT_EQ(large_recv, large_payload);
+
+  const std::string reverse_payload(8192, 'Y');
+  ASSERT_THAT(WriteFd(outer_client.get(), reverse_payload.data(),
+                      reverse_payload.size()),
+              SyscallSucceedsWithValue(reverse_payload.size()));
+  large_recv.assign(reverse_payload.size(), '\0');
+  ASSERT_THAT(
+      ReadFd(inner_accepted.get(), large_recv.data(), large_recv.size()),
+      SyscallSucceedsWithValue(large_recv.size()));
+  EXPECT_EQ(large_recv, reverse_payload);
+
+  // Verify post-save accept() on pre-save listening socket and post-save veth
+  // creation in the restored child namespace.
+  ASSERT_THAT(setns(inner_netns.get(), CLONE_NEWNET), SyscallSucceeds());
+
+  // A connection from the child namespace to its own eth0 address goes
+  // through the namespace's loopback device.
+  FileDescriptor self_client =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
+  ASSERT_THAT(
+      RetryEINTR(connect)(self_client.get(), AsSockAddr(&inner_tcp_addr),
+                          sizeof(inner_tcp_addr)),
+      SyscallSucceeds());
+  FileDescriptor self_accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(inner_listen.get(), nullptr, nullptr));
+  constexpr std::string_view kSelfMsg = "post-save-self-connect";
+  ASSERT_THAT(WriteFd(self_client.get(), kSelfMsg.data(), kSelfMsg.size()),
+              SyscallSucceedsWithValue(kSelfMsg.size()));
+  recv_buf.assign(kSelfMsg.size(), '\0');
+  ASSERT_THAT(ReadFd(self_accepted.get(), recv_buf.data(), recv_buf.size()),
+              SyscallSucceedsWithValue(recv_buf.size()));
+  EXPECT_EQ(recv_buf, kSelfMsg);
+  FileDescriptor post_client =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
+  ASSERT_THAT(
+      RetryEINTR(connect)(post_client.get(), AsSockAddr(&outer_tcp_addr),
+                          sizeof(outer_tcp_addr)),
+      SyscallSucceeds());
+  FileDescriptor outer_accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(outer_listen.get(), nullptr, nullptr));
+  constexpr std::string_view kPostMsg = "post-save-new-conn";
+  ASSERT_THAT(WriteFd(post_client.get(), kPostMsg.data(), kPostMsg.size()),
+              SyscallSucceedsWithValue(kPostMsg.size()));
+  recv_buf.assign(kPostMsg.size(), '\0');
+  ASSERT_THAT(ReadFd(outer_accepted.get(), recv_buf.data(), recv_buf.size()),
+              SyscallSucceedsWithValue(recv_buf.size()));
+  EXPECT_EQ(recv_buf, kPostMsg);
+
+  ASSERT_NO_ERRNO(
+      NewLink(inner_nl, kSeq + 104, "veth", "veth_post0", "veth_post1"));
+  EXPECT_NE(if_nametoindex("veth_post0"), 0);
+}
+
+// Returns true if the namespace that nl is bound in has a link named name.
+PosixErrorOr<bool> HasLinkNamed(const FileDescriptor& nl,
+                                std::string_view name) {
+  ASSIGN_OR_RETURN_ERRNO(std::vector<Link> links, DumpLinks(nl));
+  for (const Link& link : links) {
+    if (link.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+TEST_F(NetnsRestoringTest, RenameToExistingNameFails) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(nl, kSeq + 200, "veth", "vrA", "vrB"));
+  const int a_idx = if_nametoindex("vrA");
+  ASSERT_NE(a_idx, 0);
+
+  EXPECT_THAT(
+      SetLinkAttr(nl, kSeq + 201, a_idx, IFLA_IFNAME, "vrB", strlen("vrB")),
+      PosixErrorIs(EEXIST));
+  EXPECT_EQ(if_nametoindex("vrA"), a_idx);
+}
+
+TEST_F(NetnsRestoringTest, MoveToNamespaceWithSameNameFails) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(outer_nl, kSeq + 210, "veth", "vmA", "vmB"));
+  const int a_idx = if_nametoindex("vmA");
+  ASSERT_NE(a_idx, 0);
+
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor inner_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(inner_nl, kSeq + 211, "veth", "vmA", "vmC"));
+
+  // Move without a new name: vmA already exists in the inner namespace.
+  int nsfd = inner_netns.get();
+  EXPECT_THAT(SetLinkAttr(outer_nl, kSeq + 212, a_idx, IFLA_NET_NS_FD, &nsfd,
+                          sizeof(nsfd)),
+              PosixErrorIs(EEXIST));
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(outer_nl, "vmA")));
+
+  // Move with a new name that already exists in the inner namespace.
+  {
+    LinkRequest req = {};
+    req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+    req.hdr.nlmsg_type = RTM_NEWLINK;
+    req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    req.hdr.nlmsg_seq = kSeq + 213;
+    req.ifm.ifi_index = a_idx;
+    AddAttr(&req, IFLA_NET_NS_FD, &nsfd, sizeof(nsfd));
+    AddAttr(&req, IFLA_IFNAME, "vmC", strlen("vmC"));
+    EXPECT_THAT(
+        NetlinkRequestAckOrError(outer_nl, kSeq + 213, &req, req.hdr.nlmsg_len),
+        PosixErrorIs(EEXIST));
+  }
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(outer_nl, "vmA")));
+}
+
+TEST_F(NetnsRestoringTest, MoveWithNewNameWhenOldNameIsTaken) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(outer_nl, kSeq + 214, "veth", "vmA", "vmB"));
+  const int a_idx = if_nametoindex("vmA");
+  ASSERT_NE(a_idx, 0);
+
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor inner_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(inner_nl, kSeq + 215, "veth", "vmA", "vmC"));
+
+  // The old name vmA is taken in the inner namespace, but the new name vmD
+  // is free, so the move succeeds.
+  LinkRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+  req.hdr.nlmsg_type = RTM_NEWLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq + 216;
+  req.ifm.ifi_index = a_idx;
+  int nsfd = inner_netns.get();
+  AddAttr(&req, IFLA_NET_NS_FD, &nsfd, sizeof(nsfd));
+  AddAttr(&req, IFLA_IFNAME, "vmD", strlen("vmD"));
+  ASSERT_NO_ERRNO(
+      NetlinkRequestAckOrError(outer_nl, kSeq + 216, &req, req.hdr.nlmsg_len));
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(inner_nl, "vmD")));
+  EXPECT_FALSE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(outer_nl, "vmA")));
+}
+
+TEST_F(NetnsRestoringTest, MoveWithTakenNewNameMovesWithOldName) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(outer_nl, kSeq + 217, "veth", "vmA", "vmB"));
+  const int a_idx = if_nametoindex("vmA");
+  ASSERT_NE(a_idx, 0);
+
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor inner_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(inner_nl, kSeq + 218, "veth", "vmC", "vmE"));
+
+  // The old name vmA is free in the inner namespace, so the link moves with
+  // its old name. The new name vmC is taken, so the rename fails.
+  LinkRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+  req.hdr.nlmsg_type = RTM_NEWLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq + 219;
+  req.ifm.ifi_index = a_idx;
+  int nsfd = inner_netns.get();
+  AddAttr(&req, IFLA_NET_NS_FD, &nsfd, sizeof(nsfd));
+  AddAttr(&req, IFLA_IFNAME, "vmC", strlen("vmC"));
+  EXPECT_THAT(
+      NetlinkRequestAckOrError(outer_nl, kSeq + 219, &req, req.hdr.nlmsg_len),
+      PosixErrorIs(EEXIST));
+  EXPECT_FALSE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(outer_nl, "vmA")));
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(inner_nl, "vmA")));
+}
+
+TEST_F(NetnsRestoringTest, MoveLoopbackFails) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  Link inner_lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  LinkRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+  req.hdr.nlmsg_type = RTM_NEWLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq + 220;
+  req.ifm.ifi_index = inner_lo.index;
+  int nsfd = outer_netns.get();
+  AddAttr(&req, IFLA_NET_NS_FD, &nsfd, sizeof(nsfd));
+  AddAttr(&req, IFLA_IFNAME, "lo2", strlen("lo2"));
+  EXPECT_THAT(
+      NetlinkRequestAckOrError(inner_nl, kSeq + 220, &req, req.hdr.nlmsg_len),
+      PosixErrorIs(EINVAL));
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(inner_nl, "lo")));
+}
+
+TEST_F(NetnsRestoringTest, MoveBridgeFails) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  PosixError err = NewLink(outer_nl, kSeq + 225, "bridge", "brM", nullptr);
+  SKIP_IF(!IsRunningOnGvisor() && err.errno_value() == EOPNOTSUPP);
+  ASSERT_NO_ERRNO(err);
+  const int br_idx = if_nametoindex("brM");
+  ASSERT_NE(br_idx, 0);
+
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  int nsfd = inner_netns.get();
+  EXPECT_THAT(SetLinkAttr(outer_nl, kSeq + 226, br_idx, IFLA_NET_NS_FD, &nsfd,
+                          sizeof(nsfd)),
+              PosixErrorIs(EINVAL));
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(outer_nl, "brM")));
+}
+
+// Returns the IFLA_MASTER of the link with the given index in the namespace
+// that nl is bound in, or 0 if the link has no master.
+PosixErrorOr<int> LinkMaster(const FileDescriptor& nl, int index) {
+  int master = -1;
+  RETURN_IF_ERRNO(DumpLinks(nl, kSeq + 300, [&](const struct nlmsghdr* hdr) {
+    if (hdr->nlmsg_type != RTM_NEWLINK) {
+      return;
+    }
+    const struct ifinfomsg* msg =
+        reinterpret_cast<const struct ifinfomsg*>(NLMSG_DATA(hdr));
+    if (msg->ifi_index != index) {
+      return;
+    }
+    master = 0;
+    const struct rtattr* rta = FindRtAttr(hdr, msg, IFLA_MASTER);
+    if (rta != nullptr) {
+      master = *reinterpret_cast<const uint32_t*>(RTA_DATA(rta));
+    }
+  }));
+  if (master < 0) {
+    return PosixError(ENOENT, "link not found");
+  }
+  return master;
+}
+
+TEST_F(NetnsRestoringTest, DeleteBridgeReleasesPorts) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor outer_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  PosixError err = NewLink(outer_nl, kSeq + 230, "bridge", "brD", nullptr);
+  SKIP_IF(!IsRunningOnGvisor() && err.errno_value() == EOPNOTSUPP);
+  ASSERT_NO_ERRNO(err);
+  ASSERT_NO_ERRNO(NewLink(outer_nl, kSeq + 231, "veth", "vdA", "vdB"));
+  const int br_idx = if_nametoindex("brD");
+  ASSERT_NE(br_idx, 0);
+  const int a_idx = if_nametoindex("vdA");
+  ASSERT_NE(a_idx, 0);
+  const int b_idx = if_nametoindex("vdB");
+  ASSERT_NE(b_idx, 0);
+  ASSERT_NO_ERRNO(SetLinkAttr(outer_nl, kSeq + 232, a_idx, IFLA_MASTER, &br_idx,
+                              sizeof(br_idx)));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(LinkMaster(outer_nl, a_idx)), br_idx);
+
+  // Move vdB into an inner namespace and give it an address there.
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor inner_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  int nsfd = inner_netns.get();
+  ASSERT_NO_ERRNO(SetLinkAttr(outer_nl, kSeq + 233, b_idx, IFLA_NET_NS_FD,
+                              &nsfd, sizeof(nsfd)));
+  const int inner_b_idx = if_nametoindex("vdB");
+  ASSERT_NE(inner_b_idx, 0);
+  ASSERT_NO_ERRNO(LinkChangeFlags(inner_b_idx, IFF_UP, IFF_UP));
+  struct in_addr inner_ip = {};
+  ASSERT_EQ(inet_pton(AF_INET, "10.77.0.2", &inner_ip), 1);
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(inner_nl, inner_b_idx, AF_INET, 24,
+                                   &inner_ip, sizeof(inner_ip)));
+  FileDescriptor inner_udp =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
+  struct sockaddr_in inner_addr = {};
+  inner_addr.sin_family = AF_INET;
+  inner_addr.sin_addr = inner_ip;
+  ASSERT_THAT(
+      bind(inner_udp.get(), AsSockAddr(&inner_addr), sizeof(inner_addr)),
+      SyscallSucceeds());
+  socklen_t addrlen = sizeof(inner_addr);
+  ASSERT_THAT(getsockname(inner_udp.get(), AsSockAddr(&inner_addr), &addrlen),
+              SyscallSucceeds());
+
+  // Delete the bridge. vdA is then a standalone link again.
+  ASSERT_THAT(setns(outer_netns.get(), CLONE_NEWNET), SyscallSucceeds());
+  LinkRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+  req.hdr.nlmsg_type = RTM_DELLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq + 234;
+  req.ifm.ifi_index = br_idx;
+  ASSERT_NO_ERRNO(
+      NetlinkRequestAckOrError(outer_nl, kSeq + 234, &req, req.hdr.nlmsg_len));
+  EXPECT_FALSE(ASSERT_NO_ERRNO_AND_VALUE(HasLinkNamed(outer_nl, "brD")));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(LinkMaster(outer_nl, a_idx)), 0);
+
+  // Traffic through vdA reaches the inner namespace, and replies (such as
+  // ARP replies) reach vdA.
+  ASSERT_NO_ERRNO(LinkChangeFlags(a_idx, IFF_UP, IFF_UP));
+  struct in_addr outer_ip = {};
+  ASSERT_EQ(inet_pton(AF_INET, "10.77.0.1", &outer_ip), 1);
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(outer_nl, a_idx, AF_INET, 24, &outer_ip,
+                                   sizeof(outer_ip)));
+  FileDescriptor outer_udp =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  bool received = false;
+  while (!received && absl::Now() < deadline) {
+    const char probe[] = "port";
+    ASSERT_THAT(sendto(outer_udp.get(), probe, sizeof(probe), 0,
+                       AsSockAddr(&inner_addr), sizeof(inner_addr)),
+                SyscallSucceedsWithValue(sizeof(probe)));
+    struct pollfd pfd = {.fd = inner_udp.get(), .events = POLLIN};
+    if (RetryEINTR(poll)(&pfd, 1, 100) == 1) {
+      char buf[16] = {};
+      ASSERT_THAT(recv(inner_udp.get(), buf, sizeof(buf), 0),
+                  SyscallSucceedsWithValue(sizeof(probe)));
+      received = true;
+    }
+  }
+  EXPECT_TRUE(received) << "former bridge port vdA did not pass traffic";
+}
+
+TEST_F(NetnsRestoringTest, MovedLinkIsDownWhenChangeOmitsUp) {
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor outer_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  ASSERT_NO_ERRNO(NewLink(outer_nl, kSeq + 240, "veth", "vfA", "vfB"));
+  const int a_idx = if_nametoindex("vfA");
+  ASSERT_NE(a_idx, 0);
+  ASSERT_NO_ERRNO(LinkChangeFlags(a_idx, IFF_UP, IFF_UP));
+  unsigned int a_flags = 0;
+  for (const Link& link : ASSERT_NO_ERRNO_AND_VALUE(DumpLinks(outer_nl))) {
+    if (link.index == a_idx) {
+      a_flags = link.flags;
+    }
+  }
+  ASSERT_NE(a_flags & IFF_UP, 0u);
+
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+  FileDescriptor inner_netns =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  FileDescriptor inner_nl =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  // Move vfA with a flag change that writes back its current IFF_MULTICAST
+  // bit and leaves IFF_UP out of ifi_change.
+  LinkRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+  req.hdr.nlmsg_type = RTM_NEWLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq + 241;
+  req.ifm.ifi_index = a_idx;
+  req.ifm.ifi_flags = a_flags & IFF_MULTICAST;
+  req.ifm.ifi_change = IFF_MULTICAST;
+  int nsfd = inner_netns.get();
+  AddAttr(&req, IFLA_NET_NS_FD, &nsfd, sizeof(nsfd));
+  ASSERT_NO_ERRNO(
+      NetlinkRequestAckOrError(outer_nl, kSeq + 241, &req, req.hdr.nlmsg_len));
+
+  bool found = false;
+  for (const Link& link : ASSERT_NO_ERRNO_AND_VALUE(DumpLinks(inner_nl))) {
+    if (link.name == "vfA") {
+      found = true;
+      EXPECT_EQ(link.flags & IFF_UP, 0u);
+    }
+  }
+  EXPECT_TRUE(found);
 }
 
 }  // namespace

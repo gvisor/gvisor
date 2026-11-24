@@ -329,11 +329,22 @@ func (it *IPTables) replaceTable(id TableID, table Table, ipv6, force bool) {
 		it.startReaper(reaperDelay)
 	}
 	it.modified = true
+	it.modifiedTables[id] = true
 	if ipv6 {
 		it.v6Tables[id] = table
 	} else {
 		it.v4Tables[id] = table
 	}
+}
+
+// TableModified reports whether the IPv4 or IPv6 table with the given id was
+// replaced at least once. It stays true after that, even if the new table
+// equals the default table. The result can change at any time unless nothing
+// can replace tables, for example while the kernel is paused for save.
+func (it *IPTables) TableModified(id TableID) bool {
+	it.mu.RLock()
+	defer it.mu.RUnlock()
+	return it.modifiedTables[id]
 }
 
 // A chainVerdict is what a table decides should be done with a packet.
@@ -710,17 +721,17 @@ func (it *IPTables) startReaper(interval time.Duration) {
 	})
 }
 
-// maxJumps is the maximum allowed depth of recursion when jumping between
+// MaxJumps is the maximum allowed depth of recursion when jumping between
 // chains in iptables. This prevents stack overflows from jump loops or deep
 // recursion. Linux kernel uses XT_JUMP_STACK_MAX = 16.
-const maxJumps = 16
+const MaxJumps = 16
 
 // Preconditions:
 //   - pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
 //   - pkt.NetworkHeader is not nil.
 func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string, depth int) chainVerdict {
-	if depth >= maxJumps {
-		log.Warningf("iptables: jump depth exceeded max %d", maxJumps)
+	if depth >= MaxJumps {
+		log.Warningf("iptables: jump depth exceeded max %d", MaxJumps)
 		return chainDrop
 	}
 	// Start from ruleIdx and walk the list of rules until a rule gives us
