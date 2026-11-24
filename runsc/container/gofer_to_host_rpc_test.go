@@ -21,12 +21,13 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
 func TestGoferToHostRPCMountNSThread(t *testing.T) {
 	// The mount namespace of this process stands in for the gofer's, which joining
 	// needs privileges for.
-	rpc := &goferToHostRPC{goferPID: os.Getpid()}
+	rpc := &goferToHostRPC{goferPID: os.Getpid(), spec: &specs.Spec{}, conf: &config.Config{}}
 	dir := t.TempDir()
 	var want unix.Stat_t
 	if err := unix.Stat(dir, &want); err != nil {
@@ -66,7 +67,7 @@ func TestGoferToHostRPCMountNSThread(t *testing.T) {
 func TestGoferToHostRPCMountNSThreadSetupFailure(t *testing.T) {
 	// There is no gofer with this PID, so the thread can't join its mount
 	// namespace. Every request gets that error, and not only the first one.
-	rpc := &goferToHostRPC{goferPID: -1}
+	rpc := &goferToHostRPC{goferPID: -1, spec: &specs.Spec{}, conf: &config.Config{}}
 	for i := 0; i < 3; i++ {
 		var res OpenMountResult
 		err := rpc.OpenMount(&OpenMountArgs{Mount: &specs.Mount{Source: t.TempDir()}}, &res)
@@ -74,4 +75,44 @@ func TestGoferToHostRPCMountNSThreadSetupFailure(t *testing.T) {
 			t.Errorf("OpenMount() #%d = %v, want an error from the mount namespace thread", i, err)
 		}
 	}
+}
+
+func TestGoferToHostRPCDevicesDirFailure(t *testing.T) {
+	// The gofer exposes a device, so the thread mounts the tmpfs that devices are
+	// created in. There is no /proc/fs/dev in this process's mount namespace to
+	// mount it on, so the thread can't be set up, and every request gets that
+	// error.
+	nvidiactl := specs.LinuxDevice{Path: "/dev/nvidiactl", Type: "c", Major: 195, Minor: 255}
+	spec := &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{nvidiactl}}}
+	rpc := &goferToHostRPC{goferPID: os.Getpid(), spec: spec, conf: &config.Config{NVProxy: true}}
+	var res CreateDeviceResult
+	err := rpc.CreateDevice(&CreateDeviceArgs{Device: nvidiactl}, &res)
+	if err != nil && strings.Contains(err.Error(), "not permitted") {
+		t.Skipf("can't join a mount namespace here: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "tmpfs") {
+		t.Errorf("CreateDevice() = %v, want an error about mounting the tmpfs", err)
+	}
+	var openRes OpenMountResult
+	if err := rpc.OpenMount(&OpenMountArgs{Mount: &specs.Mount{Source: t.TempDir()}}, &openRes); err == nil || !strings.Contains(err.Error(), "tmpfs") {
+		t.Errorf("OpenMount() = %v, want the same error", err)
+	}
+}
+
+func TestGoferToHostRPCDevicesDirNoChroot(t *testing.T) {
+	// Without a chroot, the gofer doesn't make /proc/fs/dev, so there is nothing
+	// to mount even though it exposes a device, and other requests are served.
+	nvidiactl := specs.LinuxDevice{Path: "/dev/nvidiactl", Type: "c", Major: 195, Minor: 255}
+	spec := &specs.Spec{Linux: &specs.Linux{Devices: []specs.LinuxDevice{nvidiactl}}}
+	conf := &config.Config{NVProxy: true, TestOnlyAllowRunAsCurrentUserWithoutChroot: true}
+	rpc := &goferToHostRPC{goferPID: os.Getpid(), spec: spec, conf: conf}
+	var res OpenMountResult
+	err := rpc.OpenMount(&OpenMountArgs{Mount: &specs.Mount{Source: t.TempDir()}}, &res)
+	if err != nil && strings.Contains(err.Error(), "not permitted") {
+		t.Skipf("can't join a mount namespace here: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("OpenMount() failed: %v", err)
+	}
+	res.Files[0].Close()
 }

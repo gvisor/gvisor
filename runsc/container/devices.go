@@ -43,7 +43,7 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 	}
 	// A device that does not exist is left to whatever opens it later, which
 	// reports the error.
-	add := func(path, access string) error {
+	addFromPath := func(path, access string) error {
 		r, err := deviceRuleForPath(path, access)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -54,8 +54,20 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 		rules = append(rules, r)
 		return nil
 	}
+	addFromSpec := func(dev specs.LinuxDevice, access string) error {
+		// A fifo has no device numbers, so it needs no rule.
+		if dev.Type == "p" {
+			return nil
+		}
+		r, err := deviceRuleForSpec(dev, access)
+		if err != nil {
+			return err
+		}
+		rules = append(rules, r)
+		return nil
+	}
 	// The sentry holds /dev/cpu_dma_latency open to cap host CPU idle states.
-	if err := add("/dev/cpu_dma_latency", "w"); err != nil {
+	if err := addFromPath("/dev/cpu_dma_latency", "w"); err != nil {
 		return nil, err
 	}
 	// runsc opens the platform's device and donates it to the sentry.
@@ -68,14 +80,25 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 		if path == "" {
 			path = p.Device
 		}
-		if err := add(path, "rw"); err != nil {
+		if err := addFromPath(path, "rw"); err != nil {
 			return nil, err
 		}
 	}
-	// The gofer opens the container's devices for the sentry.
+	// The gofer opens the container's devices for the sentry, and the process that
+	// starts it may create them. They may not be in the host's /dev, so their
+	// numbers come from the spec.
 	if spec.Linux != nil {
+		// Creating a device needs the "m" access. On cgroup v2 it is always
+		// added. On cgroup v1 it is left out, because the kernel rejects the
+		// rule if the parent cgroup doesn't allow it, and that would fail the
+		// start. Without it, creating a device fails, and the gofer uses the
+		// host's device instead.
+		access := "rw"
+		if cgroup.IsOnlyV2() {
+			access = "rwm"
+		}
 		for _, dev := range spec.Linux.Devices {
-			if err := add(dev.Path, "rw"); err != nil {
+			if err := addFromSpec(dev, access); err != nil {
 				return nil, err
 			}
 		}
@@ -113,6 +136,25 @@ func deviceRuleForPath(path, access string) (cgroup.DeviceRule, error) {
 		r.Type = "b"
 	default:
 		return r, fmt.Errorf("%q is not a device", path)
+	}
+	return r, nil
+}
+
+// deviceRuleForSpec returns the rule for the device dev, by its type and
+// numbers.
+func deviceRuleForSpec(dev specs.LinuxDevice, access string) (cgroup.DeviceRule, error) {
+	r := cgroup.DeviceRule{Major: dev.Major, Minor: dev.Minor, Access: access}
+	switch dev.Type {
+	case "c", "u":
+		r.Type = "c"
+	case "b":
+		r.Type = "b"
+	default:
+		return r, fmt.Errorf("device %q has unsupported type %q", dev.Path, dev.Type)
+	}
+	// A negative number is a wildcard in a rule.
+	if dev.Major < 0 || dev.Minor < 0 {
+		return r, fmt.Errorf("device %q has invalid numbers %d:%d", dev.Path, dev.Major, dev.Minor)
 	}
 	return r, nil
 }

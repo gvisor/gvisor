@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -122,7 +123,7 @@ func WriteMounts(mountsFD int, mounts []specs.Mount) error {
 // mountConfs must be indexed such that mountConfs[0] is the root filesystem
 // configuration and subsequent entries correspond to spec mounts with
 // mount configs.
-func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.GoferMountConf, devIoFD int, mountOpener MountOpener, containerID string, bundleDir string) error {
+func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.GoferMountConf, devIoFD int, mountOpener MountOpener, deviceCreator DeviceCreator, containerID string, bundleDir string) error {
 	rootfsConf := mountConfs[0]
 	hasCreateContainerHooks := spec.Hooks != nil && len(spec.Hooks.CreateContainer) > 0
 	if rootfsConf.ShouldUseLisafs() && hasCreateContainerHooks {
@@ -170,6 +171,9 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 		}
 		if err := os.Mkdir("/proc/fs/etc", 0755); err != nil {
 			util.Fatalf("error creating /proc/fs/etc: %v", err)
+		}
+		if err := os.Mkdir("/proc/fs/dev", 0755); err != nil {
+			util.Fatalf("error creating /proc/fs/dev: %v", err)
 		}
 		// This cannot use SafeMount because there's no available procfs. But we
 		// know that /proc/fs is an empty tmpfs mount, so this is safe.
@@ -231,7 +235,7 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 
 	// Set up /dev directory if needed.
 	if devIoFD >= 0 {
-		if err := SetupDev(spec, conf, containerRootFs, procPath); err != nil {
+		if err := SetupDev(spec, conf, containerRootFs, procPath, deviceCreator); err != nil {
 			util.Fatalf("error setting up /dev: %v", err)
 		}
 	}
@@ -541,8 +545,50 @@ func ShouldExposeRDMADevice(path string) bool {
 	return strings.HasPrefix(path, "/dev/infiniband/uverbs")
 }
 
+// checkDevice returns an error if dev is not the device that its path is for.
+// Otherwise a spec could make the gofer expose any device under that path.
+func checkDevice(dev *specs.LinuxDevice, procPath string) error {
+	if dev.Type != "c" && dev.Type != "u" {
+		return fmt.Errorf("%q is not a character device: type %q", dev.Path, dev.Type)
+	}
+	if ShouldExposeNvidiaDevice(dev.Path) {
+		return checkNvidiaDevice(dev, procPath)
+	}
+	return checkHostDevice(dev)
+}
+
+// checkNvidiaDevice returns an error if the major number of dev is not one of
+// the Nvidia drivers'. The devices may not be on the host's /dev, as when only
+// a driver container has them.
+func checkNvidiaDevice(dev *specs.LinuxDevice, procPath string) error {
+	majors, err := specutils.NvidiaCharMajors(procPath)
+	if err != nil {
+		return fmt.Errorf("reading the Nvidia major numbers: %w", err)
+	}
+	if !slices.Contains(majors, dev.Major) {
+		return fmt.Errorf("%q has the major number %d, which no Nvidia driver has", dev.Path, dev.Major)
+	}
+	return nil
+}
+
+// checkHostDevice returns an error if dev is not the device at its path in the
+// host's /dev. The TPU and RDMA devices are there.
+func checkHostDevice(dev *specs.LinuxDevice) error {
+	var st unix.Stat_t
+	if err := unix.Stat(dev.Path, &st); err != nil {
+		return fmt.Errorf("device %q: %w", dev.Path, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFCHR || int64(unix.Major(st.Rdev)) != dev.Major || int64(unix.Minor(st.Rdev)) != dev.Minor {
+		return fmt.Errorf("%q is the device %d:%d in the spec, and another on the host", dev.Path, dev.Major, dev.Minor)
+	}
+	return nil
+}
+
 // SetupDev mounts devices from the OCI spec into the gofer's /dev directory.
-func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) error {
+// It creates each device with deviceCreator, or mounts the host's if that
+// fails. A device that checkDevice rejects fails SetupDev before it creates
+// anything.
+func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string, deviceCreator DeviceCreator) error {
 	if err := os.MkdirAll(filepath.Join(root, "dev"), 0777); err != nil {
 		return fmt.Errorf("creating dev directory: %v", err)
 	}
@@ -560,14 +606,21 @@ func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) erro
 		if !shouldMount {
 			continue
 		}
+		if err := checkDevice(&dev, procPath); err != nil {
+			return err
+		}
 		// The rootfs may contain symlinks at dev.Path; resolve them within
 		// root so the mount point is never created outside the rootfs.
 		dst, err := ResolveSymlinks(root, dev.Path)
 		if err != nil {
 			return fmt.Errorf("resolving symlinks to %q: %v", dev.Path, err)
 		}
-		log.Infof("Mounting device %q as bind mount at %q", dev.Path, dst)
-		if err := specutils.SafeSetupAndMount(dev.Path, dst, "bind", unix.MS_BIND, procPath); err != nil {
+		src := dev.Path
+		if path, err := deviceCreator(&dev); err == nil {
+			src = path
+		}
+		log.Infof("Mounting device %q from %q as bind mount at %q", dev.Path, src, dst)
+		if err := specutils.SafeSetupAndMount(src, dst, "bind", unix.MS_BIND, procPath); err != nil {
 			return fmt.Errorf("mounting %q: %v", dev.Path, err)
 		}
 	}

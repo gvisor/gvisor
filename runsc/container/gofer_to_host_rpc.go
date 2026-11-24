@@ -25,6 +25,8 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -49,6 +51,17 @@ type openMountRequest struct {
 	done   chan error
 }
 
+// CreateDeviceArgs represents a device to be created, as the spec has it.
+type CreateDeviceArgs struct {
+	Device specs.LinuxDevice
+}
+
+type createDeviceRequest struct {
+	args   *CreateDeviceArgs
+	result *CreateDeviceResult
+	done   chan error
+}
+
 // goferToHostRPC is an rpc server that allows the gofer process to do RPC
 // calls outside of its namespace container. It is used to configure sandbox
 // mounts.
@@ -56,11 +69,19 @@ type goferToHostRPC struct {
 	mu              sync.Mutex
 	mountNSRequests chan mountNSRequest
 	goferPID        int
+	spec            *specs.Spec
+	conf            *config.Config
 }
 
 // OpenMountResult is a result of the rpcp.OpenMount call.
 type OpenMountResult struct {
 	urpc.FilePayload
+}
+
+// CreateDeviceResult is a result of the rpcp.CreateDevice call. Path is the
+// path of the device that was created, in the gofer's mount namespace.
+type CreateDeviceResult struct {
+	Path string
 }
 
 func createIDMappedUserNS(uidMappings, gidMappings []specs.LinuxIDMapping) (*os.File, error) {
@@ -188,6 +209,24 @@ func (req *openMountRequest) cancel(err error) {
 	req.done <- err
 }
 
+func (req *createDeviceRequest) handle() {
+	defer close(req.done)
+
+	path, err := sandboxsetup.CreateDevice(&req.args.Device, "/proc/fs/dev")
+	if err != nil {
+		req.done <- err
+		return
+	}
+
+	req.result.Path = path
+}
+
+func (req *createDeviceRequest) cancel(err error) {
+	defer close(req.done)
+
+	req.done <- err
+}
+
 func (rpc *goferToHostRPC) mountNSThread() error {
 	if err := unix.Unshare(unix.CLONE_FS); err != nil {
 		return fmt.Errorf("mount namespace thread: unshare filesystem attributes: %w", err)
@@ -199,6 +238,11 @@ func (rpc *goferToHostRPC) mountNSThread() error {
 	defer nsFd.Close()
 	if err := unix.Setns(int(nsFd.Fd()), unix.CLONE_NEWNS); err != nil {
 		return fmt.Errorf("mount namespace thread: join container mntns: %w", err)
+	}
+	if shouldCreateDeviceGofer(rpc.spec, rpc.conf) && !rpc.conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		if err := sandboxsetup.MountDevicesDir("/proc/fs/dev"); err != nil {
+			return fmt.Errorf("mount namespace thread: mount devices dir: %w", err)
+		}
 	}
 	for req := range rpc.mountNSRequests {
 		req.handle()
@@ -236,6 +280,23 @@ func (rpc *goferToHostRPC) OpenMount(reqArg *OpenMountArgs, res *OpenMountResult
 
 	rpc.startMountNSThread()
 	req := openMountRequest{
+		args:   reqArg,
+		result: res,
+		done:   make(chan error),
+	}
+	rpc.mountNSRequests <- &req
+	err := <-req.done
+	return err
+}
+
+// CreateDevice creates a specified device and returns a path to it. It is used
+// when the device can't be created in the gofer user namespace.
+func (rpc *goferToHostRPC) CreateDevice(reqArg *CreateDeviceArgs, res *CreateDeviceResult) error {
+	rpc.mu.Lock()
+	defer rpc.mu.Unlock()
+
+	rpc.startMountNSThread()
+	req := createDeviceRequest{
 		args:   reqArg,
 		result: res,
 		done:   make(chan error),

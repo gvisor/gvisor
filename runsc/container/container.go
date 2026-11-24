@@ -1893,7 +1893,7 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 	}
 	donations.DonateAndClose("mounts-fd", mountsGofer)
 
-	willNeedHostRPC, err := goferWillNeedHostRPC(c.Spec)
+	willNeedHostRPC, err := goferWillNeedHostRPC(c.Spec, conf)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("cannot determine whether the gofer needs gofer-to-host RPCs: %w", err)
 	}
@@ -1917,7 +1917,7 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 				return
 			}
 			s := urpc.NewServer()
-			s.Register(&goferToHostRPC{goferPID: pid})
+			s.Register(&goferToHostRPC{goferPID: pid, spec: c.Spec, conf: conf})
 			s.Handle(rpcServ)
 		}()
 	}
@@ -2649,7 +2649,11 @@ func modifySpecForDirectfs(conf *config.Config, spec *specs.Spec) error {
 // goferWillNeedHostRPC returns whether the gofer may need its setup process,
 // e.g. to open mounts that it cannot open itself (which need capabilities in
 // the initial user namespace, or different permissions).
-func goferWillNeedHostRPC(spec *specs.Spec) (bool, error) {
+func goferWillNeedHostRPC(spec *specs.Spec, conf *config.Config) (bool, error) {
+	// The gofer asks for the devices it exposes to be created.
+	if shouldCreateDeviceGofer(spec, conf) {
+		return true, nil
+	}
 	if slices.ContainsFunc(spec.Mounts, func(m specs.Mount) bool {
 		return specutils.IsIDMappedMount(m) || strings.HasPrefix(m.Source, "/proc/")
 	}) {

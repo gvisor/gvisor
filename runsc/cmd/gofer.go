@@ -207,6 +207,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	// Only pass the FD if the gofer will actually need it.
 	var goferToHostRPC *urpc.Client
 	var mountOpener sandboxsetup.MountOpener
+	var deviceCreator sandboxsetup.DeviceCreator
 	if g.goferToHostRPCFD >= 0 {
 		goferToHostRPCSock, err := unet.NewSocket(g.goferToHostRPCFD)
 		if err != nil {
@@ -214,6 +215,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		}
 		goferToHostRPC = urpc.NewClient(goferToHostRPCSock)
 		mountOpener = makeRPCMountOpener(goferToHostRPC)
+		deviceCreator = makeRPCDeviceCreator(goferToHostRPC)
 	}
 
 	var umounter *os.File
@@ -224,7 +226,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		if spawnUnmounter {
 			umounter = openProcUmounter()
 		}
-		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, containerID, g.bundleDir); err != nil {
+		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, deviceCreator, containerID, g.bundleDir); err != nil {
 			util.Fatalf("Error setting up root FS: %v", err)
 		}
 	}
@@ -588,6 +590,19 @@ func makeRPCMountOpener(goferToHostRPC *urpc.Client) sandboxsetup.MountOpener {
 			return nil, fmt.Errorf("opening %s: %w", m.Source, err)
 		}
 		return res.Files[0], nil
+	}
+}
+
+// makeRPCDeviceCreator returns a DeviceCreator that creates devices via the
+// gofer-to-host RPC channel.
+func makeRPCDeviceCreator(goferToHostRPC *urpc.Client) sandboxsetup.DeviceCreator {
+	return func(dev *specs.LinuxDevice) (string, error) {
+		req := container.CreateDeviceArgs{Device: *dev}
+		var res container.CreateDeviceResult
+		if err := goferToHostRPC.Call("goferToHostRPC.CreateDevice", &req, &res); err != nil {
+			return "", fmt.Errorf("creating %s: %w", dev.Path, err)
+		}
+		return res.Path, nil
 	}
 }
 

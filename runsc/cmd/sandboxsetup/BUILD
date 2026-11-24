@@ -13,6 +13,7 @@ go_library(
         "cpu_dma_latency.go",
         "cpu_dma_latency_amd64.go",
         "cpu_dma_latency_arm64.go",
+        "devices.go",
         "fdmappings.go",
         "flags.go",
         "fs.go",
@@ -44,6 +45,7 @@ go_test(
     name = "sandboxsetup_test",
     size = "small",
     srcs = [
+        "devices_test.go",
         "fs_test.go",
         "gofer_mount_test.go",
     ],
@@ -51,6 +53,7 @@ go_test(
     deps = [
         "//runsc/config",
         "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
