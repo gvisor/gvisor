@@ -74,8 +74,7 @@ type filesystem struct {
 	mopts string
 	iopts InternalFilesystemOptions
 
-	// devMinor is the filesystem's minor device number. devMinor is immutable
-	// once the filesystem is mounted or restored.
+	// devMinor is the filesystem's minor device number. devMinor is immutable.
 	devMinor uint32
 
 	// root is the root dentry. root is immutable.
@@ -84,8 +83,8 @@ type filesystem struct {
 	// image is the EROFS image. image is immutable.
 	image *erofs.Image
 
-	// superBlockChanged is true if the filesystem was restored with an image
-	// whose superblock is not the checkpointed one.
+	// superBlockChanged is true if the checkpoint was restored with a
+	// different image (e.g. due to injected files).
 	superBlockChanged bool `state:"nosave"`
 
 	// mf implements memmap.File for this image.
