@@ -311,16 +311,17 @@ func Processes(k *kernel.Kernel, containerID string, out *[]*controlapi.Process)
 			threads = append(threads, int32(tid))
 		}
 		*out = append(*out, &controlapi.Process{
-			UID:     tg.Leader().Credentials().EffectiveKUID,
-			PID:     int32(pid),
-			PPID:    int32(ppid),
-			PGID:    int32(pgid),
-			Threads: threads,
-			STime:   formatStartTime(now, tg.Leader().StartTime()),
-			C:       percentCPU(tg.CPUStats(), tg.Leader().StartTime(), now),
-			Time:    tg.CPUStats().SysTime.String(),
-			Cmd:     tg.Leader().Name(),
-			TTY:     ttyName(tg.TTY()),
+			UID:         tg.Leader().Credentials().EffectiveKUID,
+			PID:         int32(pid),
+			PPID:        int32(ppid),
+			PGID:        int32(pgid),
+			Threads:     threads,
+			STime:       formatStartTime(now, tg.Leader().StartTime()),
+			C:           percentCPU(tg.CPUStats(), tg.Leader().StartTime(), now),
+			Time:        tg.CPUStats().SysTime.String(),
+			Cmd:         tg.Leader().Name(),
+			TTY:         ttyName(tg.TTY()),
+			OOMScoreAdj: tg.Leader().OOMScoreAdj(),
 		})
 	}
 	sort.Slice(*out, func(i, j int) bool { return (*out)[i].PID < (*out)[j].PID })

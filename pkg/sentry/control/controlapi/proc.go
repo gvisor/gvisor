@@ -156,6 +156,8 @@ type Process struct {
 	Time string `json:"time"`
 	// Executable shortname (e.g. "sh" for /bin/sh)
 	Cmd string `json:"cmd"`
+	// OOMScoreAdj is the thread group's /proc/[pid]/oom_score_adj.
+	OOMScoreAdj int32 `json:"oom_score_adj"`
 }
 
 // ProcessListToTable prints a table with the following format:
