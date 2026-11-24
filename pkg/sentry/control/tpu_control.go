@@ -127,15 +127,20 @@ func restoreTPUTasks(k *kernel.Kernel, discover bool) error {
 }
 
 // Callers must not hold any thread-group leader's Task.mu in k.
-// checklocks cannot name the leader mutexes selected by ForEachThreadGroup.
 func findTPUTasks(k *kernel.Kernel) []*tpuTaskInfo {
-	var infos []*tpuTaskInfo
+	return findTPUTasksWithDeviceCheck(k, isTPUDevice)
+}
+
+// Callers must not hold any thread-group leader's Task.mu in k.
+// checklocks cannot name the leader mutexes selected by ForEachThreadGroup.
+func findTPUTasksWithDeviceCheck(k *kernel.Kernel, isDevice func(*vfs.FileDescription) bool) []*tpuTaskInfo {
+	var tasks []*kernel.Task
 	sctx := k.SupervisorContext()
 	k.TaskSet().ForEachThreadGroup(func(tg *kernel.ThreadGroup, tgLeader *kernel.Task) {
 		hasTPU := false
 		tgLeader.WithMuLocked(func(t *kernel.Task) {
 			t.FDTable().ForEach(sctx, func(_ int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
-				if isTPUDevice(file) {
+				if isDevice(file) {
 					hasTPU = true
 					return false
 				}
@@ -147,16 +152,24 @@ func findTPUTasks(k *kernel.Kernel) []*tpuTaskInfo {
 			return
 		}
 
-		tg.ForEachTask(func(t *kernel.Task) bool {
-			tpuInfo, err := extractTPUTaskInfo(t)
-			if err != nil {
-				log.Warningf("Failed to extract TPU task info for task %d: %v", t.ThreadID(), err)
-				return true
-			}
-			infos = append(infos, tpuInfo)
+		// ForEachThreadGroup holds the TaskSet read lock.
+		tg.ForEachTaskLocked(func(t *kernel.Task) bool {
+			tasks = append(tasks, t)
 			return true
 		})
 	})
+
+	// Extraction and error logging can look up task IDs, which acquire the
+	// TaskSet read lock. Run them after releasing the discovery lock.
+	infos := make([]*tpuTaskInfo, 0, len(tasks))
+	for _, t := range tasks {
+		tpuInfo, err := extractTPUTaskInfo(t)
+		if err != nil {
+			log.Warningf("Failed to extract TPU task info for task %d: %v", t.ThreadID(), err)
+			continue
+		}
+		infos = append(infos, tpuInfo)
+	}
 	return infos
 }
 

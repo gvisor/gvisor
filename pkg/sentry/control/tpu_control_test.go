@@ -16,11 +16,17 @@ package control
 
 import (
 	"errors"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 func TestRunTPURequests(t *testing.T) {
@@ -208,5 +214,136 @@ func TestPausedWithoutTPUTasks(t *testing.T) {
 	})
 	if prepared || err != nil {
 		t.Fatalf("preSaveTPU() = (%t, %v), want (false, nil)", prepared, err)
+	}
+}
+
+// newTPUDiscoveryTasks creates one thread group with the given task names and a
+// marker FD in its leader. The marker substitutes for a VFIO FD in discovery.
+func newTPUDiscoveryTasks(t testing.TB, names []string) (*kernel.Kernel, []*kernel.Task, *vfs.FileDescription) {
+	t.Helper()
+	k, err := testutil.Boot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(k.Timekeeper().Destroy)
+	ctx := k.SupervisorContext()
+	t.Cleanup(func() { k.GlobalInit().Release(ctx) })
+	mntns, err := k.VFS().NewMountNamespace(ctx, auth.CredentialsFromContext(ctx), "", "tmpfs", &vfs.MountOptions{}, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mntns.DecRef(ctx) })
+	root := mntns.Root(ctx)
+	t.Cleanup(func() { root.DecRef(ctx) })
+	var tasks []*kernel.Task
+	for _, name := range names {
+		task, err := testutil.CreateTask(ctx, name, k.GlobalInit(), mntns, root, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			task.MemoryManager().DecUsers(ctx)
+			task.FDTable().DecRef(ctx)
+		})
+		tasks = append(tasks, task)
+	}
+	vd := k.VFS().NewAnonVirtualDentry("tpu-discovery-marker")
+	defer vd.DecRef(ctx)
+	file := &vfs.FileDescription{}
+	if err := file.Init(&mockFDImpl{}, linux.O_RDONLY, auth.CredentialsFromContext(ctx), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { file.DecRef(ctx) })
+	if _, err := tasks[0].NewFDFrom(0, file, kernel.FDFlags{}); err != nil {
+		t.Fatal(err)
+	}
+	return k, tasks, file
+}
+
+func TestFindTPUTasks(t *testing.T) {
+	k, tasks, marker := newTPUDiscoveryTasks(t, []string{"libtpu00010002", "worker", "libtpu123", "libtpuXXXX0002", "libtpu00030004"})
+	for _, hasDevice := range []bool{false, true} {
+		infos := findTPUTasksWithDeviceCheck(k, func(file *vfs.FileDescription) bool {
+			return hasDevice && file == marker
+		})
+		if !hasDevice {
+			if len(infos) != 0 {
+				t.Fatalf("discovery without a device returned %d tasks", len(infos))
+			}
+			continue
+		}
+		if len(infos) != 2 {
+			t.Fatalf("discovery returned %d tasks, want 2", len(infos))
+		}
+		for i, index := range []int{0, 4} {
+			if got := infos[i]; got.task != tasks[index] || got.reqWriteFd != int32(2*i+1) || got.rspReadFd != int32(2*i+2) {
+				t.Errorf("discovery result %d = %+v, want task %p with FDs %d and %d", i, got, tasks[index], 2*i+1, 2*i+2)
+			}
+		}
+	}
+}
+
+func TestFindTPUTasksWithPendingWriter(t *testing.T) {
+	for _, name := range []string{"libtpu00010002", "worker", "libtpu123"} {
+		t.Run(name, func(t *testing.T) {
+			k, _, marker := newTPUDiscoveryTasks(t, []string{name})
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			done := make(chan []*tpuTaskInfo, 1)
+			writerDone := make(chan struct{})
+			go func() {
+				done <- findTPUTasksWithDeviceCheck(k, func(file *vfs.FileDescription) bool {
+					close(entered)
+					<-release
+					return file == marker
+				})
+			}()
+			<-entered
+			go func() {
+				_ = k.TaskSet().IsExiting()
+				close(writerDone)
+			}()
+			// Wait for the writer to reach the semaphore, after announcing
+			// itself to new readers. A start signal alone does not establish
+			// that the write lock is pending.
+			deadline := time.Now().Add(10 * time.Second)
+			buf := make([]byte, 1<<20)
+			for {
+				stacks := string(buf[:runtime.Stack(buf, true)])
+				pending := false
+				for _, stack := range strings.Split(stacks, "\n\n") {
+					if strings.Contains(stack, "[semacquire]") && strings.Contains(stack, "(*TaskSet).IsExiting") && strings.Contains(stack, "(*CrossGoroutineRWMutex).Lock") {
+						pending = true
+						break
+					}
+				}
+				if pending {
+					break
+				}
+				if time.Now().After(deadline) {
+					close(release)
+					t.Fatalf("TaskSet writer did not block:\n%s", stacks)
+				}
+				runtime.Gosched()
+			}
+			close(release)
+			select {
+			case infos := <-done:
+				want := 0
+				if name == "libtpu00010002" {
+					want = 1
+				}
+				if len(infos) != want {
+					t.Errorf("discovery returned %d tasks, want %d", len(infos), want)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("discovery blocked with a pending TaskSet writer")
+			}
+			select {
+			case <-writerDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("TaskSet writer did not finish after discovery")
+			}
+		})
 	}
 }
