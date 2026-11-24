@@ -15,7 +15,10 @@
 package specutils
 
 import (
+	"bufio"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -274,4 +277,40 @@ func removeNvproxyFrontendDevices(field, cName string, o, n []specs.LinuxDevice)
 	o = slices.DeleteFunc(slices.Clone(o), shouldDelete)
 	n = slices.DeleteFunc(slices.Clone(n), shouldDelete)
 	return o, n, nil
+}
+
+// NvidiaCharMajors returns the character device major numbers of the NVIDIA
+// drivers whose devices nvproxy exposes, from the procfs mounted at procPath.
+func NvidiaCharMajors(procPath string) ([]int64, error) {
+	f, err := os.Open(filepath.Join(procPath, "devices"))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// The frontend driver's major number is fixed; the other drivers' are
+	// allocated dynamically.
+	majors, err := parseDeviceMajors(f, []string{"nvidia-uvm", "nvidia-caps", "nvidia-caps-imex-channels"})
+	if err != nil {
+		return nil, err
+	}
+	return append([]int64{nvgpu.NV_MAJOR_DEVICE_NUMBER}, majors...), nil
+}
+
+// parseDeviceMajors returns the major numbers of the named devices listed in
+// /proc/devices.
+func parseDeviceMajors(r io.Reader, names []string) ([]int64, error) {
+	var majors []int64
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		fields := strings.Fields(s.Text())
+		if len(fields) != 2 || !slices.Contains(names, fields[1]) {
+			continue
+		}
+		major, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parsing /proc/devices line %q: %w", s.Text(), err)
+		}
+		majors = append(majors, major)
+	}
+	return majors, s.Err()
 }

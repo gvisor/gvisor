@@ -53,7 +53,6 @@ go_test(
         "console_test.go",
         "container_save_restore_test.go",
         "container_test.go",
-        "devices_test.go",
         "fscheckpoint_cordon_test.go",
         "gofer_to_host_rpc_test.go",
         "metric_server_test.go",

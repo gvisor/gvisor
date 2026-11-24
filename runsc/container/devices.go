@@ -15,18 +15,12 @@
 package container
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"slices"
-	"strconv"
-	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
@@ -91,7 +85,7 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 		// the device files for the GPUs visible to the container inside its
 		// rootfs, where the image can spoof them. Allow the NVIDIA drivers'
 		// devices by major number instead.
-		majors, err := nvidiaCharMajors()
+		majors, err := specutils.NvidiaCharMajors("/proc")
 		if err != nil {
 			return nil, err
 		}
@@ -121,42 +115,6 @@ func deviceRuleForPath(path, access string) (cgroup.DeviceRule, error) {
 		return r, fmt.Errorf("%q is not a device", path)
 	}
 	return r, nil
-}
-
-// nvidiaCharMajors returns the character device major numbers of the NVIDIA
-// drivers whose devices nvproxy exposes.
-func nvidiaCharMajors() ([]int64, error) {
-	f, err := os.Open("/proc/devices")
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	// The frontend driver's major number is fixed; the other drivers' are
-	// allocated dynamically.
-	majors, err := parseDeviceMajors(f, []string{"nvidia-uvm", "nvidia-caps", "nvidia-caps-imex-channels"})
-	if err != nil {
-		return nil, err
-	}
-	return append([]int64{nvgpu.NV_MAJOR_DEVICE_NUMBER}, majors...), nil
-}
-
-// parseDeviceMajors returns the major numbers of the named devices listed in
-// /proc/devices.
-func parseDeviceMajors(r io.Reader, names []string) ([]int64, error) {
-	var majors []int64
-	s := bufio.NewScanner(r)
-	for s.Scan() {
-		fields := strings.Fields(s.Text())
-		if len(fields) != 2 || !slices.Contains(names, fields[1]) {
-			continue
-		}
-		major, err := strconv.ParseInt(fields[0], 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("parsing /proc/devices line %q: %w", s.Text(), err)
-		}
-		majors = append(majors, major)
-	}
-	return majors, s.Err()
 }
 
 // allowDevices extends the sandbox cgroup cg with the host devices that the
