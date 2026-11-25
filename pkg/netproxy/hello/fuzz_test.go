@@ -59,6 +59,51 @@ func checkError(t *testing.T, what string, err error) {
 	}
 }
 
+// FuzzValidate decodes arbitrary bytes after a valid header and validates the
+// result. Every failure must be an *Error, and a message that passes
+// validation must fit in a datagram when encoded again.
+func FuzzValidate(f *testing.F) {
+	for _, b := range seeds(f) {
+		// The target maps typ to Type(typ%4 + 1).
+		f.Add(b[4]-1, b[HeaderSize:])
+	}
+	f.Fuzz(func(t *testing.T, typ uint8, body []byte) {
+		h := Header{Type: Type(typ%4 + 1), Major: Major}
+		b, err := Marshal(h, newMessage(h.Type))
+		if err != nil {
+			t.Fatalf("Marshal(%v) failed: %v", h.Type, err)
+		}
+		b = append(b, body...)
+		if len(b) > MaxMessageSize {
+			return
+		}
+		b[8], b[9] = byte(len(b)>>8), byte(len(b))
+		_, msg, err := Unmarshal(b)
+		checkError(t, "Unmarshal()", err)
+		if err != nil {
+			return
+		}
+		switch m := msg.(type) {
+		case *pb.Offer:
+			err = ValidateOffer(m)
+			checkError(t, "ValidateOffer()", err)
+		case *pb.Config:
+			for _, offer := range []*pb.Offer{
+				singleLinkOffer(),
+				{SupportedMajors: []uint32{Major}, LinkIndex: 1, LinkCount: 2},
+			} {
+				err = ValidateConfig(m, offer)
+				checkError(t, "ValidateConfig()", err)
+			}
+		}
+		if err == nil {
+			if _, err := Marshal(h, msg); err != nil {
+				t.Fatalf("Marshal() of a valid %v failed: %v", h.Type, err)
+			}
+		}
+	})
+}
+
 // FuzzRoundTrip checks that any datagram that decodes encodes again to one
 // that decodes to an equal header and message.
 func FuzzRoundTrip(f *testing.F) {

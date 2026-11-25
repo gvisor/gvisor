@@ -13,7 +13,10 @@ proto_library(
 
 go_library(
     name = "hello",
-    srcs = ["hello.go"],
+    srcs = [
+        "hello.go",
+        "validate.go",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":hello_go_proto",
@@ -27,6 +30,7 @@ go_test(
     srcs = [
         "fuzz_test.go",
         "hello_test.go",
+        "validate_test.go",
     ],
     embed = [":hello"],
     deps = [
