@@ -1725,3 +1725,66 @@ func TestSafeSetupAndMountDanglingSymlink(t *testing.T) {
 		t.Errorf("os.Lstat(%q) err = %v, want %v", missing, err, os.ErrNotExist)
 	}
 }
+
+// TestSandboxID verifies the sandbox ID that is found in the containerd and
+// CRI-O annotations.
+func TestSandboxID(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		wantID      string
+		wantOK      bool
+	}{
+		{
+			name:        "containerd",
+			annotations: map[string]string{ContainerdSandboxIDAnnotation: "sb"},
+			wantID:      "sb",
+			wantOK:      true,
+		},
+		{
+			name:        "crio",
+			annotations: map[string]string{CRIOSandboxIDAnnotation: "sb"},
+			wantID:      "sb",
+			wantOK:      true,
+		},
+		{
+			name: "containerd takes precedence over crio",
+			annotations: map[string]string{
+				ContainerdSandboxIDAnnotation: "containerd-sb",
+				CRIOSandboxIDAnnotation:       "crio-sb",
+			},
+			wantID: "containerd-sb",
+			wantOK: true,
+		},
+		{
+			name: "empty containerd falls back to crio",
+			annotations: map[string]string{
+				ContainerdSandboxIDAnnotation: "",
+				CRIOSandboxIDAnnotation:       "crio-sb",
+			},
+			wantID: "crio-sb",
+			wantOK: true,
+		},
+		{
+			name: "all empty",
+			annotations: map[string]string{
+				ContainerdSandboxIDAnnotation: "",
+				CRIOSandboxIDAnnotation:       "",
+			},
+		},
+		{
+			name:        "none",
+			annotations: map[string]string{"other": "sb"},
+		},
+		{
+			name: "nil",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := &specs.Spec{Annotations: tc.annotations}
+			if id, ok := SandboxID(spec); id != tc.wantID || ok != tc.wantOK {
+				t.Errorf("SandboxID(%v) = %q, %t, want %q, %t", tc.annotations, id, ok, tc.wantID, tc.wantOK)
+			}
+		})
+	}
+}

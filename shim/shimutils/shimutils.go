@@ -344,13 +344,10 @@ func NewMockContainerd(t testing.TB, shimArgsOverrides, runscArgsOverrides map[s
 }
 
 // NewMockContainerdForBenchmark creates a MockContainerd configured for low-overhead
-// microbenchmarking (enabling shim pod grouping and GKE production flags while disabling debug
-// logging, strace, and packet logging) with explicit per-iteration Cleanup() support.
+// microbenchmarking (enabling GKE production flags while disabling debug logging, strace, and
+// packet logging) with explicit per-iteration Cleanup() support.
 func NewMockContainerdForBenchmark(b *testing.B, conf *config.Config) *MockContainerd {
 	b.Helper()
-	shimArgs := map[string]any{
-		"grouping": true,
-	}
 	runscArgs := map[string]any{
 		"allow-packet-socket-write": fmt.Sprintf("%t", conf.AllowPacketEndpointWrite),
 		"allow-suid":                fmt.Sprintf("%t", conf.AllowSUID),
@@ -363,7 +360,7 @@ func NewMockContainerdForBenchmark(b *testing.B, conf *config.Config) *MockConta
 		"systemd-cgroup":            fmt.Sprintf("%t", conf.SystemdCgroup),
 		"watchdog-action":           conf.WatchdogAction,
 	}
-	cd := newMockContainerdWithSuffix(b, "", shimArgs, runscArgs, true /* benchMode */)
+	cd := newMockContainerdWithSuffix(b, "", nil, runscArgs, true /* benchMode */)
 	cd.shimSocket = filepath.Join(cd.eventWd, "shim.sock")
 	var err error
 	if cd.logFile, err = os.Create(filepath.Join(cd.wd, "log")); err != nil {

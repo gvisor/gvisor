@@ -158,9 +158,8 @@ func TestShutdownResponse(t *testing.T) {
 			wantShutdown: true,
 		},
 		{
-			// With shim grouping, a single shim services all containers of a
-			// pod and receives a Shutdown request every time one of them is
-			// deleted.
+			// A single shim services all containers of a pod and receives a
+			// Shutdown request every time one of them is deleted.
 			name:         "still servicing containers",
 			main:         &fakeTaskService{shutdownErr: errors.New("shim still servicing 1 containers")},
 			wantShutdown: false,
@@ -200,8 +199,7 @@ func TestPodExtensionCalledOncePerPod(t *testing.T) {
 	t.Run("caches nil extension", func(t *testing.T) {
 		main := &fakeTaskService{createPid: 123}
 		s := &shimRedirector{
-			main:     main,
-			grouping: true,
+			main: main,
 		}
 		var podExtCalls int
 		extension.NewPodExtension = func(context.Context, extension.TaskServiceExt, *task.CreateTaskRequest) (extension.TaskServiceExt, error) {
@@ -240,8 +238,7 @@ func TestPodExtensionCalledOncePerPod(t *testing.T) {
 		main := &fakeTaskService{createPid: 123}
 		ext := &fakeTaskService{createPid: 456}
 		s := &shimRedirector{
-			main:     main,
-			grouping: true,
+			main: main,
 		}
 		var podExtCalls int
 		extension.NewPodExtension = func(context.Context, extension.TaskServiceExt, *task.CreateTaskRequest) (extension.TaskServiceExt, error) {
@@ -275,8 +272,7 @@ func TestPodExtensionCalledOncePerPod(t *testing.T) {
 	t.Run("retries after error", func(t *testing.T) {
 		main := &fakeTaskService{createPid: 123}
 		s := &shimRedirector{
-			main:     main,
-			grouping: true,
+			main: main,
 		}
 		var podExtCalls int
 		extension.NewPodExtension = func(context.Context, extension.TaskServiceExt, *task.CreateTaskRequest) (extension.TaskServiceExt, error) {

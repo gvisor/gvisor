@@ -25,13 +25,9 @@ import (
 	"github.com/containerd/containerd/v2/pkg/stdio"
 )
 
-// NewExtension registers an extension constructor. It may return nil, nil to indicate that the
-// extension should not handle this task request. Returning an error will fail the task request.
-var NewExtension func(ctx context.Context, next TaskServiceExt, req *task.CreateTaskRequest) (TaskServiceExt, error)
-
-// NewPodExtension registers an extension constructor which is used when grouping is enabled.
-// It may return nil, nil to indicate that the extension should not handle this task request.
-// Returning an error will fail the task request.
+// NewPodExtension registers an extension constructor. The shim uses the extension for all
+// containers of the pod. It may return nil, nil to indicate that the extension should not handle
+// the pod. Returning an error will fail the task request.
 var NewPodExtension func(ctx context.Context, next TaskServiceExt, req *task.CreateTaskRequest) (TaskServiceExt, error)
 
 // FSRestoreConfig is the configuration for a FS restore request.

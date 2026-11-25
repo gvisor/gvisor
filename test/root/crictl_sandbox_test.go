@@ -73,7 +73,7 @@ func TestSandboxControllerUnimplemented(t *testing.T) {
 	}
 
 	// Setup containerd and crictl.
-	crictl, cleanup, err := setup(t, false /* enableGrouping */)
+	crictl, cleanup, err := setup(t)
 	if err != nil {
 		t.Fatalf("failed to setup crictl: %v", err)
 	}

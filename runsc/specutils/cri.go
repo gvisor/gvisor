@@ -108,12 +108,13 @@ func IsRootContainer(spec *specs.Spec) bool {
 }
 
 // SandboxID returns the ID of the sandbox to join and whether an ID was found
-// in the spec.
+// in the spec. The containerd annotation takes precedence over the CRI-O
+// annotation. An annotation with an empty value is ignored.
 func SandboxID(spec *specs.Spec) (string, bool) {
-	if id, ok := spec.Annotations[ContainerdSandboxIDAnnotation]; ok {
+	if id := spec.Annotations[ContainerdSandboxIDAnnotation]; id != "" {
 		return id, true
 	}
-	if id, ok := spec.Annotations[CRIOSandboxIDAnnotation]; ok {
+	if id := spec.Annotations[CRIOSandboxIDAnnotation]; id != "" {
 		return id, true
 	}
 	return "", false

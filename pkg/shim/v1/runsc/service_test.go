@@ -191,10 +191,10 @@ func (p *errorPublisher) Close() error {
 // TestForwardDoesNotPanicOnPublishError verifies that the event forward loop
 // logs publish errors instead of panicking, whether or not an event sink is
 // configured (TTRPC_ADDRESS is empty under CRI-O). The publisher queues failed
-// events for retry, and with shim grouping a panic would take down every
-// container in the pod. It also verifies that events are published with a live
-// context that keeps the namespace, even once the shim context is done, and
-// that the publisher is closed once all events are drained.
+// events for retry, and a panic would take down every container in the pod.
+// It also verifies that events are published with a live context that keeps
+// the namespace, even once the shim context is done, and that the publisher is
+// closed once all events are drained.
 func TestForwardDoesNotPanicOnPublishError(t *testing.T) {
 	for _, tc := range []struct {
 		name         string

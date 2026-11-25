@@ -28,64 +28,73 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/shim"
 	typeurl "github.com/containerd/typeurl/v2"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-spec/specs-go/features"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsc"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
-// TestResolveGrouping verifies that resolveGrouping correctly extracts the
-// sandbox ID from both containerd and CRI-O annotations.
-func TestResolveGrouping(t *testing.T) {
-	const containerID = "test-container-id"
-	const sandboxID = "test-sandbox-id"
-
+// TestSocketKey verifies that the shim socket key is the sandbox ID if the
+// spec has one, and the container ID if not.
+func TestSocketKey(t *testing.T) {
+	const (
+		containerID = "test-container-id"
+		sandboxID   = "test-sandbox-id"
+	)
 	for _, tc := range []struct {
-		name        string
-		annotations map[string]string
-		want        string
+		name string
+		spec *specs.Spec
+		want string
 	}{
 		{
-			name:        "containerd annotation",
-			annotations: map[string]string{kubernetesGroupAnnotation: sandboxID},
-			want:        sandboxID,
+			name: "sandbox ID",
+			spec: &specs.Spec{Annotations: map[string]string{specutils.ContainerdSandboxIDAnnotation: sandboxID}},
+			want: "runsc/" + sandboxID,
 		},
 		{
-			name:        "crio annotation",
-			annotations: map[string]string{specutils.CRIOSandboxIDAnnotation: sandboxID},
-			want:        sandboxID,
+			name: "no sandbox ID",
+			spec: &specs.Spec{Annotations: map[string]string{specutils.ContainerdSandboxIDAnnotation: ""}},
+			want: "runsc/" + containerID,
 		},
 		{
-			name: "containerd takes precedence over crio",
-			annotations: map[string]string{
-				kubernetesGroupAnnotation:         "containerd-sandbox",
-				specutils.CRIOSandboxIDAnnotation: "crio-sandbox",
-			},
-			want: "containerd-sandbox",
-		},
-		{
-			name:        "no annotation returns container ID",
-			annotations: map[string]string{},
-			want:        containerID,
-		},
-		{
-			name:        "nil annotations returns container ID",
-			annotations: nil,
-			want:        containerID,
-		},
-		{
-			name:        "unrelated annotations returns container ID",
-			annotations: map[string]string{"io.kubernetes.cri-o.ContainerType": "container"},
-			want:        containerID,
+			name: "no spec",
+			want: "runsc/" + containerID,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveGrouping(containerID, tc.annotations)
-			if got != tc.want {
-				t.Errorf("resolveGrouping(%q, %v) = %q, want %q", containerID, tc.annotations, got, tc.want)
+			if got := socketKey(containerID, tc.spec); got != tc.want {
+				t.Errorf("socketKey(%q, %+v) = %q, want %q", containerID, tc.spec, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSocketAddressIsRuntimeSpecific verifies that the shim socket address for
+// a sandbox ID differs from the address that another shim, such as the runc
+// shim, derives from the same sandbox ID.
+func TestSocketAddressIsRuntimeSpecific(t *testing.T) {
+	const (
+		containerdAddress = "/run/containerd/containerd.sock"
+		sandboxID         = "test-sandbox-id"
+	)
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	spec := &specs.Spec{Annotations: map[string]string{specutils.ContainerdSandboxIDAnnotation: sandboxID}}
+	for _, debug := range []bool{false, true} {
+		otherAddr, err := shim.SocketAddress(ctx, containerdAddress, sandboxID, debug)
+		if err != nil {
+			t.Fatalf("SocketAddress(%q) failed: %v", sandboxID, err)
+		}
+		key := socketKey("test-container-id", spec)
+		runscAddr, err := shim.SocketAddress(ctx, containerdAddress, key, debug)
+		if err != nil {
+			t.Fatalf("SocketAddress(%q) failed: %v", key, err)
+		}
+		if runscAddr == otherAddr {
+			t.Errorf("debug=%t: runsc shim socket address %q is the same as the address derived from the sandbox ID", debug, runscAddr)
+		}
 	}
 }
 
