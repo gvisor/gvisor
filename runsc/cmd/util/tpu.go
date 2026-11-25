@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,22 +26,16 @@ import (
 )
 
 const (
-	googleVendorID            = 0x1AE0
-	accelDevicePathRegex      = `^/dev/accel(\d+)$`
-	accelSysfsFormat          = "/sys/class/accel/accel%d/device/%s"
-	vfioDevicePathRegex       = `^/dev/vfio/(\d+)$`
-	iommuGroupSysfsGlobFormat = "/sys/kernel/iommu_groups/%s/devices/*"
-	vendorFile                = "vendor"
-	deviceFile                = "device"
-	pciAddressMaxLength       = 13
+	googleVendorID       = 0x1AE0
+	accelDevicePathRegex = `^/dev/accel(\d+)$`
+	accelSysfsFormat     = "/sys/class/accel/accel%d/device/%s"
+	vendorFile           = "vendor"
+	deviceFile           = "device"
+	pciAddressMaxLength  = 13
 )
 
 var (
-	tpuV4DeviceIDs   = map[uint64]struct{}{tpu.TPUV4DeviceID: {}, tpu.TPUV4liteDeviceID: {}}
-	tpuVFIODeviceIDs = map[uint64]struct{}{
-		tpu.TPUV4DeviceID: {}, tpu.TPUV4liteDeviceID: {}, tpu.TPUV5eDeviceID: {}, tpu.TPUV5pDeviceID: {},
-		tpu.TPUV6eDeviceID: {}, tpu.TPUV7xDeviceID: {}, tpu.TPUV6ePFDeviceID: {}, tpu.TPUV7xPFDeviceID: {},
-	}
+	tpuV4DeviceIDs = map[uint64]struct{}{tpu.TPUV4DeviceID: {}, tpu.TPUV4liteDeviceID: {}}
 	// Matches PCI device addresses in domain:bus:device.function form.
 	pciDeviceRegex = regexp.MustCompile(tpu.PCIDeviceRegexPattern)
 )
@@ -71,16 +64,9 @@ func IsPCIDeviceDirTPU(sysfsPath string, allowedDeviceIDs map[uint64]struct{}) b
 	return true
 }
 
-// IsTPUDeviceValid returns if the accelerator device is valid.
+// IsTPUDeviceValid returns if path is a valid TPU accel device, /dev/accel#.
 func IsTPUDeviceValid(path string) (bool, error) {
-	valid, err := tpuV4DeviceValid(path)
-	if err != nil {
-		return false, err
-	}
-	if valid {
-		return valid, err
-	}
-	return tpuVFIODeviceValid(path)
+	return tpuV4DeviceValid(path)
 }
 
 // tpuV4DeviceValid returns v4 and v4lite TPU device minor number for the given path.
@@ -113,37 +99,6 @@ func tpuV4DeviceValid(devPath string) (bool, error) {
 		return false, err
 	}
 	if _, ok := tpuV4DeviceIDs[deviceID]; !ok {
-		return false, nil
-	}
-	return true, nil
-}
-
-// tpuVFIODeviceValid returns the v5e TPU device minor number for te given path.
-// A valid VFIO TPU device is defined as:
-// * Path is /dev/vfio/#.
-// * Vendor is googleVendorID.
-// * Device ID is one of tpuVFIODeviceIDs.
-func tpuVFIODeviceValid(devPath string) (bool, error) {
-	paths, err := filepath.Glob(fmt.Sprintf(iommuGroupSysfsGlobFormat, path.Base(devPath)))
-	if err != nil {
-		return false, err
-	}
-	if len(paths) != 1 {
-		return false, fmt.Errorf("found %d paths for %s", len(paths), devPath)
-	}
-	sysfsPath := paths[0]
-	vendor, err := readHexInt(path.Join(sysfsPath, vendorFile))
-	if err != nil {
-		return false, err
-	}
-	if vendor != googleVendorID {
-		return false, nil
-	}
-	deviceID, err := readHexInt(path.Join(sysfsPath, deviceFile))
-	if err != nil {
-		return false, err
-	}
-	if _, ok := tpuVFIODeviceIDs[deviceID]; !ok {
 		return false, nil
 	}
 	return true, nil
