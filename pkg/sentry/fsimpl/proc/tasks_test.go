@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -944,5 +945,43 @@ func TestCPUInfo(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(out), "bogomips\t: 1234.50\n") {
 		t.Errorf("/proc/cpuinfo does not report the recorded frequency:\n%s", out)
+	}
+}
+
+func TestWriteSentryMeminfo(t *testing.T) {
+	var base runtime.MemStats
+	base.PauseNs[0] = 11111
+	base.PauseNs[255] = 99999
+
+	for _, tc := range []struct {
+		name      string
+		numGC     uint32
+		fraction  float64
+		wantPause uint64
+		wantPPM   uint64
+	}{
+		{"no_gc", 0, 0.0123456, 0, 12346},
+		{"first_gc", 1, 0.0123456, 11111, 12346},
+		{"ring_end", 256, 0.0123456, 99999, 12346},
+		{"ring_wrap", 257, 0.0123456, 11111, 12346},
+		{"negative_fraction", 1, -0.5, 11111, 0},
+		{"nan_fraction", 1, math.NaN(), 11111, 0},
+		{"pos_inf_fraction", 1, math.Inf(1), 11111, 0},
+		{"over_one_fraction", 1, 1.5, 11111, 1000000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base
+			m.NumGC = tc.numGC
+			m.GCCPUFraction = tc.fraction
+			var buf bytes.Buffer
+			writeSentryMeminfo(&buf, &m)
+			got := buf.String()
+			if want := fmt.Sprintf("LastPauseNs:    %12d ns\n", tc.wantPause); !strings.Contains(got, want) {
+				t.Errorf("writeSentryMeminfo() missing %q in:\n%s", want, got)
+			}
+			if want := fmt.Sprintf("GCCPUPPM:       %12d ppm\n", tc.wantPPM); !strings.Contains(got, want) {
+				t.Errorf("writeSentryMeminfo() missing %q in:\n%s", want, got)
+			}
+		})
 	}
 }

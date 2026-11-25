@@ -683,6 +683,16 @@ func TestSentryGODEBUG(t *testing.T) {
 			conf: config.Config{Platform: "systrap", Network: config.NetworkPlugin, ProfileEnable: true},
 			want: []string{"containermaxprocs=0", "cgocheck=0"},
 		},
+		{
+			name: "gctrace without profile",
+			conf: config.Config{Platform: "systrap", GCTrace: 1},
+			want: []string{"containermaxprocs=0", "memprofilerate=0", "gctrace=1"},
+		},
+		{
+			name: "gctrace with profile",
+			conf: config.Config{Platform: "systrap", ProfileEnable: true, GCTrace: 2},
+			want: []string{"containermaxprocs=0", "gctrace=2"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := sentryGODEBUG(&tc.conf); !slices.Equal(got, tc.want) {

@@ -1872,7 +1872,17 @@ TEST(ProcSentryMeminfo, ContainsFieldsAndEndsWithNewline) {
                     ContainsRegex(R"(Live Objects:\s+[0-9]+)"),
                     ContainsRegex(R"(HeapAlloc:\s+[0-9]+ kB)"),
                     ContainsRegex(R"(HeapSys:\s+[0-9]+ kB)"),
-                    ContainsRegex(R"(HeapObjects:\s+[0-9]+)")));
+                    ContainsRegex(R"(HeapObjects:\s+[0-9]+)"),
+                    ContainsRegex(R"(HeapIdle:\s+[0-9]+ B)"),
+                    ContainsRegex(R"(HeapInuse:\s+[0-9]+ B)"),
+                    ContainsRegex(R"(HeapReleased:\s+[0-9]+ B)"),
+                    ContainsRegex(R"(NextGC:\s+[0-9]+ B)"),
+                    ContainsRegex(R"(LastGC:\s+[0-9]+ ns)"),
+                    ContainsRegex(R"(PauseTotalNs:\s+[0-9]+ ns)"),
+                    ContainsRegex(R"(LastPauseNs:\s+[0-9]+ ns)"),
+                    ContainsRegex(R"(NumGC:\s+[0-9]+)"),
+                    ContainsRegex(R"(NumForcedGC:\s+[0-9]+)"),
+                    ContainsRegex(R"(GCCPUPPM:\s+[0-9]+ ppm)")));
 
   // Assert that /proc/sentry-meminfo ends with a new line.
   EXPECT_EQ(proc_sentry_meminfo.back(), '\n');

@@ -4813,6 +4813,39 @@ func TestProfile(t *testing.T) {
 	}
 }
 
+// TestGCTrace checks that --gctrace writes Sentry init and runtime GC trace
+// lines to --panic-log.
+func TestGCTrace(t *testing.T) {
+	spec := testutil.NewSpecWithArgs("/bin/bash", "-c", "true")
+	conf := testutil.TestConfig(t)
+	conf.GCTrace = 1
+	conf.PanicLog = filepath.Join(t.TempDir(), "panic.log")
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("SetupContainer() failed: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+		Attached:  true,
+	}
+	if _, err := Run(conf, args); err != nil {
+		t.Fatalf("Run() failed: %v", err)
+	}
+
+	got, err := os.ReadFile(conf.PanicLog)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) failed: %v", conf.PanicLog, err)
+	}
+	if !strings.Contains(string(got), "gc 1 @") {
+		t.Errorf("os.ReadFile(%q) missing initial gc 1 trace line:\n%s", conf.PanicLog, got)
+	}
+}
+
 // TestProfileLive checks that live CPU and Heap profiling on a running sandbox.
 func TestProfileLive(t *testing.T) {
 	spec, conf := sleepSpecConf(t)

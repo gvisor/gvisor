@@ -118,12 +118,18 @@ func TestFromFlags(t *testing.T) {
 	if err := testFlags.Lookup("network-proxy-path").Value.Set("/run/netproxy.sock"); err != nil {
 		t.Errorf("Flag set: %v", err)
 	}
+	if err := testFlags.Lookup("gctrace").Value.Set("1"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
 	c, err = NewFromFlags(testFlags)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := "/run/netproxy.sock"; c.NetworkProxyPath != want || !c.UseNetworkProxy() {
 		t.Errorf("NetworkProxyPath=%q UseNetworkProxy()=%v, want %q and true", c.NetworkProxyPath, c.UseNetworkProxy(), want)
+	}
+	if want := 1; c.GCTrace != want {
+		t.Errorf("GCTrace=%d, want %d", c.GCTrace, want)
 	}
 
 	if err := testFlags.Lookup("network-proxy-path").Value.Set(""); err != nil {
@@ -561,6 +567,16 @@ func TestValidationFail(t *testing.T) {
 				"network-proxy-path": "/run/netproxy.sock",
 			},
 			error: "netgofer and network-proxy-path flags cannot both be set",
+		},
+		{
+			name:  "gctrace:negative",
+			flags: map[string]string{"gctrace": "-1"},
+			error: "gctrace must be in [0,",
+		},
+		{
+			name:  "gctrace:overflow",
+			flags: map[string]string{"gctrace": "2147483648"},
+			error: "gctrace must be in [0,",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
