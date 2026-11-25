@@ -57,6 +57,9 @@ build --build_tag_filters=-nogo
 
 # Select the ordinary syscall tests used by public CI.
 test:syscalls-amd64 --test_tag_filters=-allsave,-runsc_slimvm
+# Select the AMD64 syscall tests run under lockdep (gVisor platforms only,
+# excluding save/restore and nogotsan tests).
+test:syscalls-amd64-lockdep --test_tag_filters=-allsave,-runsc_slimvm,-nogotsan
 test:syscalls-arm64 --test_tag_filters=-allsave,runsc_ptrace,runsc_systrap
 # ARM64 binaries support both 4K and 64K pages, so 64K page hosts run the same
 # binaries as 4K page hosts; only the selected platforms differ.
