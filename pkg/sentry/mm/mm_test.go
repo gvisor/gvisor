@@ -1383,3 +1383,105 @@ func TestGetByteSlicePtrZeroed(t *testing.T) {
 		putByteSlicePtr(s)
 	}
 }
+
+// TestFaultDuringAsyncPageLoad tests that a fault on pages that are being
+// loaded asynchronously does not block a fault on pages that are already
+// loaded.
+func TestFaultDuringAsyncPageLoad(t *testing.T) {
+	const (
+		size  = 2 * asyncLoadMapUnit
+		gated = asyncLoadMapUnit
+	)
+	ctx := contexttest.Context(t)
+
+	src := newTestMemoryFile(t)
+	fr, err := src.Allocate(size, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate got err %v want nil", err)
+	}
+	if _, err := unix.Pwrite(src.FD(), bytes.Repeat([]byte{1}, size), int64(fr.Start)); err != nil {
+		t.Fatalf("Pwrite got err %v want nil", err)
+	}
+	var metadata, pages bytes.Buffer
+	saveDone := make(chan error, 1)
+	apfs, err := pgalloc.StartAsyncPagesFileSave(stateio.NewIOWriter(&pages, 1<<20, 1, 1), func(err error) { saveDone <- err })
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileSave got err %v want nil", err)
+	}
+	if err := src.SaveTo(ctx, &metadata, &pgalloc.SaveOpts{PagesFile: apfs}); err != nil {
+		t.Fatalf("SaveTo got err %v want nil", err)
+	}
+	apfs.MemoryFilesDone()
+	if err := <-saveDone; err != nil {
+		t.Fatalf("async page save got err %v want nil", err)
+	}
+
+	mf := newTestMemoryFile(t)
+	gate := make(chan struct{})
+	loadDone := make(chan error, 1)
+	apfl, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(&gatedReaderAt{bytes.NewReader(pages.Bytes()), gated, gate}, 1<<20, 1, 2), func(err error) { loadDone <- err }, nil, pgalloc.AsyncPagesFileLoadOpts{})
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad got err %v want nil", err)
+	}
+	if err := mf.LoadFrom(ctx, &metadata, &pgalloc.LoadOpts{PagesFile: apfl}); err != nil {
+		t.Fatalf("LoadFrom got err %v want nil", err)
+	}
+	apfl.MemoryFilesDone()
+
+	// Ensure the ungated first half is loaded before testing concurrent faults.
+	if _, err := mf.MapInternal(memmap.FileRange{fr.Start, fr.Start + gated}, hostarch.Read); err != nil {
+		t.Fatalf("MapInternal ungated half got err %v want nil", err)
+	}
+
+	// Map the restored pages with a single pma.
+	mm := testMemoryManager(ctx, t)
+	mm.mf = mf // mm has no mappings yet.
+	defer mm.DecUsers(ctx)
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   size,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+	ar := hostarch.AddrRange{addr, addr + size}
+	mm.activeMu.Lock()
+	mm.pmas.Insert(mm.pmas.FindGap(ar.Start), ar, pma{
+		file:           mf,
+		off:            fr.Start,
+		translatePerms: hostarch.AnyAccess,
+		effectivePerms: hostarch.ReadWrite,
+		maxPerms:       hostarch.AnyAccess,
+		private:        true,
+	})
+	mm.addRSSLocked(ar)
+	mm.activeMu.Unlock()
+
+	// Faulting on pages past offset gated waits until gate is closed, but must
+	// not hold activeMu and block a concurrent fault on already-loaded pages.
+	gatedErr := make(chan error, 1)
+	go func() {
+		gatedErr <- mm.HandleUserFault(ctx, addr+gated+pageSizeAddr, hostarch.Read, 0)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	timer := time.AfterFunc(2*time.Second, func() {
+		t.Errorf("HandleUserFault on loaded page blocked behind unloaded fault")
+		close(gate)
+	})
+	faultErr := mm.HandleUserFault(ctx, addr+pageSizeAddr, hostarch.Read, 0)
+	if timer.Stop() {
+		close(gate)
+	}
+	if faultErr != nil {
+		t.Errorf("HandleUserFault on loaded page got err %v want nil", faultErr)
+	}
+	if err := <-gatedErr; err != nil {
+		t.Errorf("HandleUserFault past offset %#x got err %v want nil", gated, err)
+	}
+	if err := <-loadDone; err != nil {
+		t.Errorf("async page load got err %v want nil", err)
+	}
+}
