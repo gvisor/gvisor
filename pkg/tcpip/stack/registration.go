@@ -272,11 +272,6 @@ type TransportProtocol interface {
 	// NewRawEndpoint creates a new raw endpoint of the transport protocol.
 	NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waitQueue *waiter.Queue) (tcpip.Endpoint, tcpip.Error)
 
-	// MinimumPacketSize returns the minimum valid packet size of this
-	// transport protocol. The stack automatically drops any packets smaller
-	// than this targeted at this protocol.
-	MinimumPacketSize() int
-
 	// ParsePorts returns the source and destination ports stored in a
 	// packet of this protocol.
 	ParsePorts(b []byte) (src, dst uint16, err tcpip.Error)
@@ -317,8 +312,7 @@ type TransportProtocol interface {
 	Restore()
 
 	// Parse sets pkt.TransportHeader and trims pkt.Data appropriately. It does
-	// neither and returns false if pkt.Data is too small, i.e. pkt.Data.Size() <
-	// MinimumPacketSize()
+	// neither and returns false if pkt.Data is too small to hold the header.
 	Parse(pkt *PacketBuffer) (ok bool)
 }
 
@@ -1010,11 +1004,6 @@ type MulticastForwardingNetworkEndpoint interface {
 type NetworkProtocol interface {
 	// Number returns the network protocol number.
 	Number() tcpip.NetworkProtocolNumber
-
-	// MinimumPacketSize returns the minimum valid packet size of this
-	// network protocol. The stack automatically drops any packets smaller
-	// than this targeted at this protocol.
-	MinimumPacketSize() int
 
 	// ParseAddresses returns the source and destination addresses stored in a
 	// packet of this protocol.

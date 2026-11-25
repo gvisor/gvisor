@@ -122,11 +122,6 @@ func (*testIPv6Protocol) Number() tcpip.NetworkProtocolNumber {
 	return header.IPv6ProtocolNumber
 }
 
-// MinimumPacketSize implements NetworkProtocol.MinimumPacketSize.
-func (*testIPv6Protocol) MinimumPacketSize() int {
-	return header.IPv6MinimumSize
-}
-
 // ParseAddresses implements NetworkProtocol.ParseAddresses.
 func (*testIPv6Protocol) ParseAddresses(v []byte) (src, dst tcpip.Address) {
 	h := header.IPv6(v)

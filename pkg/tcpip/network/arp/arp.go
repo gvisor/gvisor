@@ -283,7 +283,6 @@ type protocol struct {
 }
 
 func (p *protocol) Number() tcpip.NetworkProtocolNumber { return ProtocolNumber }
-func (p *protocol) MinimumPacketSize() int              { return header.ARPSize }
 
 func (*protocol) ParseAddresses([]byte) (src, dst tcpip.Address) {
 	return tcpip.Address{}, tcpip.Address{}

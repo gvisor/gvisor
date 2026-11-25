@@ -182,10 +182,6 @@ func (*fwdTestNetworkProtocol) Number() tcpip.NetworkProtocolNumber {
 	return fwdTestNetNumber
 }
 
-func (*fwdTestNetworkProtocol) MinimumPacketSize() int {
-	return fwdTestNetHeaderLen
-}
-
 func (*fwdTestNetworkProtocol) ParseAddresses(v []byte) (src, dst tcpip.Address) {
 	return tcpip.AddrFrom4Slice(v[srcAddrOffset : srcAddrOffset+4]), tcpip.AddrFrom4Slice(v[dstAddrOffset : dstAddrOffset+4])
 }

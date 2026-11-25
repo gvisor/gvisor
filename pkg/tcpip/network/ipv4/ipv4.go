@@ -1722,11 +1722,6 @@ func (p *protocol) Number() tcpip.NetworkProtocolNumber {
 	return ProtocolNumber
 }
 
-// MinimumPacketSize returns the minimum valid ipv4 packet size.
-func (p *protocol) MinimumPacketSize() int {
-	return header.IPv4MinimumSize
-}
-
 // ParseAddresses implements stack.NetworkProtocol.
 func (*protocol) ParseAddresses(v []byte) (src, dst tcpip.Address) {
 	h := header.IPv4(v)
