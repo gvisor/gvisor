@@ -1848,7 +1848,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		wakeups = wakeups[:0]
 		for _, fr := range decRefs {
-			fr.amfl.f.DecRef(fr.FileRange)
+			fr.amfl.f.decAsyncLoadTempRef(fr.FileRange)
 		}
 		decRefs = decRefs[:0]
 	}
@@ -2045,7 +2045,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
 					ulseg.ValuePtr().started = true
 					amfl.minUnstarted = ulFR.End
-					amfl.f.incRefLocked(ulFR)
+					amfl.f.incAsyncLoadTempRefLocked(ulFR)
 					if (throttled && partial) || !apfl.canEnqueue() {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()

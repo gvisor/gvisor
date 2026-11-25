@@ -207,6 +207,12 @@ type MemoryFile struct {
 	// failed async page loading.
 	asyncPageLoad atomic.Pointer[asyncMemoryFileLoad]
 
+	// asyncLoadTempRefs tracks ranges on which AsyncPagesFileLoad currently
+	// holds a temporary reference.
+	//
+	// asyncLoadTempRefs is protected by mu.
+	asyncLoadTempRefs tempRefSet
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
@@ -1271,36 +1277,95 @@ func (f *MemoryFile) FirstSharedRange(fr memmap.FileRange) (memmap.FileRange, bo
 }
 
 // PSSShift is the number of fractional bits in the proportional size returned
-// by SharedBytes, as in Linux's fs/proc/task_mmu.c:PSS_SHIFT.
+// by SharedBytes.
 const PSSShift = 12
 
+// sharedBytesYieldSegments is the maximum number of unfree segments
+// SharedBytes visits per f.mu lock acquisition.
+const sharedBytesYieldSegments = 1024
+
 // SharedBytes returns the number of bytes in fr on which more than one
-// reference is held, and the sum over those pages of the page size divided by
-// the page's reference count, in units of 2^-PSSShift bytes. As for
-// HasUniqueRef, the result is racy unless the caller prevents other goroutines
-// from copying fr.
+// non-loader reference is held, and the sum over those pages of the page size
+// divided by the page's reference count, in units of 2^-PSSShift bytes.
+// Temporary references held by an in-progress AsyncPagesFileLoad are
+// discounted. As for HasUniqueRef, the result is racy unless the caller
+// prevents other goroutines from copying fr.
 //
 // Preconditions: At least one reference must be held on all pages in fr.
 func (f *MemoryFile) SharedBytes(fr memmap.FileRange) (shared, pss uint64) {
+	if fr.Length() == 0 {
+		return 0, 0
+	}
+	pageSize := uint64(hostarch.PageSize)
+	add := func(n, refs uint64) {
+		if refs > 1 {
+			shared += n
+			pss += n / pageSize * (pageSize << PSSShift / refs)
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	segs := 0
 	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
 		unfree := &f.unfreeSmall
 		if chunk.huge {
 			unfree = &f.unfreeHuge
 		}
-		unfree.VisitFullRange(chunkFR, func(ufseg unfreeIterator) bool {
-			if refs := ufseg.ValuePtr().refs; refs > 1 {
-				n := ufseg.Range().Intersect(chunkFR).Length()
-				shared += n
-				pageSize := uint64(hostarch.PageSize)
-				pss += n / pageSize * (pageSize << PSSShift / refs)
+		pos := chunkFR.Start
+		ufseg := unfree.FindSegment(pos)
+		for {
+			if !ufseg.Ok() {
+				panic(fmt.Sprintf("missing unfree segment at %#x in %v", pos, fr))
 			}
-			return true
-		})
-		return true
+			segEnd := min(ufseg.End(), chunkFR.End)
+			if refs := ufseg.ValuePtr().refs; refs > 1 {
+				if f.asyncLoadTempRefs.IsEmpty() {
+					add(segEnd-pos, refs)
+				} else {
+					cur := pos
+					for tseg := f.asyncLoadTempRefs.LowerBoundSegment(cur); tseg.Ok() && tseg.Start() < segEnd; tseg = tseg.NextSegment() {
+						if tseg.Start() > cur {
+							add(tseg.Start()-cur, refs)
+							cur = tseg.Start()
+						}
+						tEnd := min(tseg.End(), segEnd)
+						add(tEnd-cur, refs-1)
+						cur = tEnd
+					}
+					if cur < segEnd {
+						add(segEnd-cur, refs)
+					}
+				}
+			}
+			pos = segEnd
+			segs++
+			if segs >= sharedBytesYieldSegments {
+				segs = 0
+				f.mu.Unlock()
+				f.mu.Lock()
+				if pos >= chunkFR.End {
+					return true
+				}
+				ufseg = unfree.FindSegment(pos)
+			} else if pos >= chunkFR.End {
+				return true
+			} else {
+				ufseg, _ = ufseg.NextNonEmpty()
+			}
+		}
 	})
 	return shared, pss
+}
+
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) incAsyncLoadTempRefLocked(fr memmap.FileRange) {
+	f.incRefLocked(fr)
+	f.asyncLoadTempRefs.InsertRange(fr, tempRefInfo{})
+}
+
+func (f *MemoryFile) decAsyncLoadTempRef(fr memmap.FileRange) {
+	f.decRef(fr, true /* asyncLoadTempRef */)
 }
 
 // IncRef implements memmap.File.IncRef.
@@ -1335,12 +1400,19 @@ func (f *MemoryFile) incRefLocked(fr memmap.FileRange) {
 
 // DecRef implements memmap.File.DecRef.
 func (f *MemoryFile) DecRef(fr memmap.FileRange) {
+	f.decRef(fr, false /* asyncLoadTempRef */)
+}
+
+func (f *MemoryFile) decRef(fr memmap.FileRange, asyncLoadTempRef bool) {
 	if !fr.WellFormed() || fr.Length() == 0 || !hostarch.IsPageAligned(fr.Start) || !hostarch.IsPageAligned(fr.End) {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if asyncLoadTempRef {
+		f.asyncLoadTempRefs.RemoveFullRange(fr)
+	}
 
 	haveWaste := false
 	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
@@ -2159,4 +2231,28 @@ func (evictableRangeSetFunctions) Merge(_ EvictableRange, _ evictableRangeSetVal
 
 func (evictableRangeSetFunctions) Split(_ EvictableRange, _ evictableRangeSetValue, _ uint64) (evictableRangeSetValue, evictableRangeSetValue) {
 	return evictableRangeSetValue{}, evictableRangeSetValue{}
+}
+
+// tempRefInfo is the value type of MemoryFile.asyncLoadTempRefs.
+type tempRefInfo struct{}
+
+type tempRefSetFunctions struct{}
+
+func (tempRefSetFunctions) MinKey() uint64 {
+	return 0
+}
+
+func (tempRefSetFunctions) MaxKey() uint64 {
+	return math.MaxUint64
+}
+
+func (tempRefSetFunctions) ClearValue(val *tempRefInfo) {
+}
+
+func (tempRefSetFunctions) Merge(_ memmap.FileRange, _ tempRefInfo, _ memmap.FileRange, _ tempRefInfo) (tempRefInfo, bool) {
+	return tempRefInfo{}, true
+}
+
+func (tempRefSetFunctions) Split(_ memmap.FileRange, _ tempRefInfo, _ uint64) (tempRefInfo, tempRefInfo) {
+	return tempRefInfo{}, tempRefInfo{}
 }

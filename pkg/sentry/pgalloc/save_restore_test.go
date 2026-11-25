@@ -542,3 +542,139 @@ func TestAsyncLoadShortRead(t *testing.T) {
 		t.Error("page loader still holds a reference after reporting EIO")
 	}
 }
+
+type blockingPageReader struct {
+	stateio.AsyncReader
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingPageReader) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
+	select {
+	case r.started <- struct{}{}:
+	default:
+	}
+	<-r.release
+	return r.AsyncReader.Wait(cs, minCompletions)
+}
+
+func TestSharedBytesDiscountsAsyncLoadTempRef(t *testing.T) {
+	page := uint64(hostarch.PageSize)
+	src := newSaveTestMemoryFile(t, "", false)
+	fr := allocateSaveTestPages(t, src)
+	// Leave page 0 and pages 3..15 uncommitted so only pages 1..2 receive
+	// background restore reads with temporary references.
+	pwritePage(t, src, fr, 1, 1)
+	pwritePage(t, src, fr, 2, 2)
+	meta, pages := saveTestPageFiles(t, src, false)
+
+	dst := newSaveTestMemoryFile(t, "", false)
+	reader := &blockingPageReader{
+		AsyncReader: stateio.NewIOReader(bytes.NewReader(pages), 2*page, 1, 1),
+		started:     make(chan struct{}, 1),
+		release:     make(chan struct{}),
+	}
+	released := false
+	releaseOnce := func() {
+		if !released {
+			released = true
+			close(reader.release)
+		}
+	}
+
+	done := make(chan error, 1)
+	loader, err := StartAsyncPagesFileLoad(reader, func(err error) { done <- err }, nil, AsyncPagesFileLoadOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaderWaited := false
+	t.Cleanup(func() {
+		releaseOnce()
+		loader.MemoryFilesDone()
+		if !loaderWaited {
+			<-done
+		}
+	})
+
+	if err := dst.LoadFrom(t.Context(), bytes.NewReader(meta), &LoadOpts{PagesFile: loader}); err != nil {
+		t.Fatal(err)
+	}
+	loader.MemoryFilesDone()
+	t.Cleanup(func() { dst.DecRef(fr) })
+
+	<-reader.started
+	loadedFR := memmap.FileRange{Start: fr.Start + page, End: fr.Start + 3*page}
+	if dst.HasUniqueRef(loadedFR) {
+		t.Error("HasUniqueRef returned true while async page load holds temporary reference")
+	}
+	if shared, pss := dst.SharedBytes(fr); shared != 0 || pss != 0 {
+		t.Errorf("SharedBytes with sole mapper and in-flight load: got (%d, %d), want (0, 0)", shared, pss)
+	}
+
+	// Build a single merged unfree segment [0, 4*page) with refs=2 straddling
+	// asyncLoadTempRefs [page, 3*page): pages 0 and 3 have 2 real refs, while
+	// pages 1..2 have 1 real ref plus the loader's temporary ref.
+	page0FR := memmap.FileRange{Start: fr.Start, End: fr.Start + page}
+	page3FR := memmap.FileRange{Start: fr.Start + 3*page, End: fr.Start + 4*page}
+	dst.IncRef(page0FR, 0)
+	dst.IncRef(page3FR, 0)
+	page0Refs, page3Refs := 1, 1
+	t.Cleanup(func() {
+		for range page0Refs {
+			dst.DecRef(page0FR)
+		}
+		for range page3Refs {
+			dst.DecRef(page3FR)
+		}
+	})
+	wantShared2 := 2 * page
+	wantPSS2 := 2 * (page << PSSShift / 2)
+	if shared, pss := dst.SharedBytes(fr); shared != wantShared2 || pss != wantPSS2 {
+		t.Errorf("SharedBytes with merged refs=2 segment straddling tempRef: got (%d, %d), want (%d, %d)", shared, pss, wantShared2, wantPSS2)
+	}
+
+	// Raise [0, 4*page) to a single merged unfree segment with refs=3: pages 0
+	// and 3 have 3 real refs, while pages 1..2 have 2 real refs plus tempRef.
+	dst.IncRef(page0FR, 0)
+	page0Refs++
+	dst.IncRef(page3FR, 0)
+	page3Refs++
+	dst.IncRef(loadedFR, 0)
+	loadedExtraRef := true
+	t.Cleanup(func() {
+		if loadedExtraRef {
+			dst.DecRef(loadedFR)
+		}
+	})
+	wantShared3 := 4 * page
+	wantPSS3 := 2*(page<<PSSShift/3) + 2*(page<<PSSShift/2)
+	if shared, pss := dst.SharedBytes(fr); shared != wantShared3 || pss != wantPSS3 {
+		t.Errorf("SharedBytes with merged refs=3 segment straddling tempRef: got (%d, %d), want (%d, %d)", shared, pss, wantShared3, wantPSS3)
+	}
+
+	releaseOnce()
+	loaderWaited = true
+	if loadErr := <-done; loadErr != nil {
+		t.Fatalf("async page load: %v", loadErr)
+	}
+	if shared, pss := dst.SharedBytes(fr); shared != wantShared3 || pss != wantPSS3 {
+		t.Errorf("SharedBytes after load completed: got (%d, %d), want (%d, %d)", shared, pss, wantShared3, wantPSS3)
+	}
+
+	dst.DecRef(loadedFR)
+	loadedExtraRef = false
+	for range page0Refs {
+		dst.DecRef(page0FR)
+	}
+	page0Refs = 0
+	for range page3Refs {
+		dst.DecRef(page3FR)
+	}
+	page3Refs = 0
+	if !dst.HasUniqueRef(fr) {
+		t.Error("HasUniqueRef returned false after dropping extra references and completing load")
+	}
+	if shared, pss := dst.SharedBytes(fr); shared != 0 || pss != 0 {
+		t.Errorf("SharedBytes after dropping extra references: got (%d, %d), want (0, 0)", shared, pss)
+	}
+}

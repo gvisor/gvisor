@@ -732,3 +732,40 @@ func TestZeroDiskBackedPanicsOnNonzeroUnwritablePage(t *testing.T) {
 	}()
 	zeroDiskBacked(fd, 0, m)
 }
+
+func TestSharedBytesYieldsAcrossManySegments(t *testing.T) {
+	f := newSaveTestMemoryFile(t, "", false)
+	page := uint64(hostarch.PageSize)
+	const nPages = 2*sharedBytesYieldSegments + 10
+	fr, err := f.Allocate(nPages*page, AllocOpts{Mode: AllocateUncommitted})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	t.Cleanup(func() { f.DecRef(fr) })
+
+	var wantShared, wantPSS uint64
+	for i := uint64(0); i < nPages; i++ {
+		pfr := memmap.FileRange{Start: fr.Start + i*page, End: fr.Start + (i+1)*page}
+		switch i % 4 {
+		case 0:
+			f.IncRef(pfr, 0)
+			f.IncRef(pfr, 0)
+			t.Cleanup(func() {
+				f.DecRef(pfr)
+				f.DecRef(pfr)
+			})
+			wantShared += page
+			wantPSS += page << PSSShift / 3
+		case 2:
+			f.IncRef(pfr, 0)
+			t.Cleanup(func() { f.DecRef(pfr) })
+			wantShared += page
+			wantPSS += page << PSSShift / 2
+		}
+	}
+
+	gotShared, gotPSS := f.SharedBytes(fr)
+	if gotShared != wantShared || gotPSS != wantPSS {
+		t.Errorf("SharedBytes(%v): got (%d, %d), want (%d, %d)", fr, gotShared, gotPSS, wantShared, wantPSS)
+	}
+}
