@@ -305,7 +305,6 @@ func (c *ControlMessage) UnpackFDs() {
 // The normal entrypoint is WriteVec.
 type SocketWriter struct {
 	socket   *Socket
-	to       []byte
 	blocking bool
 	race     *atomicbitops.Int32
 
@@ -323,78 +322,6 @@ func (s *Socket) Write(p []byte) (int, error) {
 	return r.WriteVec([][]byte{p})
 }
 
-// GetSockOpt gets the given socket option.
-func (s *Socket) GetSockOpt(level int, name int, b []byte) (uint32, error) {
-	fd, ok := s.enterFD()
-	if !ok {
-		return 0, unix.EBADF
-	}
-	defer s.gate.Leave()
-
-	return getsockopt(fd, level, name, b)
-}
-
-// SetSockOpt sets the given socket option.
-func (s *Socket) SetSockOpt(level, name int, b []byte) error {
-	fd, ok := s.enterFD()
-	if !ok {
-		return unix.EBADF
-	}
-	defer s.gate.Leave()
-
-	return setsockopt(fd, level, name, b)
-}
-
-// GetSockName returns the socket name.
-func (s *Socket) GetSockName() ([]byte, error) {
-	fd, ok := s.enterFD()
-	if !ok {
-		return nil, unix.EBADF
-	}
-	defer s.gate.Leave()
-
-	var buf []byte
-	l := unix.SizeofSockaddrAny
-
-	for {
-		// If the buffer is not large enough, allocate a new one with the hint.
-		buf = make([]byte, l)
-		l, err := getsockname(fd, buf)
-		if err != nil {
-			return nil, err
-		}
-
-		if l <= uint32(len(buf)) {
-			return buf[:l], nil
-		}
-	}
-}
-
-// GetPeerName returns the peer name.
-func (s *Socket) GetPeerName() ([]byte, error) {
-	fd, ok := s.enterFD()
-	if !ok {
-		return nil, unix.EBADF
-	}
-	defer s.gate.Leave()
-
-	var buf []byte
-	l := unix.SizeofSockaddrAny
-
-	for {
-		// See above.
-		buf = make([]byte, l)
-		l, err := getpeername(fd, buf)
-		if err != nil {
-			return nil, err
-		}
-
-		if l <= uint32(len(buf)) {
-			return buf[:l], nil
-		}
-	}
-}
-
 // SocketReader wraps an individual receive operation.
 //
 // This may be used for doing vectorized reads and/or sending additional
@@ -403,7 +330,6 @@ func (s *Socket) GetPeerName() ([]byte, error) {
 // One of ExtractFDs or DisposeFDs must be called if EnableFDs is used.
 type SocketReader struct {
 	socket   *Socket
-	source   []byte
 	blocking bool
 	race     *atomicbitops.Int32
 
