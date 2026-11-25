@@ -782,7 +782,7 @@ func (s *runscService) getContainerPids(ctx context.Context, c *Container) ([]ui
 // the event for retry, and it fails for transient reasons such as containerd
 // restarting, or permanently when no event sink is configured (as under CRI-O).
 // Exiting the shim instead would take down every container it serves, which is
-// the whole pod with shim grouping.
+// the whole pod.
 func (s *runscService) forward(ctx context.Context, publisher shim.Publisher) {
 	// Detach from the shim context, which is done once shutdown completes, so
 	// that events still queued at that point don't fail immediately. This is

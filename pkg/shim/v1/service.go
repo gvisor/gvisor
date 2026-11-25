@@ -98,7 +98,6 @@ func NewShimRedirector(ctx context.Context, publisher shim.Publisher, sd shutdow
 		})
 	}
 
-	s.grouping = runtimeOptions.Grouping
 	return s, nil
 }
 
@@ -132,9 +131,6 @@ type shimRedirector struct {
 	// +checklocks:mu
 	extInitialized bool
 
-	// grouping indicates if shim grouping is enabled.
-	grouping bool
-
 	shutdown       shutdown.Service
 	runtimeOptions *rsc.Options
 }
@@ -160,13 +156,6 @@ func (s *shimRedirector) get() extension.TaskServiceExt {
 	return s.getLocked()
 }
 
-const kubernetesGroupAnnotation = "io.kubernetes.cri.sandbox-id"
-
-type spec struct {
-	// Annotations contains arbitrary metadata for the container.
-	Annotations map[string]string `json:"annotations,omitempty"`
-}
-
 // isDaemon ensures we only create sockets and run Serve() in the main background process,
 // ignoring short-lived containerd helpers like delete or state.
 func isDaemon() bool {
@@ -185,28 +174,16 @@ func (s *shimRedirector) initExt(ctx context.Context, r *task.CreateTaskRequest)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.grouping {
-		// Create shim extension if required.
-		if !s.extInitialized && extension.NewPodExtension != nil {
-			log.L.Debugf("Create shim extension per pod")
-			var err error
-			s.ext, err = extension.NewPodExtension(ctx, s.main, r)
-			if err != nil {
-				log.L.Debugf("Creating shim extension per pod failed with error: %v", err)
-				return err
-			}
-			s.extInitialized = true
+	// Create shim extension if required.
+	if !s.extInitialized && extension.NewPodExtension != nil {
+		log.L.Debugf("Create shim extension per pod")
+		var err error
+		s.ext, err = extension.NewPodExtension(ctx, s.main, r)
+		if err != nil {
+			log.L.Debugf("Creating shim extension per pod failed with error: %v", err)
+			return err
 		}
-	} else {
-		if extension.NewExtension != nil {
-			log.L.Debugf("Create shim extension per container")
-			var err error
-			s.ext, err = extension.NewExtension(ctx, s.main, r)
-			if err != nil {
-
-				return err
-			}
-		}
+		s.extInitialized = true
 	}
 	return nil
 }

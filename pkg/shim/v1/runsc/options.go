@@ -82,9 +82,6 @@ type Options struct {
 	// This configuration only applies when the shim is running as a service.
 	LogPath string `toml:"log_path" json:"logPath"`
 
-	// Grouping indicates if shim grouping should be enabled.
-	Grouping bool `toml:"grouping" json:"grouping"`
-
 	// EnableHibernateServer indicates if the hibernate server should be started.
 	EnableHibernateServer bool `toml:"enable_hibernate_server" json:"enableHibernateServer"`
 

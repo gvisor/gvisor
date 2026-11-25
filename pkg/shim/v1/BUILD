@@ -39,6 +39,7 @@ go_library(
         "@com_github_containerd_log//:go_default_library",
         "@com_github_containerd_ttrpc//:go_default_library",
         "@com_github_containerd_typeurl_v2//:go_default_library",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -61,6 +62,7 @@ go_test(
         "@com_github_containerd_containerd_v2//pkg/shim:go_default_library",
         "@com_github_containerd_containerd_v2//pkg/shutdown:go_default_library",
         "@com_github_containerd_typeurl_v2//:go_default_library",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go/features:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],

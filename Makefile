@@ -608,10 +608,6 @@ containerd-tests-min: containerd-test-2.0.14
 containerd-tests: containerd-test-2.0.14 containerd-test-2.3.7 containerd-test-2.4.2
 .PHONY: containerd-test-% containerd-tests-min containerd-tests
 
-containerd-performance-test-%:
-	@$(call test_runtime,$(RUNTIME),--test_output=streamed --test_arg=-test.v --test_arg=--containerd_version=$* --test_env=RUN_SHIM_GROUPING_PERFORMANCE_TEST=true $(ARGS) -- //test/root:crictl_test)
-.PHONY: containerd-performance-test-%
-
 
 kubernetes-smoke-test: ## Runs the Kubernetes hello test in a KIND cluster.
 	@test/kubernetes/scripts/run_kind_e2e.sh //test/kubernetes/tests:hello_test

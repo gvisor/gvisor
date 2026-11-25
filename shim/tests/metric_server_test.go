@@ -111,53 +111,30 @@ func queryMetrics(t *testing.T, metricSock string) string {
 	return string(body)
 }
 
-// Test variants for grouping.
-
-type metricServerTestCase struct {
-	name     string
-	shimArgs map[string]any
-}
-
-var metricServerTestCases = []metricServerTestCase{
-	{
-		name: "default",
-	},
-	{
-		name: "grouping",
-		shimArgs: map[string]any{
-			"grouping": true,
-		},
-	},
-}
-
 // TestMetricServer is a basic smoke test that verifies the runsc metric-server
 // can start, bind to a Unix domain socket, and export Prometheus metrics
 // containing the ID of a running sandbox.
 func TestMetricServer(t *testing.T) {
-	for _, tc := range metricServerTestCases {
-		t.Run(tc.name, func(t *testing.T) {
-			metricSock := filepath.Join(t.TempDir(), "metrics.sock")
-			runscArgs := map[string]any{
-				"metric-server": metricSock,
-			}
-			containerd := shimutils.NewMockContainerd(t, tc.shimArgs, runscArgs)
+	metricSock := filepath.Join(t.TempDir(), "metrics.sock")
+	runscArgs := map[string]any{
+		"metric-server": metricSock,
+	}
+	containerd := shimutils.NewMockContainerd(t, nil, runscArgs)
 
-			sandbox, client := setupSandbox(t, containerd)
+	sandbox, client := setupSandbox(t, containerd)
 
-			rootDir := filepath.Join(containerd.WorkingDir(), "containers", "default")
-			startMetricServer(t, rootDir, metricSock, containerd.WorkingDir())
+	rootDir := filepath.Join(containerd.WorkingDir(), "containers", "default")
+	startMetricServer(t, rootDir, metricSock, containerd.WorkingDir())
 
-			metricsStr := queryMetrics(t, metricSock)
-			t.Logf("Metrics received:\n%s", metricsStr)
+	metricsStr := queryMetrics(t, metricSock)
+	t.Logf("Metrics received:\n%s", metricsStr)
 
-			if !strings.Contains(metricsStr, sandbox.ID()) {
-				t.Errorf("expected metrics to contain sandbox ID %q, but they did not", sandbox.ID())
-			}
+	if !strings.Contains(metricsStr, sandbox.ID()) {
+		t.Errorf("expected metrics to contain sandbox ID %q, but they did not", sandbox.ID())
+	}
 
-			if err := killAndWaitForContainer(t.Context(), client, sandbox.ID(), containerd); err != nil {
-				t.Fatalf("failed to kill sandbox: %v", err)
-			}
-		})
+	if err := killAndWaitForContainer(t.Context(), client, sandbox.ID(), containerd); err != nil {
+		t.Fatalf("failed to kill sandbox: %v", err)
 	}
 }
 
@@ -166,49 +143,42 @@ func TestMetricServer(t *testing.T) {
 // share the same runsc root directory. It asserts that metrics for both
 // sandboxes are present and that the running sandbox count is correct.
 func TestMetricServerMultipleSandboxes(t *testing.T) {
-	for _, tc := range metricServerTestCases {
-		t.Run(tc.name, func(t *testing.T) {
-			sharedRoot := filepath.Join(t.TempDir(), "shared_containers")
-			metricSock := filepath.Join(t.TempDir(), "metrics.sock")
-			shimArgs := map[string]any{
-				"root": sharedRoot,
-			}
-			for k, v := range tc.shimArgs {
-				shimArgs[k] = v
-			}
-			runscArgs := map[string]any{
-				"metric-server": metricSock,
-			}
+	sharedRoot := filepath.Join(t.TempDir(), "shared_containers")
+	metricSock := filepath.Join(t.TempDir(), "metrics.sock")
+	shimArgs := map[string]any{
+		"root": sharedRoot,
+	}
+	runscArgs := map[string]any{
+		"metric-server": metricSock,
+	}
 
-			containerd1 := shimutils.NewMockContainerdWithSuffix(t, "sb1", shimArgs, runscArgs)
-			containerd2 := shimutils.NewMockContainerdWithSuffix(t, "sb2", shimArgs, runscArgs)
+	containerd1 := shimutils.NewMockContainerdWithSuffix(t, "sb1", shimArgs, runscArgs)
+	containerd2 := shimutils.NewMockContainerdWithSuffix(t, "sb2", shimArgs, runscArgs)
 
-			sandbox1, client1 := setupSandbox(t, containerd1)
-			sandbox2, client2 := setupSandbox(t, containerd2)
+	sandbox1, client1 := setupSandbox(t, containerd1)
+	sandbox2, client2 := setupSandbox(t, containerd2)
 
-			rootDir := filepath.Join(sharedRoot, "default")
-			startMetricServer(t, rootDir, metricSock, containerd1.WorkingDir())
+	rootDir := filepath.Join(sharedRoot, "default")
+	startMetricServer(t, rootDir, metricSock, containerd1.WorkingDir())
 
-			metricsStr := queryMetrics(t, metricSock)
-			t.Logf("Metrics received:\n%s", metricsStr)
+	metricsStr := queryMetrics(t, metricSock)
+	t.Logf("Metrics received:\n%s", metricsStr)
 
-			if !strings.Contains(metricsStr, sandbox1.ID()) {
-				t.Errorf("expected metrics to contain sandbox 1 ID %q", sandbox1.ID())
-			}
-			if !strings.Contains(metricsStr, sandbox2.ID()) {
-				t.Errorf("expected metrics to contain sandbox 2 ID %q", sandbox2.ID())
-			}
-			if !strings.Contains(metricsStr, "runsc_meta_num_sandboxes_running 2") {
-				t.Errorf("expected runsc_meta_num_sandboxes_running to be 2")
-			}
+	if !strings.Contains(metricsStr, sandbox1.ID()) {
+		t.Errorf("expected metrics to contain sandbox 1 ID %q", sandbox1.ID())
+	}
+	if !strings.Contains(metricsStr, sandbox2.ID()) {
+		t.Errorf("expected metrics to contain sandbox 2 ID %q", sandbox2.ID())
+	}
+	if !strings.Contains(metricsStr, "runsc_meta_num_sandboxes_running 2") {
+		t.Errorf("expected runsc_meta_num_sandboxes_running to be 2")
+	}
 
-			if err := killAndWaitForContainer(t.Context(), client1, sandbox1.ID(), containerd1); err != nil {
-				t.Fatalf("failed to kill sandbox 1: %v", err)
-			}
-			if err := killAndWaitForContainer(t.Context(), client2, sandbox2.ID(), containerd2); err != nil {
-				t.Fatalf("failed to kill sandbox 2: %v", err)
-			}
-		})
+	if err := killAndWaitForContainer(t.Context(), client1, sandbox1.ID(), containerd1); err != nil {
+		t.Fatalf("failed to kill sandbox 1: %v", err)
+	}
+	if err := killAndWaitForContainer(t.Context(), client2, sandbox2.ID(), containerd2); err != nil {
+		t.Fatalf("failed to kill sandbox 2: %v", err)
 	}
 }
 
@@ -216,63 +186,59 @@ func TestMetricServerMultipleSandboxes(t *testing.T) {
 // to a sandbox does not break metrics export, and that the sandbox
 // remains discoverable by the metric server.
 func TestMetricServerMultiContainer(t *testing.T) {
-	for _, tc := range metricServerTestCases {
-		t.Run(tc.name, func(t *testing.T) {
-			metricSock := filepath.Join(t.TempDir(), "metrics.sock")
-			runscArgs := map[string]any{
-				"metric-server": metricSock,
-			}
-			containerd := shimutils.NewMockContainerd(t, tc.shimArgs, runscArgs)
+	metricSock := filepath.Join(t.TempDir(), "metrics.sock")
+	runscArgs := map[string]any{
+		"metric-server": metricSock,
+	}
+	containerd := shimutils.NewMockContainerd(t, nil, runscArgs)
 
-			sandbox, client := setupSandbox(t, containerd)
+	sandbox, client := setupSandbox(t, containerd)
 
-			opts, err := containerd.GetRuntimeOptions()
-			if err != nil {
-				t.Fatalf("failed to get runtime options: %v", err)
-			}
+	opts, err := containerd.GetRuntimeOptions()
+	if err != nil {
+		t.Fatalf("failed to get runtime options: %v", err)
+	}
 
-			// Create and start a second container in the same sandbox.
-			containerSpec := shimutils.NewContainerSpec(sandbox.ID(), []string{"sleep", "10000"})
-			container, err := shimutils.NewContainer(containerSpec, containerd)
-			if err != nil {
-				t.Fatalf("failed to create container: %v", err)
-			}
+	// Create and start a second container in the same sandbox.
+	containerSpec := shimutils.NewContainerSpec(sandbox.ID(), []string{"sleep", "10000"})
+	container, err := shimutils.NewContainer(containerSpec, containerd)
+	if err != nil {
+		t.Fatalf("failed to create container: %v", err)
+	}
 
-			if err := createAndWaitForContainer(t.Context(), client, container, opts); err != nil {
-				t.Fatalf("failed to create container: %v", err)
-			}
+	if err := createAndWaitForContainer(t.Context(), client, container, opts); err != nil {
+		t.Fatalf("failed to create container: %v", err)
+	}
 
-			startReq := &task.StartRequest{
-				ID: container.ID(),
-			}
-			if _, err := client.Start(t.Context(), startReq); err != nil {
-				t.Fatalf("failed to start container: %v", err)
-			}
+	startReq := &task.StartRequest{
+		ID: container.ID(),
+	}
+	if _, err := client.Start(t.Context(), startReq); err != nil {
+		t.Fatalf("failed to start container: %v", err)
+	}
 
-			rootDir := filepath.Join(containerd.WorkingDir(), "containers", "default")
-			startMetricServer(t, rootDir, metricSock, containerd.WorkingDir())
+	rootDir := filepath.Join(containerd.WorkingDir(), "containers", "default")
+	startMetricServer(t, rootDir, metricSock, containerd.WorkingDir())
 
-			metricsStr := queryMetrics(t, metricSock)
-			t.Logf("Metrics received:\n%s", metricsStr)
+	metricsStr := queryMetrics(t, metricSock)
+	t.Logf("Metrics received:\n%s", metricsStr)
 
-			if !strings.Contains(metricsStr, sandbox.ID()) {
-				t.Errorf("expected metrics to contain sandbox ID %q", sandbox.ID())
-			}
+	if !strings.Contains(metricsStr, sandbox.ID()) {
+		t.Errorf("expected metrics to contain sandbox ID %q", sandbox.ID())
+	}
 
-			if err := killAndWaitForContainer(t.Context(), client, container.ID(), containerd); err != nil {
-				t.Fatalf("failed to kill container: %v", err)
-			}
+	if err := killAndWaitForContainer(t.Context(), client, container.ID(), containerd); err != nil {
+		t.Fatalf("failed to kill container: %v", err)
+	}
 
-			// Verify that the metric server still responds after the second container is killed.
-			metricsStrAfterKill := queryMetrics(t, metricSock)
-			if !strings.Contains(metricsStrAfterKill, sandbox.ID()) {
-				t.Errorf("expected metrics to still contain sandbox ID %q after sub-container was killed", sandbox.ID())
-			}
+	// Verify that the metric server still responds after the second container is killed.
+	metricsStrAfterKill := queryMetrics(t, metricSock)
+	if !strings.Contains(metricsStrAfterKill, sandbox.ID()) {
+		t.Errorf("expected metrics to still contain sandbox ID %q after sub-container was killed", sandbox.ID())
+	}
 
-			if err := killAndWaitForContainer(t.Context(), client, sandbox.ID(), containerd); err != nil {
-				t.Fatalf("failed to kill sandbox: %v", err)
-			}
-		})
+	if err := killAndWaitForContainer(t.Context(), client, sandbox.ID(), containerd); err != nil {
+		t.Fatalf("failed to kill sandbox: %v", err)
 	}
 }
 
@@ -281,71 +247,64 @@ func TestMetricServerMultiContainer(t *testing.T) {
 // It asserts that the active running sandbox count updates correctly
 // (1 -> 0 -> 1) as sandboxes transition through their lifecycles.
 func TestMetricServerLifecycle(t *testing.T) {
-	for _, tc := range metricServerTestCases {
-		t.Run(tc.name, func(t *testing.T) {
-			sharedRoot := filepath.Join(t.TempDir(), "shared_containers")
-			metricSock := filepath.Join(t.TempDir(), "metrics.sock")
-			shimArgs := map[string]any{
-				"root": sharedRoot,
-			}
-			for k, v := range tc.shimArgs {
-				shimArgs[k] = v
-			}
-			runscArgs := map[string]any{
-				"metric-server": metricSock,
-			}
+	sharedRoot := filepath.Join(t.TempDir(), "shared_containers")
+	metricSock := filepath.Join(t.TempDir(), "metrics.sock")
+	shimArgs := map[string]any{
+		"root": sharedRoot,
+	}
+	runscArgs := map[string]any{
+		"metric-server": metricSock,
+	}
 
-			// 1. Start the first sandbox.
-			containerd1 := shimutils.NewMockContainerdWithSuffix(t, "sb1", shimArgs, runscArgs)
-			sandbox1, client1 := setupSandbox(t, containerd1)
+	// 1. Start the first sandbox.
+	containerd1 := shimutils.NewMockContainerdWithSuffix(t, "sb1", shimArgs, runscArgs)
+	sandbox1, client1 := setupSandbox(t, containerd1)
 
-			// 2. Start the metric server.
-			rootDir := filepath.Join(sharedRoot, "default")
-			startMetricServer(t, rootDir, metricSock, containerd1.WorkingDir())
+	// 2. Start the metric server.
+	rootDir := filepath.Join(sharedRoot, "default")
+	startMetricServer(t, rootDir, metricSock, containerd1.WorkingDir())
 
-			// 3. Verify sandbox 1 is running.
-			metricsStr1 := queryMetrics(t, metricSock)
-			if !strings.Contains(metricsStr1, sandbox1.ID()) {
-				t.Errorf("expected metrics to contain sandbox 1 ID %q", sandbox1.ID())
-			}
-			if !strings.Contains(metricsStr1, "runsc_meta_num_sandboxes_running 1") {
-				t.Errorf("expected runsc_meta_num_sandboxes_running to be 1")
-			}
+	// 3. Verify sandbox 1 is running.
+	metricsStr1 := queryMetrics(t, metricSock)
+	if !strings.Contains(metricsStr1, sandbox1.ID()) {
+		t.Errorf("expected metrics to contain sandbox 1 ID %q", sandbox1.ID())
+	}
+	if !strings.Contains(metricsStr1, "runsc_meta_num_sandboxes_running 1") {
+		t.Errorf("expected runsc_meta_num_sandboxes_running to be 1")
+	}
 
-			// 4. Stop sandbox 1.
-			if err := killAndWaitForContainer(t.Context(), client1, sandbox1.ID(), containerd1); err != nil {
-				t.Fatalf("failed to kill sandbox 1: %v", err)
-			}
+	// 4. Stop sandbox 1.
+	if err := killAndWaitForContainer(t.Context(), client1, sandbox1.ID(), containerd1); err != nil {
+		t.Fatalf("failed to kill sandbox 1: %v", err)
+	}
 
-			// 5. Verify metrics show 0 running sandboxes.
-			metricsStr2 := queryMetrics(t, metricSock)
-			if strings.Contains(metricsStr2, sandbox1.ID()) {
-				t.Errorf("expected metrics to NOT contain sandbox 1 ID %q after it stopped", sandbox1.ID())
-			}
-			if !strings.Contains(metricsStr2, "runsc_meta_num_sandboxes_running 0") {
-				t.Errorf("expected runsc_meta_num_sandboxes_running to be 0")
-			}
+	// 5. Verify metrics show 0 running sandboxes.
+	metricsStr2 := queryMetrics(t, metricSock)
+	if strings.Contains(metricsStr2, sandbox1.ID()) {
+		t.Errorf("expected metrics to NOT contain sandbox 1 ID %q after it stopped", sandbox1.ID())
+	}
+	if !strings.Contains(metricsStr2, "runsc_meta_num_sandboxes_running 0") {
+		t.Errorf("expected runsc_meta_num_sandboxes_running to be 0")
+	}
 
-			// 6. Start a second sandbox.
-			containerd2 := shimutils.NewMockContainerdWithSuffix(t, "sb2", shimArgs, runscArgs)
-			sandbox2, client2 := setupSandbox(t, containerd2)
+	// 6. Start a second sandbox.
+	containerd2 := shimutils.NewMockContainerdWithSuffix(t, "sb2", shimArgs, runscArgs)
+	sandbox2, client2 := setupSandbox(t, containerd2)
 
-			// 7. Verify sandbox 2 is running and sandbox 1 is still gone.
-			metricsStr3 := queryMetrics(t, metricSock)
-			if strings.Contains(metricsStr3, sandbox1.ID()) {
-				t.Errorf("expected metrics to NOT contain sandbox 1 ID %q", sandbox1.ID())
-			}
-			if !strings.Contains(metricsStr3, sandbox2.ID()) {
-				t.Errorf("expected metrics to contain sandbox 2 ID %q", sandbox2.ID())
-			}
-			if !strings.Contains(metricsStr3, "runsc_meta_num_sandboxes_running 1") {
-				t.Errorf("expected runsc_meta_num_sandboxes_running to be 1")
-			}
+	// 7. Verify sandbox 2 is running and sandbox 1 is still gone.
+	metricsStr3 := queryMetrics(t, metricSock)
+	if strings.Contains(metricsStr3, sandbox1.ID()) {
+		t.Errorf("expected metrics to NOT contain sandbox 1 ID %q", sandbox1.ID())
+	}
+	if !strings.Contains(metricsStr3, sandbox2.ID()) {
+		t.Errorf("expected metrics to contain sandbox 2 ID %q", sandbox2.ID())
+	}
+	if !strings.Contains(metricsStr3, "runsc_meta_num_sandboxes_running 1") {
+		t.Errorf("expected runsc_meta_num_sandboxes_running to be 1")
+	}
 
-			// Clean up sandbox 2.
-			if err := killAndWaitForContainer(t.Context(), client2, sandbox2.ID(), containerd2); err != nil {
-				t.Fatalf("failed to kill sandbox 2: %v", err)
-			}
-		})
+	// Clean up sandbox 2.
+	if err := killAndWaitForContainer(t.Context(), client2, sandbox2.ID(), containerd2); err != nil {
+		t.Fatalf("failed to kill sandbox 2: %v", err)
 	}
 }

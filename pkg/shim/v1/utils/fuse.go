@@ -271,7 +271,7 @@ func FindGoferPID(rootDir, bundleDir, containerID string) int {
 	// 1. For a subcontainer, resolve the sandbox ID from the OCI spec in the bundle.
 	if bundleDir != "" {
 		if s, err := ReadSpec(bundleDir); err == nil {
-			if sbID, ok := specutils.SandboxID(s); ok && sbID != "" && sbID != containerID {
+			if sbID, ok := specutils.SandboxID(s); ok && sbID != containerID {
 				path := filepath.Join(rootDir, fmt.Sprintf("%s_sandbox:%s.state", containerID, sbID))
 				if pid := readGoferPIDFromStateFile(path); pid > 0 {
 					return pid

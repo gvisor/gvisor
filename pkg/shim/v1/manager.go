@@ -16,7 +16,6 @@ package v1
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +30,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/log"
 	typeurl "github.com/containerd/typeurl/v2"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
@@ -98,38 +98,29 @@ func (m manager) Name() string {
 	return m.name
 }
 
-// resolveGrouping determines the grouping key from the OCI spec annotations.
-// It checks the containerd annotation first, then falls back to the CRI-O
-// annotation. If neither is found, it returns the container ID unchanged.
-func resolveGrouping(id string, annotations map[string]string) string {
-	if groupID, ok := annotations[kubernetesGroupAnnotation]; ok {
-		log.L.Debugf("group label found %v: %v", kubernetesGroupAnnotation, groupID)
-		return groupID
+// socketKey returns the key from which the shim socket address is derived for
+// the container with the given ID and spec. The containers of a sandbox share
+// one shim, so the key is the sandbox ID from the spec if it has one, and the
+// container ID if not. Other shims, such as the runc shim, derive their socket
+// address from the same sandbox ID, so the key is specific to runsc. Without
+// it, a container could reuse the shim of another runtime and run outside of
+// gVisor. spec may be nil.
+func socketKey(id string, spec *specs.Spec) string {
+	if spec != nil {
+		if sandboxID, ok := specutils.SandboxID(spec); ok {
+			id = sandboxID
+		}
 	}
-	if groupID, ok := annotations[specutils.CRIOSandboxIDAnnotation]; ok {
-		log.L.Debugf("group label found %v: %v", specutils.CRIOSandboxIDAnnotation, groupID)
-		return groupID
-	}
-	return id
+	return "runsc/" + id
 }
 
 // Start implements shim.Manager.Start.
 func (m *manager) Start(ctx context.Context, id string, opts shim.StartOpts) (shim.BootstrapParams, error) {
-	grouping := id
-	enableGrouping := getEnableGrouping()
-	if enableGrouping {
-		// The config.json is always at the current directory by containerd.
-		configFile, err := os.Open("config.json")
-		if err != nil {
-			return shim.BootstrapParams{}, fmt.Errorf("failed to read config.json when starting shim: %w", err)
-		}
-		var readSpec spec
-		if err := json.NewDecoder(configFile).Decode(&readSpec); err != nil {
-			configFile.Close()
-			return shim.BootstrapParams{}, err
-		}
-		configFile.Close()
-		grouping = resolveGrouping(id, readSpec.Annotations)
+	// containerd writes config.json to the current directory, unless the
+	// container has no OCI spec.
+	spec, err := utils.ReadSpec(".")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return shim.BootstrapParams{}, fmt.Errorf("failed to read config.json when starting shim: %w", err)
 	}
 
 	cmd, err := newCommand(ctx, id, opts.Address, opts.Debug)
@@ -137,16 +128,15 @@ func (m *manager) Start(ctx context.Context, id string, opts shim.StartOpts) (sh
 		return shim.BootstrapParams{}, err
 	}
 
-	address, err := shim.SocketAddress(ctx, opts.Address, grouping, opts.Debug)
+	address, err := shim.SocketAddress(ctx, opts.Address, socketKey(id, spec), opts.Debug)
 	if err != nil {
 		return shim.BootstrapParams{}, err
 	}
 	socket, err := shim.NewSocket(address)
 	if err != nil {
 		// The only time where this would happen is if there is a bug and the socket
-		// was not cleaned up in the cleanup method of the shim or we are using the
-		// grouping functionality where the new process should be run with the same
-		// shim as an existing container.
+		// was not cleaned up in the cleanup method of the shim or the new process
+		// should be run with the same shim as an existing container of the pod.
 		if !shim.SocketEaddrinuse(err) {
 			return shim.BootstrapParams{}, fmt.Errorf("create new shim socket: %w", err)
 		}
@@ -250,14 +240,6 @@ func (manager) Stop(ctx context.Context, id string) (shim.StopStatus, error) {
 		ExitedAt:   time.Now(),
 		ExitStatus: 128 + int(unix.SIGKILL),
 	}, nil
-}
-
-func getEnableGrouping() bool {
-	opts := runsc.GetRuntimeOptions()
-	if opts == nil {
-		return false
-	}
-	return opts.Grouping
 }
 
 func (m *manager) Info(ctx context.Context, optionsR io.Reader) (*types.RuntimeInfo, error) {

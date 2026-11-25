@@ -115,7 +115,7 @@ func mountSizeOption(opts string) (int, error) {
 // writes beyond the limit fail with ENOSPC instead of consuming memory until
 // the pod is killed.
 func TestCrictlEmptyDirSizeLimit(t *testing.T) {
-	crictl, cleanup, err := setup(t, true /* enableGrouping */)
+	crictl, cleanup, err := setup(t)
 	if err != nil {
 		t.Fatalf("failed to setup crictl: %v", err)
 	}
