@@ -691,6 +691,9 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		if conf.Netgofer.Enabled() {
 			log.Warningf("Netgofer proxy is enabled (--netgofer=%s) but custom network args are provided for restore; netgofer will not be started", conf.Netgofer)
 		}
+		if conf.NetworkProxyConfig == config.NetworkProxyConfigPeer {
+			log.Warningf("--network-proxy-config=%s is set but custom network args are provided for restore; no hello is exchanged with the network proxy peer", conf.NetworkProxyConfig)
+		}
 		// When network args is not nil, set it in the loader which will be used
 		// during restore to configure the loaded stack.
 		log.Debugf("Setting up network args, config: %+v", networkArgs)

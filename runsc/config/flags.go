@@ -53,6 +53,7 @@ const (
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagInSandboxCgroup         = "in-sandbox-cgroup"
 	flagNetworkProxyPath        = "network-proxy-path"
+	flagNetworkProxyConfig      = "network-proxy-config"
 	flagNetgofer                = "netgofer"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
@@ -174,6 +175,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Flags that control sandbox runtime behavior: network related.
 	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none. Using network inside the sandbox is more secure because it's isolated from the host network.")
 	flagSet.String(flagNetworkProxyPath, "", "EXPERIMENTAL. Path of an external SOCK_SEQPACKET Unix domain socket to attach the sandbox's primary network interface to, instead of an AF_PACKET socket.")
+	flagSet.Var(NetworkProxyConfigNetNS.Ptr(), flagNetworkProxyConfig, "EXPERIMENTAL. Where the configuration of the --network-proxy-path link comes from: netns copies it from the sandbox's network namespace; peer asks the peer at --network-proxy-path in a hello on the socket and doesn't use the network namespace (netns|peer, default: netns).")
 	flagSet.Var(NetgoferModeOff.Ptr(), flagNetgofer, "EXPERIMENTAL. Mode for using netgofer (off|proxy|proxy-loopback, default: off).")
 	flagSet.Var(goferNetworkNamespacePtr(GoferNetworkNamespaceNull), "gofer-network-namespace", "network namespace for gofers: null (default; an empty namespace shared by all gofers using the same --shared-root, which defaults to --root), new (a new empty namespace per gofer), host (the current namespace), or an absolute path to an existing namespace.")
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")

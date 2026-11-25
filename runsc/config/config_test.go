@@ -125,6 +125,29 @@ func TestFromFlags(t *testing.T) {
 	if want := "/run/netproxy.sock"; c.NetworkProxyPath != want || !c.UseNetworkProxy() {
 		t.Errorf("NetworkProxyPath=%q UseNetworkProxy()=%v, want %q and true", c.NetworkProxyPath, c.UseNetworkProxy(), want)
 	}
+	if c.NetworkProxyConfig != NetworkProxyConfigNetNS {
+		t.Errorf("NetworkProxyConfig=%v, want netns", c.NetworkProxyConfig)
+	}
+	if i := slices.IndexFunc(c.ToFlags(), func(f string) bool { return strings.HasPrefix(f, "--network-proxy-config") }); i >= 0 {
+		t.Errorf("ToFlags() contains %q, want no --network-proxy-config by default", c.ToFlags()[i])
+	}
+
+	if err := testFlags.Lookup("network-proxy-config").Value.Set("peer"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NetworkProxyConfig != NetworkProxyConfigPeer {
+		t.Errorf("NetworkProxyConfig=%v, want peer", c.NetworkProxyConfig)
+	}
+	if !slices.Contains(c.ToFlags(), "--network-proxy-config=peer") {
+		t.Errorf("ToFlags()=%v, want it to contain --network-proxy-config=peer", c.ToFlags())
+	}
+	if err := testFlags.Lookup("network-proxy-config").Value.Set("netns"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
 
 	if err := testFlags.Lookup("network-proxy-path").Value.Set(""); err != nil {
 		t.Errorf("Flag set: %v", err)
@@ -349,6 +372,11 @@ func TestInvalidFlags(t *testing.T) {
 			value: "invalid",
 			error: "invalid netgofer mode",
 		},
+		{
+			name:  "network-proxy-config",
+			value: "invalid",
+			error: "invalid network proxy config source",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -561,6 +589,48 @@ func TestValidationFail(t *testing.T) {
 				"network-proxy-path": "/run/netproxy.sock",
 			},
 			error: "netgofer and network-proxy-path flags cannot both be set",
+		},
+		{
+			name: "network-proxy-config:peer-without-path",
+			flags: map[string]string{
+				"network-proxy-config": "peer",
+			},
+			error: "network-proxy-config=peer requires network-proxy-path",
+		},
+		{
+			name: "network-proxy-config:peer+netgofer",
+			flags: map[string]string{
+				"network-proxy-config": "peer",
+				"netgofer":             "proxy",
+			},
+			error: "network-proxy-config=peer is incompatible with netgofer",
+		},
+		{
+			name: "network-proxy-config:peer+reproduce-nat",
+			flags: map[string]string{
+				"network-proxy-config": "peer",
+				"network-proxy-path":   "/run/netproxy.sock",
+				"reproduce-nat":        "true",
+			},
+			error: "network-proxy-config=peer is incompatible with reproduce-nat and reproduce-nftables",
+		},
+		{
+			name: "network-proxy-config:peer+reproduce-nftables",
+			flags: map[string]string{
+				"network-proxy-config": "peer",
+				"network-proxy-path":   "/run/netproxy.sock",
+				"reproduce-nftables":   "true",
+			},
+			error: "network-proxy-config=peer is incompatible with reproduce-nat and reproduce-nftables",
+		},
+		{
+			name: "network-proxy-config:peer+network:none",
+			flags: map[string]string{
+				"network-proxy-config": "peer",
+				"network-proxy-path":   "/run/netproxy.sock",
+				"network":              "none",
+			},
+			error: "network-proxy-path flag is only supported with sandbox networking",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

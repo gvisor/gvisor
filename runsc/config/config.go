@@ -197,6 +197,10 @@ type Config struct {
 	// an AF_PACKET socket.
 	NetworkProxyPath string `flag:"network-proxy-path"`
 
+	// NetworkProxyConfig selects where the configuration of the
+	// NetworkProxyPath link comes from.
+	NetworkProxyConfig NetworkProxyConfigSource `flag:"network-proxy-config"`
+
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
 
@@ -630,6 +634,19 @@ func (c *Config) Validate() error {
 		}
 		if c.XDP.Mode != XDPModeOff {
 			return fmt.Errorf("network-proxy-path flag is incompatible with XDP")
+		}
+	}
+	if c.NetworkProxyConfig == NetworkProxyConfigPeer {
+		if c.Netgofer.Enabled() {
+			return fmt.Errorf("network-proxy-config=peer is incompatible with netgofer")
+		}
+		if c.NetworkProxyPath == "" {
+			return fmt.Errorf("network-proxy-config=peer requires network-proxy-path")
+		}
+		// NAT reproduction reads the network namespace, which peer mode
+		// never joins.
+		if c.ReproduceNAT || c.ReproduceNftables {
+			return fmt.Errorf("network-proxy-config=peer is incompatible with reproduce-nat and reproduce-nftables")
 		}
 	}
 	if c.Netgofer.Enabled() {
@@ -2173,6 +2190,56 @@ func (n *NetgoferMode) Set(v string) error {
 		*n = NetgoferModeProxyLoopback
 	default:
 		return fmt.Errorf("invalid netgofer mode %q (must be one of: off, proxy, proxy-loopback)", v)
+	}
+	return nil
+}
+
+// NetworkProxyConfigSource specifies where runsc takes the configuration of
+// the --network-proxy-path link from.
+type NetworkProxyConfigSource int
+
+const (
+	// NetworkProxyConfigNetNS copies the link's configuration from an
+	// interface in the sandbox's network namespace.
+	NetworkProxyConfigNetNS NetworkProxyConfigSource = iota
+
+	// NetworkProxyConfigPeer asks the peer at --network-proxy-path for the
+	// link's configuration in a hello on the socket, and doesn't use the
+	// sandbox's network namespace.
+	NetworkProxyConfigPeer
+)
+
+// Ptr returns a pointer to s.
+func (s NetworkProxyConfigSource) Ptr() *NetworkProxyConfigSource {
+	return &s
+}
+
+// Get implements flag.Getter.
+func (s *NetworkProxyConfigSource) Get() any {
+	return *s
+}
+
+// String implements flag.Getter.
+func (s NetworkProxyConfigSource) String() string {
+	switch s {
+	case NetworkProxyConfigNetNS:
+		return "netns"
+	case NetworkProxyConfigPeer:
+		return "peer"
+	default:
+		panic(fmt.Sprintf("invalid network proxy config source %d", s))
+	}
+}
+
+// Set implements flag.Getter. Set(String()) should be idempotent.
+func (s *NetworkProxyConfigSource) Set(v string) error {
+	switch v {
+	case "", "netns":
+		*s = NetworkProxyConfigNetNS
+	case "peer":
+		*s = NetworkProxyConfigPeer
+	default:
+		return fmt.Errorf("invalid network proxy config source %q (must be one of: netns, peer)", v)
 	}
 	return nil
 }
