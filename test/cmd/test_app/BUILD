@@ -15,6 +15,7 @@ go_binary(
         "fds.go",
         "hostinet_sr.go",
         "main.go",
+        "memfd_seals.go",
         "segfault_unsafe.go",
         "state_workload.go",
         "state_workload_fs.go",

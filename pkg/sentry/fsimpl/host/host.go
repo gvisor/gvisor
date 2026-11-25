@@ -902,6 +902,29 @@ func (i *inode) HostFD() int {
 	return i.hostFD
 }
 
+// IsHostFD returns true if fd represents a regular host file, a pipe or a
+// character device imported with NewFD.
+func IsHostFD(fd *vfs.FileDescription) bool {
+	_, ok := fd.Impl().(*fileDescription)
+	return ok
+}
+
+// GetSeals returns the file seals of the host file backing fd, as reported by
+// fcntl(F_GET_SEALS) on the host file descriptor. It returns EINVAL if fd is
+// not a host file or if the host file does not support sealing.
+func GetSeals(fd *vfs.FileDescription) (uint32, error) {
+	f, ok := fd.Impl().(*fileDescription)
+	if !ok {
+		return 0, linuxerr.EINVAL
+	}
+	seals, err := unix.FcntlInt(uintptr(f.inode.hostFD), unix.F_GET_SEALS, 0)
+	if err != nil {
+		return 0, err
+	}
+	// Seal values are part of the Linux ABI, so no translation is needed.
+	return uint32(seals), nil
+}
+
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (f *fileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	if f.inode.readonly {

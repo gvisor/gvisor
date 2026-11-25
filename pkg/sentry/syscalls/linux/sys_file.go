@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -787,7 +788,7 @@ func Fcntl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		}
 		return uintptr(pipefile.PipeSize()), nil, nil
 	case linux.F_GET_SEALS:
-		val, err := tmpfs.GetSeals(file)
+		val, err := getSeals(file)
 		return uintptr(val), nil, err
 	case linux.F_ADD_SEALS:
 		if !file.IsWritable() {
@@ -1823,4 +1824,13 @@ func MemfdCreate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 	}
 
 	return uintptr(fd), nil, nil
+}
+
+// getSeals returns the file seals of file. Host files report the seals of the
+// host file; other files report their tmpfs seals.
+func getSeals(file *vfs.FileDescription) (uint32, error) {
+	if host.IsHostFD(file) {
+		return host.GetSeals(file)
+	}
+	return tmpfs.GetSeals(file)
 }

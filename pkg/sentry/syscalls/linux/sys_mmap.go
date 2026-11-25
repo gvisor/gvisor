@@ -105,9 +105,12 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 			opts.MaxPerms.Write = false
 		}
 
-		if shared {
+		// The seals only matter if the mapping can be writable. Skipping the
+		// lookup otherwise also keeps the error for a file that is not open for
+		// writing.
+		if shared && opts.MaxPerms.Write {
 			// Check for any seal violations.
-			if seals, err := tmpfs.GetSeals(file); err == nil && seals&linux.F_SEAL_WRITE != 0 {
+			if seals, err := getSeals(file); err == nil && seals&(linux.F_SEAL_WRITE|linux.F_SEAL_FUTURE_WRITE) != 0 {
 				if opts.Perms.Write {
 					// Writable shared mapping on write-sealed file is not allowed.
 					return 0, nil, linuxerr.EPERM

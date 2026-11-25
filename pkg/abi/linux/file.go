@@ -536,10 +536,11 @@ const (
 	F_ADD_SEALS           = F_LINUX_SPECIFIC_BASE + 9
 	F_GET_SEALS           = F_LINUX_SPECIFIC_BASE + 10
 
-	F_SEAL_SEAL   = 0x0001 // Prevent further seals from being set.
-	F_SEAL_SHRINK = 0x0002 // Prevent file from shrinking.
-	F_SEAL_GROW   = 0x0004 // Prevent file from growing.
-	F_SEAL_WRITE  = 0x0008 // Prevent writes.
+	F_SEAL_SEAL         = 0x0001 // Prevent further seals from being set.
+	F_SEAL_SHRINK       = 0x0002 // Prevent file from shrinking.
+	F_SEAL_GROW         = 0x0004 // Prevent file from growing.
+	F_SEAL_WRITE        = 0x0008 // Prevent writes.
+	F_SEAL_FUTURE_WRITE = 0x0010 // Prevent new writable mappings and writes.
 )
 
 // Constants related to fallocate(2). Source: include/uapi/linux/falloc.h

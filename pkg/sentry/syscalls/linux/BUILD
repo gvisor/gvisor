@@ -140,10 +140,12 @@ go_test(
         "linux64_amd64_test.go",
         "linux64_arm64_test.go",
         "linux64_test.go",
+        "sys_file_test.go",
         "sys_socket_test.go",
     ],
     embed = [":linux"],
     deps = [
+        "//pkg/errors/linuxerr",
         "//pkg/sentry/fsimpl/host",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/seccheck",

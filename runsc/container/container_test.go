@@ -5123,6 +5123,140 @@ func TestFDPassingRun(t *testing.T) {
 	}
 }
 
+// TestFDPassingMemfdSeals checks that memfds passed into a new container
+// report the seals of the host file to fcntl(F_GET_SEALS), and that
+// write(2) works from a shared read-only mapping of a write-sealed memfd.
+func TestFDPassingMemfdSeals(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+
+	// The host may set seals at creation, for example F_SEAL_EXEC with
+	// vm.memfd_noexec, so the expected seals are relative to the initial ones.
+	newMemfd := func() (*os.File, int) {
+		fd, err := unix.MemfdCreate("seals", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+		if err != nil {
+			t.Skipf("memfd_create failed: %v", err)
+		}
+		f := os.NewFile(uintptr(fd), "memfd")
+		t.Cleanup(func() { f.Close() })
+		if err := f.Truncate(int64(os.Getpagesize())); err != nil {
+			t.Fatalf("truncate memfd: %v", err)
+		}
+		initial, err := unix.FcntlInt(f.Fd(), unix.F_GET_SEALS, 0)
+		if err != nil {
+			t.Fatalf("F_GET_SEALS on host: %v", err)
+		}
+		return f, initial
+	}
+	addSeals := func(f *os.File, seals int) error {
+		_, err := unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, seals)
+		return err
+	}
+
+	// Unsealed memfd.
+	unsealed, initial := newMemfd()
+
+	// Memfd with F_SEAL_WRITE.
+	const writeSeals = unix.F_SEAL_WRITE | unix.F_SEAL_SHRINK | unix.F_SEAL_GROW
+	sealed, _ := newMemfd()
+	if err := addSeals(sealed, writeSeals); err != nil {
+		t.Fatalf("F_ADD_SEALS on host: %v", err)
+	}
+
+	// Write-sealed memfd reopened read-only.
+	rdonly, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", sealed.Fd()))
+	if err != nil {
+		t.Fatalf("reopening memfd read-only: %v", err)
+	}
+	defer rdonly.Close()
+
+	// Memfd with F_SEAL_FUTURE_WRITE. The host keeps a writable mapping, which
+	// F_SEAL_WRITE would not allow. F_SEAL_FUTURE_WRITE requires Linux 5.1.
+	futureWrite, _ := newMemfd()
+	mem, err := unix.Mmap(int(futureWrite.Fd()), 0, os.Getpagesize(), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		t.Fatalf("mmap writable on host: %v", err)
+	}
+	defer unix.Munmap(mem)
+	hasFutureWrite := true
+	if err := addSeals(futureWrite, unix.F_SEAL_FUTURE_WRITE); err != nil {
+		t.Logf("F_SEAL_FUTURE_WRITE is not supported by the host: %v", err)
+		hasFutureWrite = false
+	}
+
+	// The Sentry needs a host mapping of the memfd to copy from a shared
+	// read-only mapping of it. Some host kernels refuse that mapping for a
+	// write-sealed memfd, see MemfdTest.SealWriteWithMmap. Only check
+	// write(2) from the mappings of the sealed memfds if the host allows it.
+	canMapSealed := false
+	if m, err := unix.Mmap(int(sealed.Fd()), 0, os.Getpagesize(), unix.PROT_READ, unix.MAP_SHARED); err == nil {
+		unix.Munmap(m)
+		canMapSealed = true
+	} else {
+		t.Logf("host mmap(PROT_READ, MAP_SHARED) of a write-sealed memfd failed: %v", err)
+	}
+
+	type guestFD struct {
+		file       *os.File
+		seals      int
+		writeCheck bool
+		rdonly     bool
+	}
+	guestFDs := []guestFD{
+		{file: unsealed, seals: initial, writeCheck: true},
+		{file: sealed, seals: initial | writeSeals, writeCheck: canMapSealed},
+		{file: rdonly, seals: initial | writeSeals, writeCheck: canMapSealed, rdonly: true},
+	}
+	if hasFutureWrite {
+		guestFDs = append(guestFDs, guestFD{file: futureWrite, seals: initial | unix.F_SEAL_FUTURE_WRITE, writeCheck: canMapSealed})
+	}
+
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			passFiles := make(map[int]*os.File)
+			var fds, wantSeals, writeCheckFDs, rdonlyFDs []string
+			for i, g := range guestFDs {
+				fd := 10 + i
+				passFiles[fd] = g.file
+				fds = append(fds, strconv.Itoa(fd))
+				wantSeals = append(wantSeals, fmt.Sprintf("%#x", g.seals))
+				if g.writeCheck {
+					writeCheckFDs = append(writeCheckFDs, strconv.Itoa(fd))
+				}
+				if g.rdonly {
+					rdonlyFDs = append(rdonlyFDs, strconv.Itoa(fd))
+				}
+			}
+			spec := testutil.NewSpecWithArgs(app, "memfd_seals",
+				"--fds="+strings.Join(fds, ","),
+				"--want-seals="+strings.Join(wantSeals, ","),
+				"--write-check-fds="+strings.Join(writeCheckFDs, ","),
+				"--rdonly-fds="+strings.Join(rdonlyFDs, ","))
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			ws, err := Run(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+				PassFiles: passFiles,
+				Attached:  true,
+			})
+			if err != nil {
+				t.Fatalf("running container: %v", err)
+			}
+			if !ws.Exited() || ws.ExitStatus() != 0 {
+				t.Errorf("guest checks failed, waitStatus: %v (see the guest log output above)", ws)
+			}
+		})
+	}
+}
+
 // TestFDPassingExec checks that file descriptors passed into an already
 // running container work as expected.
 func TestFDPassingExec(t *testing.T) {
