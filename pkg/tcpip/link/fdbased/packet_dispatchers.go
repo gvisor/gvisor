@@ -154,10 +154,10 @@ func (b *iovecBuffer) pullBuffer(n int) buffer.Buffer {
 }
 
 func (b *iovecBuffer) release() {
-	for _, v := range b.views {
-		if v != nil {
-			v.Release()
-			v = nil
+	for i := range b.views {
+		if b.views[i] != nil {
+			b.views[i].Release()
+			b.views[i] = nil
 		}
 	}
 }
@@ -194,8 +194,12 @@ func newReadVDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, err
 	skipsVnetHdr := d.e.gsoKind == stack.HostGSOSupported
 	d.buf = newIovecBuffer(BufConfig, skipsVnetHdr)
 	d.mgr = newProcessorManager(opts, e)
-	d.mgr.start()
 	return d, nil
+}
+
+func (d *readVDispatcher) prepare() {
+	d.StopFD.Reset()
+	d.mgr.start()
 }
 
 func (d *readVDispatcher) release() {
@@ -282,14 +286,22 @@ func newRecvMMsgDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, 
 		d.bufs[i] = newIovecBuffer(BufConfig, skipsVnetHdr)
 	}
 	d.mgr = newProcessorManager(opts, e)
-	d.mgr.start()
 
 	return d, nil
+}
+
+func (d *recvMMsgDispatcher) prepare() {
+	d.StopFD.Reset()
+	d.mgr.start()
 }
 
 func (d *recvMMsgDispatcher) release() {
 	for _, iov := range d.bufs {
 		iov.release()
+	}
+	// The iovecs referenced by msgHdrs pointed into the views released above.
+	for k := range d.msgHdrs {
+		d.msgHdrs[k].Msg.Iovlen = 0
 	}
 	d.mgr.close()
 }
