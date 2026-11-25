@@ -20,6 +20,7 @@ package packetmmap
 
 import (
 	"fmt"
+	"io"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -166,6 +167,7 @@ func (m *Endpoint) Close() {
 	if m.mode&txRingBuffer != 0 {
 		m.txRingBuffer.destroy()
 	}
+	m.mode = 0
 	m.mapped.Store(0)
 }
 
@@ -311,6 +313,9 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 func (m *Endpoint) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.mode == 0 {
+		return nil, &memmap.BusError{Err: io.EOF}
+	}
 	translationSize := 0
 	if m.mode&rxRingBuffer != 0 {
 		translationSize++
