@@ -1,0 +1,135 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+// Hello exchanged on a --network-proxy-path socket before it carries IP
+// packets. Each datagram is a 16-byte header followed by exactly one of these
+// messages, chosen by the header's type. All header integers are big-endian:
+//
+//   0       4      5       6       7      8        10         12    16
+//   +-------+------+-------+-------+------+--------+----------+-----+
+//   | magic | type | major | flags | rsvd | length | reserved | xid |
+//   +-------+------+-------+-------+------+--------+----------+-----+
+//
+// - magic is F0 47 56 48. Its first nibble is never an IP version, so a
+//   receiver that expects IP packets drops a hello.
+// - type is 1 (Offer), 2 (Config), 3 (Ack) or 4 (Error).
+// - major is the sender's highest major in an Offer, and the chosen major in
+//   every other message.
+// - flags define no bits in this major. Senders set 0; receivers ignore them.
+// - rsvd (u8) and reserved (u16) are 0.
+// - length is the datagram size, header included, 16 to 16384.
+// - xid is chosen at random for each Offer, and every reply echoes it.
+//
+// The header, Error fields 1-4 and Offer field 1 keep their meaning in every
+// major. New fields need no version change; receivers ignore unknown fields.
+package gvisor.netproxy.hello.v1;
+
+// Offer is sent by runsc right after connect(). Header type 1.
+message Offer {
+  // Majors runsc supports. Non-empty, at most 16. Frozen across majors.
+  repeated uint32 supported_majors = 1;
+  // Identifies the sandbox to the peer. Informational, at most 128 bytes.
+  string sandbox_id = 2;
+  // This connection's link, 0-based, less than link_count.
+  uint32 link_index = 3;
+  // Number of links in the sandbox, 1-16. runsc always sets it.
+  uint32 link_count = 4;
+  // Set when runsc restores a checkpoint instead of creating a sandbox.
+  bool restore = 5;
+  // Features the peer must implement, else it replies UNKNOWN_FEATURE. At
+  // most 8 names, each 1-64 bytes of [a-z0-9_]. Empty in v1.
+  repeated string required_features = 6;
+}
+
+// Config is the peer's reply to an Offer. Header type 2.
+message Config {
+  // Link MTU, 68-65535. At least 1280 if any address is IPv6.
+  uint32 mtu = 1;
+  // 1-32 addresses, each IP at most once.
+  repeated Address addresses = 2;
+  // 0-256 routes, with at most one default route per family. These are all
+  // of the link's routes: runsc adds no subnet route for an address.
+  repeated Route routes = 3;
+  // Unset: runsc uses its --tx-checksum-offload and --rx-checksum-offload,
+  // and enables rx_csum if tx_csum is on. Set: runsc uses both as given.
+  Offloads offloads = 4;
+  // 1-15 bytes of [A-Za-z0-9_.-], not "lo", "." or "..". Empty means eth0,
+  // which is allowed only when Offer.link_count is 1.
+  string ifname = 5;
+  // If set, must equal Offer.link_index.
+  optional uint32 link_index = 6;
+  // Features runsc must implement, else it replies UNKNOWN_FEATURE. At most
+  // 8 names, each 1-64 bytes of [a-z0-9_]. Empty in v1.
+  repeated string required_features = 7;
+}
+
+message Address {
+  // 4 bytes (IPv4) or 16 bytes (IPv6). Not unspecified, multicast,
+  // loopback, IPv4 limited broadcast or IPv4-mapped IPv6.
+  bytes ip = 1;
+  // 1-32 for IPv4, 1-128 for IPv6.
+  uint32 prefix_len = 2;
+}
+
+message Route {
+  // 4 or 16 bytes. Bits past dst_prefix_len must be 0.
+  bytes dst = 1;
+  // 0 (a default route) up to 32 or 128.
+  uint32 dst_prefix_len = 2;
+  // Empty: on-link, also for a default route. Otherwise the same length as
+  // dst, not one of this Config's addresses, and reachable on this link:
+  // inside the prefix of one of its addresses, inside the dst of one of its
+  // on-link routes, or IPv6 link-local.
+  bytes gateway = 3;
+  // 0: the link MTU. Otherwise 68 up to Config.mtu.
+  uint32 mtu = 4;
+}
+
+message Offloads {
+  // The peer doesn't need valid L4 checksums from the sentry.
+  bool tx_csum = 1;
+  // The peer may send packets without valid L4 checksums.
+  bool rx_csum = 2;
+}
+
+// Ack accepts a Config. runsc donates the socket right after. Header type 3.
+// An empty body is valid.
+message Ack {}
+
+// Error refuses the exchange, and the sender then closes. Header type 4,
+// either direction. Fields 1-4 are frozen across majors.
+message Error {
+  ErrorCode code = 1;
+  // Path of the offending field, for example "routes[3].gateway". May be
+  // empty. At most 128 bytes.
+  string field = 2;
+  // Human-readable, at most 256 bytes.
+  string message = 3;
+  // With UNSUPPORTED_VERSION: the majors the sender supports.
+  repeated uint32 supported_majors = 4;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_MALFORMED = 1;
+  ERROR_CODE_UNSUPPORTED_VERSION = 2;
+  ERROR_CODE_UNKNOWN_FEATURE = 3;
+  ERROR_CODE_INVALID_VALUE = 4;
+  ERROR_CODE_LIMIT_EXCEEDED = 5;
+  ERROR_CODE_REFUSED = 6;
+  ERROR_CODE_NOT_READY = 7;
+  ERROR_CODE_INTERNAL = 8;
+}
