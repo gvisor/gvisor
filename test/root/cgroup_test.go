@@ -741,6 +741,57 @@ func pidCgroupPath(pid int, controller string) (string, error) {
 	return "", fmt.Errorf("no %q cgroup for pid %d", controller, pid)
 }
 
+// TestCgroupDevicesMountOverDevice checks that a container starts when the
+// destination of a file bind mount is a device file that the device cgroup
+// does not allow. Preparing the mount must not open the device file.
+func TestCgroupDevicesMountOverDevice(t *testing.T) {
+	conf := postureConfig(t)
+	runsc, err := dockerutil.RuntimePath()
+	if err != nil {
+		t.Fatalf("Cannot find the runsc binary: %v", err)
+	}
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "mount-over-device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	// The mount destination is a device file for /dev/random (1:8).
+	dst := filepath.Join(dir, "random")
+	if err := unix.Mknod(dst, unix.S_IFCHR|0666, int(unix.Mkdev(1, 8))); err != nil {
+		t.Fatalf("Mknod(%q): %v", dst, err)
+	}
+	src := filepath.Join(dir, "src")
+	const want = "mounted file"
+	if err := os.WriteFile(src, []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	spec := testutil.NewSpecWithArgs("cat", dst)
+	// The host root is the container root, so dst is in the rootfs.
+	spec.Mounts = []specs.Mount{
+		{Type: "tmpfs", Destination: "/etc"},
+		{Type: "bind", Source: src, Destination: dst},
+	}
+
+	rootDir, cleanupRoot, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupRoot()
+	bundleDir, cleanupBundle, err := testutil.SetupBundleDir(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupBundle()
+	id := testutil.RandomContainerID()
+	out, err := exec.Command(runsc, "--root", rootDir, "--network=none", "--platform="+conf.Platform, "run", "--bundle", bundleDir, id).CombinedOutput()
+	if err != nil {
+		t.Fatalf("runsc run: %v, output: %q", err, out)
+	}
+	if !strings.Contains(string(out), want) {
+		t.Errorf("runsc run output = %q, want it to contain %q", out, want)
+	}
+}
+
 // TestCgroupParent sets the "CgroupParent" option and checks that the child and
 // parent's cgroups are created correctly relative to each other.
 func TestCgroupParent(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1526,5 +1527,48 @@ func TestApplyNSRestoresThreadNamespace(t *testing.T) {
 	}
 	if restoredNS != threadNS {
 		t.Errorf("after restore, thread netns = %q, want %q (leader netns is %q)", restoredNS, threadNS, leaderNS)
+	}
+}
+
+func TestCreateMountPointFile(t *testing.T) {
+	dir := t.TempDir()
+	const content = "existing"
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Opening a FIFO for reading blocks until a writer opens it, so
+	// CreateMountPointFile blocks if it opens the FIFO.
+	fifo := filepath.Join(dir, "fifo")
+	if err := unix.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(filepath.Join(dir, "target"), link); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "missing")
+
+	for _, path := range []string{file, fifo, link, missing} {
+		errs := make(chan error, 1)
+		go func() { errs <- CreateMountPointFile(path) }()
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Errorf("CreateMountPointFile(%q): %v", path, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("CreateMountPointFile(%q) blocked: it opened the existing file", path)
+		}
+	}
+	if got, err := os.ReadFile(file); err != nil || string(got) != content {
+		t.Errorf("after CreateMountPointFile, %q contains %q (err %v), want %q", file, got, err, content)
+	}
+	if fi, err := os.Stat(missing); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("after CreateMountPointFile, stat(%q) = %v, %v, want a regular file", missing, fi, err)
+	}
+	// The dangling symlink is not followed.
+	if _, err := os.Lstat(filepath.Join(dir, "target")); !os.IsNotExist(err) {
+		t.Errorf("after CreateMountPointFile on a dangling symlink, its target exists (err %v)", err)
 	}
 }

@@ -336,11 +336,9 @@ func safeSetupAndMoveMount(srcFileFD int, src, dst, procPath string) error {
 		if err := os.MkdirAll(parent, 0777); err != nil {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
-		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("open(%q) failed: %v", dst, err)
+		if err := specutils.CreateMountPointFile(dst); err != nil {
+			return err
 		}
-		f.Close()
 	}
 
 	fd, err := unix.Open(dst, unix.O_PATH|unix.O_CLOEXEC, 0)
@@ -541,6 +539,15 @@ func ShouldExposeRDMADevice(path string) bool {
 	return strings.HasPrefix(path, "/dev/infiniband/uverbs")
 }
 
+// ShouldExposeDevice returns true if an enabled device proxy uses the device
+// at path, which spec lists. These devices are mounted in the gofer's /dev
+// directory.
+func ShouldExposeDevice(spec *specs.Spec, conf *config.Config, path string) bool {
+	return (specutils.NVProxyEnabled(spec, conf) && ShouldExposeNvidiaDevice(path)) ||
+		(specutils.TPUProxyEnabled(spec, conf) && ShouldExposeTpuDevice(path)) ||
+		(specutils.RDMAEnabled(spec, conf) && ShouldExposeRDMADevice(path))
+}
+
 // SetupDev mounts devices from the OCI spec into the gofer's /dev directory.
 func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) error {
 	if err := os.MkdirAll(filepath.Join(root, "dev"), 0777); err != nil {
@@ -550,14 +557,8 @@ func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) erro
 	if spec.Linux == nil {
 		return nil
 	}
-	nvproxyEnabled := specutils.NVProxyEnabled(spec, conf)
-	tpuproxyEnabled := specutils.TPUProxyEnabled(spec, conf)
-	rdmaproxyEnabled := specutils.RDMAEnabled(spec, conf)
 	for _, dev := range spec.Linux.Devices {
-		shouldMount := (nvproxyEnabled && ShouldExposeNvidiaDevice(dev.Path)) ||
-			(tpuproxyEnabled && ShouldExposeTpuDevice(dev.Path)) ||
-			(rdmaproxyEnabled && ShouldExposeRDMADevice(dev.Path))
-		if !shouldMount {
+		if !ShouldExposeDevice(spec, conf, dev.Path) {
 			continue
 		}
 		// The rootfs may contain symlinks at dev.Path; resolve them within

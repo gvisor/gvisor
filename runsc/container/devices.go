@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/runsc/cgroup"
+	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -78,10 +79,17 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 			return nil, err
 		}
 	}
-	// The gofer opens the container's devices for the sentry.
 	if spec.Linux != nil {
 		for _, dev := range spec.Linux.Devices {
+			if !specDeviceNeedsHostAccess(conf, spec, &dev) {
+				continue
+			}
 			if err := add(dev.Path, "rw"); err != nil {
+				// A spec entry whose host path is not a device has no host
+				// device to allow.
+				if errors.Is(err, errNotDevice) {
+					continue
+				}
 				return nil, err
 			}
 		}
@@ -102,6 +110,42 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 	return rules, nil
 }
 
+// specDeviceNeedsHostAccess returns true if a sandbox process may open the
+// host device of the spec entry dev.
+func specDeviceNeedsHostAccess(conf *config.Config, spec *specs.Spec, dev *specs.LinuxDevice) bool {
+	// The gofer may run CreateContainer hooks, which are host programs that
+	// may open any device that the spec lists.
+	if spec.Hooks != nil && len(spec.Hooks.CreateContainer) > 0 {
+		return true
+	}
+	// If the character device policy allows passthrough, device files on
+	// gofer mounts may be opened on the host. Otherwise, the sentry
+	// implements a device or fails to open it, and implements no block
+	// devices.
+	if (dev.Type == "c" || dev.Type == "u") && conf.CharacterDevicePolicy.AllowsPassthrough() {
+		return true
+	}
+	// Device proxies open their devices through the dev gofer.
+	return proxiedDevice(conf, spec, dev.Path)
+}
+
+// proxiedDevice returns true if an enabled device proxy opens the device at
+// path through the dev gofer. These are the devices that the gofer mounts in
+// the /dev directory that the dev gofer serves, plus the NVIDIA capability and
+// IMEX channel devices, which nvproxy opens through the dev gofer when they
+// are in the container's /dev.
+func proxiedDevice(conf *config.Config, spec *specs.Spec, path string) bool {
+	if sandboxsetup.ShouldExposeDevice(spec, conf, path) {
+		return true
+	}
+	nvidiaCapDevice := strings.HasPrefix(path, "/dev/nvidia-caps/") || strings.HasPrefix(path, "/dev/nvidia-caps-imex-channels/")
+	return nvidiaCapDevice && specutils.NVProxyEnabled(spec, conf)
+}
+
+// deviceRuleForPath returns an error that wraps errNotDevice for a path that
+// is not a device.
+var errNotDevice = errors.New("not a device")
+
 func deviceRuleForPath(path, access string) (cgroup.DeviceRule, error) {
 	var st unix.Stat_t
 	if err := unix.Stat(path, &st); err != nil {
@@ -118,7 +162,7 @@ func deviceRuleForPath(path, access string) (cgroup.DeviceRule, error) {
 	case unix.S_IFBLK:
 		r.Type = "b"
 	default:
-		return r, fmt.Errorf("%q is not a device", path)
+		return r, fmt.Errorf("%q: %w", path, errNotDevice)
 	}
 	return r, nil
 }

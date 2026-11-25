@@ -19,6 +19,7 @@ package specutils
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -936,12 +937,9 @@ func SafeSetupAndMount(src, dst, typ string, flags uint32, procPath string) erro
 		if err := os.MkdirAll(parent, 0777); err != nil {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
-		// Create the destination file if it does not exist.
-		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("open(%q) failed: %v", dst, err)
+		if err := CreateMountPointFile(dst); err != nil {
+			return err
 		}
-		f.Close()
 	}
 
 	// Do the mount.
@@ -949,6 +947,21 @@ func SafeSetupAndMount(src, dst, typ string, flags uint32, procPath string) erro
 		return fmt.Errorf("mount(%q, %q, %d) failed: %v", src, dst, flags, err)
 	}
 	return nil
+}
+
+// CreateMountPointFile creates an empty file at dst, to mount a file over, if
+// nothing exists at dst. It does not open an existing file at dst, which can
+// be a device or a FIFO; a mount over it does not need it to be opened. A
+// symbolic link at dst is not followed.
+func CreateMountPointFile(dst string) error {
+	f, err := os.OpenFile(dst, unix.O_CREAT|unix.O_EXCL, 0777)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open(%q) failed: %w", dst, err)
+	}
+	return f.Close()
 }
 
 // ErrSymlinkMount is returned by SafeMount when the mount destination is found
