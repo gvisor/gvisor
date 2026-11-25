@@ -21,20 +21,38 @@ import (
 )
 
 // joinNewSessionKeyringLocked creates a new session keyring with the given
-// description, and joins it immediately.
+// description, and joins it immediately. anonymous is true for unnamed _ses
+// keyrings, which Linux creates in install_session_keyring_to_cred().
 // Preconditions: t.mu is held.
 //
 // +checklocks:t.mu
-func (t *Task) joinNewSessionKeyringLocked(newKeyDesc string, newKeyPerms auth.KeyPermissions) (*auth.Key, error) {
+func (t *Task) joinNewSessionKeyringLocked(newKeyDesc string, newKeyPerms auth.KeyPermissions, anonymous bool) (*auth.Key, error) {
 	creds := t.Credentials()
-	maxKeys := int(t.Kernel().MaxKeySetSize.Load())
-	sessionKeyring, err := t.UserNamespace().Keys.Add(newKeyDesc, creds, newKeyPerms, maxKeys)
+	// Like install_session_keyring_to_cred, a task's first anonymous session
+	// keyring is charged even if that exceeds its owner's quota.
+	quotaOverrun := anonymous && t.sessionKeyring == nil
+	sessionKeyring, err := t.UserNamespace().Keys.Add(newKeyDesc, creds, newKeyPerms, t.Kernel().KeyQuotas, quotaOverrun)
 	if err != nil {
 		return nil, err
 	}
 	t.Debugf("Joining newly-created session keyring with ID %d, permissions %v", sessionKeyring.ID, newKeyPerms)
-	t.sessionKeyring = sessionKeyring
+	t.setSessionKeyringLocked(sessionKeyring)
 	return sessionKeyring, nil
+}
+
+// setSessionKeyringLocked makes key t's session keyring, taking ownership of
+// the caller's reference on key, and drops t's reference on its previous
+// session keyring.
+//
+// Preconditions: t.mu is held.
+//
+// +checklocks:t.mu
+func (t *Task) setSessionKeyringLocked(key *auth.Key) {
+	old := t.sessionKeyring
+	t.sessionKeyring = key
+	if old != nil {
+		old.DecRef(t)
+	}
 }
 
 // JoinSessionKeyring causes the task to join a keyring with the given
@@ -51,7 +69,7 @@ func (t *Task) JoinSessionKeyring(keyDesc *string) (*auth.Key, error) {
 	newKeyDesc := auth.DefaultSessionKeyringName
 	if keyDesc != nil {
 		creds.UserNamespace.Keys.ForEach(func(k *auth.Key) bool {
-			if k.Description == *keyDesc && creds.HasKeyPermission(k, possessed, auth.KeySearch) {
+			if k.Description == *keyDesc && creds.HasKeyPermission(k, possessed, auth.KeySearch) && k.TryIncRef() {
 				sessionKeyring = k
 				return true
 			}
@@ -59,13 +77,13 @@ func (t *Task) JoinSessionKeyring(keyDesc *string) (*auth.Key, error) {
 		})
 		if sessionKeyring != nil {
 			t.Debugf("Joining existing session keyring with ID %d", sessionKeyring.ID)
-			t.sessionKeyring = sessionKeyring
+			t.setSessionKeyringLocked(sessionKeyring)
 			return sessionKeyring, nil
 		}
 		newKeyDesc = *keyDesc
 		newKeyPerms = auth.DefaultNamedSessionKeyringPermissions
 	}
-	return t.joinNewSessionKeyringLocked(newKeyDesc, newKeyPerms)
+	return t.joinNewSessionKeyringLocked(newKeyDesc, newKeyPerms, keyDesc == nil)
 }
 
 // lookupKeyLocked resolves a key ID without checking permissions. The caller
@@ -78,7 +96,7 @@ func (t *Task) JoinSessionKeyring(keyDesc *string) (*auth.Key, error) {
 func (t *Task) lookupKeyLocked(keyID auth.KeySerial) (*auth.Key, error) {
 	if keyID == linux.KEY_SPEC_SESSION_KEYRING {
 		if t.sessionKeyring == nil {
-			return t.joinNewSessionKeyringLocked(auth.DefaultSessionKeyringName, auth.DefaultUnnamedSessionKeyringPermissions)
+			return t.joinNewSessionKeyringLocked(auth.DefaultSessionKeyringName, auth.DefaultUnnamedSessionKeyringPermissions, true)
 		}
 		return t.sessionKeyring, nil
 	}

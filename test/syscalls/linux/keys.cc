@@ -18,6 +18,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -34,14 +35,20 @@
 #include "gtest/gtest.h"
 #include "absl/random/random.h"
 #include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "test/util/cleanup.h"
+#include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -51,6 +58,7 @@
 #define KEY_POS_SEARCH 0x08000000
 #define KEY_POS_LINK 0x10000000
 #define KEY_POS_SETATTR 0x20000000
+#define KEY_POS_ALL 0x3f000000
 
 #define KEY_USR_VIEW 0x00010000
 #define KEY_USR_READ 0x00020000
@@ -909,6 +917,298 @@ TEST(KeysTest, SearchableKeyringIsSharedAcrossThreads) {
         << "Bit " << bit << " in second child key";
   }
   EXPECT_EQ(first_child_final_key.perm, second_child_final_key.perm);
+}
+
+// KeyEventuallyReleased returns true once key_id can no longer be found.
+// Linux drops the references held by an exited task's credentials after an
+// RCU grace period, so this retries for a while.
+bool KeyEventuallyReleased(int64_t key_id) {
+  for (int i = 0; i < 1000; ++i) {
+    if (syscall(__NR_keyctl, KEYCTL_DESCRIBE, key_id, 0, 0, 0) < 0) {
+      EXPECT_EQ(errno, ENOKEY);
+      return errno == ENOKEY;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  return false;
+}
+
+// Joining a session keyring drops the reference on the previous one, which
+// returns its quota. Linux frees the previous credentials, and with them that
+// reference, only after an RCU grace period, so natively this runs only as
+// root, whose key quota is far above the number of joins.
+TEST(KeysTest, RepeatedJoinsReleasePreviousKeyring) {
+  SKIP_IF(!IsRunningOnGvisor() && geteuid() != 0);
+  ScopedThread([&] {
+    for (int i = 0; i < 1000; ++i) {
+      ASSERT_NO_ERRNO(keyctl(KEYCTL_JOIN_SESSION_KEYRING)) << "join " << i;
+    }
+  }).Join();
+}
+
+// A keyring is released once the only task holding it exits.
+TEST(KeysTest, KeyringReleasedAfterHolderExits) {
+  const std::string name = absl::StrCat("keys_test_released_", getpid());
+  int64_t id = 0;
+  ScopedThread([&] {
+    id = ASSERT_NO_ERRNO_AND_VALUE(
+        keyctl(KEYCTL_JOIN_SESSION_KEYRING, (uint64_t)(name.c_str())));
+    // Let tasks that do not possess the keyring describe it.
+    ASSERT_NO_ERRNO(keyctl(KEYCTL_SETPERM, id,
+                           KEY_POS_ALL | KEY_USR_VIEW | KEY_USR_SEARCH));
+  }).Join();
+  ASSERT_GT(id, 0);
+  EXPECT_TRUE(KeyEventuallyReleased(id));
+}
+
+// JoinKeyringInForkedProcess forks a child that joins the session keyring
+// named name, lets its owner describe it, optionally moves to a new user
+// namespace, and exits. It returns the keyring's ID once the child is reaped.
+PosixErrorOr<int32_t> JoinKeyringInForkedProcess(const std::string& name,
+                                                 bool unshare_userns) {
+  int fds[2];
+  if (pipe(fds) < 0) {
+    return PosixError(errno, "pipe");
+  }
+  const char* const name_ptr = name.c_str();
+  const PosixErrorOr<int> status = InForkedProcess([&] {
+    const int64_t id =
+        syscall(__NR_keyctl, KEYCTL_JOIN_SESSION_KEYRING, name_ptr, 0, 0, 0);
+    TEST_PCHECK(id > 0);
+    TEST_PCHECK(syscall(__NR_keyctl, KEYCTL_SETPERM, id,
+                        KEY_POS_ALL | KEY_USR_VIEW | KEY_USR_SEARCH, 0,
+                        0) == 0);
+    if (unshare_userns) {
+      TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+    }
+    const int32_t id32 = id;
+    TEST_PCHECK(write(fds[1], &id32, sizeof(id32)) == sizeof(id32));
+    _exit(0);
+  });
+  close(fds[1]);
+  int32_t id = 0;
+  const ssize_t n = read(fds[0], &id, sizeof(id));
+  close(fds[0]);
+  RETURN_IF_ERRNO(status);
+  if (status.ValueOrDie() != 0) {
+    return PosixError(
+        ECHILD, absl::StrCat("child exited with status ", status.ValueOrDie()));
+  }
+  if (n != sizeof(id)) {
+    return PosixError(EIO, absl::StrCat("read returned ", n));
+  }
+  return id;
+}
+
+// A keyring is released once the process holding it exits and is reaped.
+TEST(KeysTest, KeyringReleasedAfterForkedHolderExits) {
+  const std::string name = absl::StrCat("keys_test_forked_", getpid());
+  const int32_t id = ASSERT_NO_ERRNO_AND_VALUE(
+      JoinKeyringInForkedProcess(name, /*unshare_userns=*/false));
+  EXPECT_TRUE(KeyEventuallyReleased(id));
+}
+
+// A keyring kept across unshare(CLONE_NEWUSER) is released from the user
+// namespace it was created in once its holder exits.
+TEST(KeysTest, KeyringReleasedAfterHolderLeavesUserNamespace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  const std::string name = absl::StrCat("keys_test_userns_", getpid());
+  const int32_t id = ASSERT_NO_ERRNO_AND_VALUE(
+      JoinKeyringInForkedProcess(name, /*unshare_userns=*/true));
+  EXPECT_TRUE(KeyEventuallyReleased(id));
+}
+
+// A keyring stays usable while any task holds it, and is released once the
+// last holder exits.
+TEST(KeysTest, SharedKeyringOutlivesOneHolder) {
+  const std::string name = absl::StrCat("keys_test_shared_", getpid());
+  int64_t id = 0;
+  ScopedThread([&] {
+    id = ASSERT_NO_ERRNO_AND_VALUE(
+        keyctl(KEYCTL_JOIN_SESSION_KEYRING, (uint64_t)(name.c_str())));
+    ASSERT_NO_ERRNO(keyctl(KEYCTL_SETPERM, id,
+                           KEY_POS_ALL | KEY_USR_VIEW | KEY_USR_SEARCH));
+    ScopedThread([&] {
+      ASSERT_THAT(keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING),
+                  IsPosixErrorOkAndHolds(id));
+      // Drop this thread's reference; the parent thread still holds one.
+      ASSERT_THAT(keyctl(KEYCTL_JOIN_SESSION_KEYRING),
+                  IsPosixErrorOkAndHolds(::testing::Ne(id)));
+      MaybeSave();
+      EXPECT_THAT(keyctl(KEYCTL_DESCRIBE, id),
+                  IsPosixErrorOkAndHolds(::testing::Gt(0)));
+      EXPECT_THAT(keyctl(KEYCTL_JOIN_SESSION_KEYRING, (uint64_t)(name.c_str())),
+                  IsPosixErrorOkAndHolds(id));
+    }).Join();
+    EXPECT_THAT(keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING),
+                IsPosixErrorOkAndHolds(id));
+  }).Join();
+  ASSERT_GT(id, 0);
+  EXPECT_TRUE(KeyEventuallyReleased(id));
+}
+
+// JoinNamedKeyring joins (creating if necessary) the session keyring called
+// name.
+PosixErrorOr<int64_t> JoinNamedKeyring(const std::string& name) {
+  return keyctl(KEYCTL_JOIN_SESSION_KEYRING, (uint64_t)(name.c_str()));
+}
+
+std::string KeyQuotaPath(const std::string& name) {
+  return absl::StrCat("/proc/sys/kernel/keys/", name);
+}
+
+// Returns true if the caller can write the key quota sysctl called name and
+// act as the real root user. On Linux, sysctl file permissions ignore
+// capabilities and only allow the global root user to write them (see
+// test_perm() in fs/proc/proc_sysctl.c). /proc/sys may also be mounted
+// read-only.
+PosixErrorOr<bool> CanSetKeyQuotas(const std::string& name) {
+  ASSIGN_OR_RETURN_ERRNO(bool have_setuid, HaveCapability(CAP_SETUID));
+  ASSIGN_OR_RETURN_ERRNO(bool in_init_userns, InInitialUserNamespace());
+  if (!have_setuid || !in_init_userns || getuid() != 0 || geteuid() != 0) {
+    return false;
+  }
+  const std::string path = KeyQuotaPath(name);
+  struct statvfs st;
+  if (statvfs(path.c_str(), &st) < 0) {
+    return PosixError(errno, absl::StrCat("statvfs ", path));
+  }
+  return (st.f_flag & ST_RDONLY) == 0;
+}
+
+// SetKeyQuota sets /proc/sys/kernel/keys/name to value until the returned
+// Cleanup runs.
+PosixErrorOr<Cleanup> SetKeyQuota(const std::string& name, int64_t value) {
+  const std::string path = KeyQuotaPath(name);
+  ASSIGN_OR_RETURN_ERRNO(std::string before, GetContents(path));
+  RETURN_IF_ERRNO(SetContents(path, absl::StrCat(value)));
+  return Cleanup(
+      [path, before] { EXPECT_NO_ERRNO(SetContents(path, before)); });
+}
+
+// Returns a random uid that is very unlikely to own any keys. Each test uses
+// its own, since Linux releases keys some time after their last holder exits.
+uid_t UnusedUid() {
+  absl::BitGen gen;
+  return absl::Uniform<uid_t>(gen, 0x10000000, 0x7fffffff);
+}
+
+// The tests below need three keyrings that are alive at the same time, so
+// each is joined by a different thread. A thread starts with its parent's
+// session keyring and dropping it does not affect the others.
+
+// Root has its own limits, so lowering maxkeys does not affect it.
+TEST(KeysQuotaTest, RootIgnoresMaxKeys) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas("maxkeys")));
+  const Cleanup cleanup = ASSERT_NO_ERRNO_AND_VALUE(SetKeyQuota("maxkeys", 1));
+  ScopedThread([&] {
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_NO_ERRNO(keyctl(KEYCTL_JOIN_SESSION_KEYRING)) << "join " << i;
+    }
+  }).Join();
+}
+
+// Each non-root user may hold at most maxkeys keys.
+TEST(KeysQuotaTest, NonRootMaxKeys) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas("maxkeys")));
+  const Cleanup cleanup = ASSERT_NO_ERRNO_AND_VALUE(SetKeyQuota("maxkeys", 2));
+  const uid_t uid = UnusedUid();
+  const std::string suffix = absl::StrCat("_", getpid());
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, uid, uid, uid), SyscallSucceeds());
+    ScopedThread([&] {
+      ASSERT_NO_ERRNO(JoinNamedKeyring("keys_quota_a" + suffix));
+      ScopedThread([&] {
+        ASSERT_NO_ERRNO(JoinNamedKeyring("keys_quota_b" + suffix));
+        // Checkpoint and restore with the keyrings held.
+        MaybeSave();
+        EXPECT_THAT(JoinNamedKeyring("keys_quota_c" + suffix),
+                    PosixErrorIs(EDQUOT));
+      }).Join();
+    }).Join();
+  }).Join();
+}
+
+// Each non-root user may be charged at most maxbytes.
+TEST(KeysQuotaTest, MaxBytes) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas("maxbytes")));
+  const std::string first = absl::StrCat("keys_quota_bytes_a_", getpid());
+  const std::string second = absl::StrCat("keys_quota_bytes_b_", getpid());
+  ASSERT_EQ(first.size(), second.size());
+  // A keyring is charged for its name and the terminating NUL.
+  const Cleanup cleanup =
+      ASSERT_NO_ERRNO_AND_VALUE(SetKeyQuota("maxbytes", first.size() + 1));
+  const uid_t uid = UnusedUid();
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, uid, uid, uid), SyscallSucceeds());
+    ScopedThread([&] {
+      ASSERT_NO_ERRNO(JoinNamedKeyring(first));
+      ScopedThread([&] {
+        // Checkpoint and restore with the keyrings held.
+        MaybeSave();
+        EXPECT_THAT(JoinNamedKeyring(second), PosixErrorIs(EDQUOT));
+      }).Join();
+    }).Join();
+  }).Join();
+}
+
+// Keyrings are owned by, and charged to, the real user of the creator, not
+// its effective user.
+TEST(KeysQuotaTest, ChargedToRealUid) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas("maxkeys")));
+  const Cleanup cleanup = ASSERT_NO_ERRNO_AND_VALUE(SetKeyQuota("maxkeys", 2));
+  const uid_t uid = UnusedUid();
+  const std::string suffix = absl::StrCat("_", getpid());
+  ScopedThread([&] {
+    // Real uid uid, effective uid root: the keyrings count against uid.
+    ASSERT_THAT(syscall(SYS_setresuid, uid, 0, 0), SyscallSucceeds());
+    ScopedThread([&] {
+      ASSERT_NO_ERRNO(JoinNamedKeyring("keys_quota_real_a" + suffix));
+      const DescribedKey described =
+          ASSERT_NO_ERRNO_AND_VALUE(DescribeKey(KEY_SPEC_SESSION_KEYRING));
+      EXPECT_EQ(described.uid, uid);
+      ScopedThread([&] {
+        ASSERT_NO_ERRNO(JoinNamedKeyring("keys_quota_real_b" + suffix));
+        // Checkpoint and restore with the keyrings held.
+        MaybeSave();
+        EXPECT_THAT(JoinNamedKeyring("keys_quota_real_c" + suffix),
+                    PosixErrorIs(EDQUOT));
+      }).Join();
+    }).Join();
+  }).Join();
+
+  ScopedThread([&] {
+    // Real uid root, effective uid uid: the keyrings count against root.
+    ASSERT_THAT(syscall(SYS_setresuid, 0, uid, 0), SyscallSucceeds());
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_NO_ERRNO(keyctl(KEYCTL_JOIN_SESSION_KEYRING)) << "join " << i;
+    }
+    const DescribedKey described =
+        ASSERT_NO_ERRNO_AND_VALUE(DescribeKey(KEY_SPEC_SESSION_KEYRING));
+    EXPECT_EQ(described.uid, 0);
+  }).Join();
+}
+
+// A released keyring no longer counts against its owner's quota.
+TEST(KeysQuotaTest, ReleasedKeyringReturnsQuota) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanSetKeyQuotas("maxkeys")));
+  const Cleanup cleanup = ASSERT_NO_ERRNO_AND_VALUE(SetKeyQuota("maxkeys", 1));
+  const uid_t uid = UnusedUid();
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, uid, uid, uid), SyscallSucceeds());
+    for (int i = 0; i < 3; ++i) {
+      int64_t id = 0;
+      ScopedThread([&] {
+        id = ASSERT_NO_ERRNO_AND_VALUE(JoinNamedKeyring(
+            absl::StrCat("keys_quota_released_", getpid(), "_", i)));
+        // Let the owner describe the keyring without possessing it.
+        ASSERT_NO_ERRNO(keyctl(KEYCTL_SETPERM, id,
+                               KEY_POS_ALL | KEY_USR_VIEW | KEY_USR_SEARCH));
+      }).Join();
+      ASSERT_GT(id, 0) << "join " << i;
+      ASSERT_TRUE(KeyEventuallyReleased(id)) << "join " << i;
+    }
+  }).Join();
 }
 
 }  // namespace

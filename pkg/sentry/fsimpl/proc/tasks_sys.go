@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"slices"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -235,7 +236,10 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "kernel/keys":
 		return map[string]kernfs.Inode{
-			"maxkeys": fs.newMaxKeySizeFile(ctx, k, root),
+			"maxkeys":       fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.KeyQuotas.MaxKeys, min: 1, max: math.MaxInt32, checkSysctlPerm: true}),
+			"maxbytes":      fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.KeyQuotas.MaxBytes, min: 1, max: math.MaxInt32, checkSysctlPerm: true}),
+			"root_maxkeys":  fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.KeyQuotas.RootMaxKeys, min: 1, max: math.MaxInt32, checkSysctlPerm: true}),
+			"root_maxbytes": fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.KeyQuotas.RootMaxBytes, min: 1, max: math.MaxInt32, checkSysctlPerm: true}),
 		}
 	case "fs":
 		return map[string]kernfs.Inode{
@@ -845,9 +849,22 @@ type atomicInt32File struct {
 
 	val      *atomicbitops.Int32
 	min, max int32
+
+	// If checkSysctlPerm is true, access is checked with sysctlPerm on open
+	// and on every write, as Linux does for /proc/sys files.
+	checkSysctlPerm bool
 }
 
 var _ vfs.WritableDynamicBytesSource = (*atomicInt32File)(nil)
+
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
+func (f *atomicInt32File) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if !f.checkSysctlPerm {
+		return f.DynamicBytesFile.CheckPermissions(ctx, creds, ats)
+	}
+	// Linux's fs/proc/proc_sysctl.c:proc_sys_permission.
+	return sysctlPerm(creds, f.Mode(), ats)
+}
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *atomicInt32File) Generate(ctx context.Context, buf *bytes.Buffer) error {
@@ -857,6 +874,11 @@ func (f *atomicInt32File) Generate(ctx context.Context, buf *bytes.Buffer) error
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (f *atomicInt32File) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	// Linux's fs/proc/proc_sysctl.c:proc_sys_call_handler checks the writer's
+	// current credentials on every write, not only at open, and returns EPERM.
+	if f.checkSysctlPerm && sysctlPerm(auth.CredentialsFromContext(ctx), f.Mode(), vfs.MayWrite) != nil {
+		return 0, linuxerr.EPERM
+	}
 	if offset != 0 {
 		// Ignore partial writes.
 		return 0, linuxerr.EINVAL
@@ -873,6 +895,23 @@ func (f *atomicInt32File) Write(ctx context.Context, _ *vfs.FileDescription, src
 
 	f.val.Store(buf[0])
 	return n, nil
+}
+
+// sysctlPerm checks creds for access ats to a /proc/sys file with the given
+// mode, as Linux's fs/proc/proc_sysctl.c:test_perm does: the owner bits apply
+// only to effective UID 0 and the group bits only to members of GID 0, by
+// effective or supplementary GID. No capability overrides the mode.
+func sysctlPerm(creds *auth.Credentials, mode linux.FileMode, ats vfs.AccessTypes) error {
+	perms := uint16(mode.Permissions())
+	if creds.EffectiveKUID == auth.RootKUID {
+		perms >>= 6
+	} else if creds.EffectiveKGID == auth.RootKGID || slices.Contains(creds.ExtraKGIDs, auth.RootKGID) {
+		perms >>= 3
+	}
+	if uint16(ats)&perms == uint16(ats) {
+		return nil
+	}
+	return linuxerr.EACCES
 }
 
 // fileNrData implements /proc/sys/fs/file-nr.

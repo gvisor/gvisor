@@ -64,17 +64,18 @@ const (
 	// MaxKeyDescSize is the maximum size of the "Description" field of keys.
 	// Corresponds to `KEY_MAX_DESC_SIZE` in Linux.
 	MaxKeyDescSize = 4096
-
-	// MaxSetSize is the default maximum number of keys in a `KeySet`.
-	// By default, Linux limits this number to 200 per non-root user.
-	// Here, we limit it to 200 per Set, which is stricter.
-	MaxSetSize = 200
 )
 
 // Key represents a key in the keyrings subsystem.
 //
+// Each task whose session keyring is the key holds a reference on it. Once
+// the last reference is dropped, the key is removed from its KeySet, and it
+// cannot be found again.
+//
 // +stateify savable
 type Key struct {
+	keyRefs
+
 	// ID is the ID of the key, also often referred to as "serial number".
 	// Note that key IDs passed in syscalls may be negative when they refer to
 	// "special keys", sometimes also referred to as "shortcut IDs".
@@ -94,8 +95,8 @@ type Key struct {
 	// superset of this `Description`.
 	Description string
 
-	// kuid is the owner of the key in the root namespace.
-	// It is immutable.
+	// kuid is the owner of the key in the root namespace. The owner is charged
+	// for the key. It is immutable.
 	kuid KUID
 
 	// kgid is the group of the key in the root namespace.
@@ -112,6 +113,33 @@ type Key struct {
 	//
 	// +checkatomic
 	perms atomicbitops.Uint64 `state:".(KeyPermissions)"`
+
+	// set is the KeySet that contains the key. It is immutable.
+	set *KeySet
+
+	// quotas holds the quota charged to kuid for the key. It is immutable.
+	quotas *KeyQuotas
+
+	// quotalen is the number of bytes charged to kuid for the key. It is
+	// immutable.
+	quotalen uint32
+}
+
+// DecRef implements refs.RefCounter.DecRef. Like key_put in Linux, dropping
+// the last reference returns the key's quota to its owner. It also removes k
+// from its KeySet, which locks KeySet.mu.
+func (k *Key) DecRef(ctx context.Context) {
+	k.keyRefs.DecRef(func() {
+		k.quotas.uncharge(k.kuid, k.quotalen)
+		k.set.remove(k)
+	})
+}
+
+// alive returns true if k still has references. Like key_lookup in Linux,
+// keys whose last reference was dropped cannot be found again even before
+// they are removed from their KeySet.
+func (k *Key) alive() bool {
+	return k.ReadRefs() > 0
 }
 
 // savePerms is invoked by stateify.
@@ -318,11 +346,13 @@ type KeySet struct {
 
 	// keys maps key IDs to the underlying Key struct.
 	// It is initialized on the first successful Add.
+	// A key is removed when its last reference is dropped.
 	// +checklocks:mu
 	keys map[KeySerial]*Key
 }
 
-// Lookup looks up a key by ID.
+// Lookup looks up a key by ID. It does not return keys with no references
+// left.
 // Callers must exercise care to verify that the key can be accessed with
 // proper credentials.
 //
@@ -331,13 +361,13 @@ func (s *KeySet) Lookup(keyID KeySerial) (*Key, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key, found := s.keys[keyID]
-	if !found {
+	if !found || !key.alive() {
 		return nil, linuxerr.ENOKEY
 	}
 	return key, nil
 }
 
-// ForEach iterates over all keys.
+// ForEach iterates over all keys that still have references.
 // If `fn` returns true, iteration stops immediately.
 // Callers must exercise care to only process keys to which they have access.
 //
@@ -348,10 +378,24 @@ func (s *KeySet) ForEach(fn func(*Key) bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, key := range s.keys {
+		if !key.alive() {
+			continue
+		}
 		if fn(key) {
 			return
 		}
 	}
+}
+
+// remove removes k from s.
+//
+// Preconditions: k has no references left.
+//
+// +checklocksexclude:s.mu
+func (s *KeySet) remove(k *Key) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.keys, k.ID)
 }
 
 // getNewID returns a new random key ID strictly larger than zero.
@@ -370,38 +414,59 @@ func getNewID() (KeySerial, error) {
 	return KeySerial(newID), nil
 }
 
-// Add adds a new Key to the KeySet.
+// Add adds a new keyring to the KeySet, owned by the real user and group of
+// creds, and charges it to its owner in quotas until its last reference is
+// dropped. It returns EDQUOT if that exceeds the owner's quota, unless
+// quotaOverrun is set. The returned key has one reference, which is owned by
+// the caller.
 //
 // +checklocksexclude:s.mu
-func (s *KeySet) Add(description string, creds *Credentials, perms KeyPermissions, keySizeLimit int) (*Key, error) {
+func (s *KeySet) Add(description string, creds *Credentials, perms KeyPermissions, quotas *KeyQuotas, quotaOverrun bool) (*Key, error) {
 	if len(description) >= MaxKeyDescSize {
 		return nil, linuxerr.EINVAL
 	}
+	k := &Key{
+		Description: description,
+		kuid:        creds.RealKUID,
+		kgid:        creds.RealKGID,
+		perms:       atomicbitops.FromUint64(uint64(perms)),
+		set:         s,
+		quotas:      quotas,
+		// Like key_alloc, the quota charge covers the description and its
+		// terminating NUL. Keyrings have no payload.
+		quotalen: uint32(len(description)) + 1,
+	}
+	if err := quotas.charge(k.kuid, k.quotalen, quotaOverrun); err != nil {
+		return nil, err
+	}
+	if err := s.add(k); err != nil {
+		quotas.uncharge(k.kuid, k.quotalen)
+		return nil, err
+	}
+	return k, nil
+}
+
+// add gives k a fresh ID and one reference, and inserts it into s.
+//
+// +checklocksexclude:s.mu
+func (s *KeySet) add(k *Key) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.keys) >= keySizeLimit {
-		return nil, linuxerr.EDQUOT
-	}
 	newID, err := getNewID()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for s.keys[newID] != nil {
 		newID, err = getNewID()
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if s.keys == nil {
 		s.keys = make(map[KeySerial]*Key)
 	}
-	k := &Key{
-		ID:          newID,
-		Description: description,
-		kuid:        creds.EffectiveKUID,
-		kgid:        creds.EffectiveKGID,
-		perms:       atomicbitops.FromUint64(uint64(perms)),
-	}
+	k.ID = newID
+	k.InitRefs()
 	s.keys[newID] = k
-	return k, nil
+	return nil
 }
