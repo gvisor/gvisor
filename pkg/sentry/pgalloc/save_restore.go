@@ -383,7 +383,6 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// host, so keeping committed zero pages in place does not raise memory
 	// usage.
 	decommitZeroPages := !opts.ExitAfterSaving || dataSeeker == nil
-	zeroPage := make([]byte, hostarch.PageSize)
 	// f.mu is unlocked below, allowing concurrent calls to f.UpdateUsage() to
 	// observe pages that we transiently commit (for comparisons to zero) or
 	// leave committed (if opts.ExcludeCommittedZeroPages is true). Set
@@ -408,29 +407,33 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			return
 		}
 		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			bs := chunk.sliceAt(chunkFR)
-			pageSize := int(hostarch.PageSize)
-			for pgoff := 0; pgoff < len(bs); pgoff += pageSize {
-				pg := bs[pgoff : pgoff+pageSize]
-				off := chunkFR.Start + uint64(pgoff)
-				isZeroed := bytes.Equal(pg, zeroPage)
-				if isZeroed {
-					if !wasCommitted {
-						alreadyUncommittedBytes += uint64(hostarch.PageSize)
-						if decommitZeroPages {
+			zero := zeroPages(chunk.sliceAt(chunkFR))
+			for i := 0; i < len(zero); {
+				j := i + 1
+				for j < len(zero) && zero[j] == zero[i] {
+					j++
+				}
+				run := memmap.FileRange{
+					Start: chunkFR.Start + uint64(i)*uint64(hostarch.PageSize),
+					End:   chunkFR.Start + uint64(j)*uint64(hostarch.PageSize),
+				}
+				switch {
+				case zero[i] && !wasCommitted:
+					alreadyUncommittedBytes += run.Length()
+					if decommitZeroPages {
+						for off := run.Start; off < run.End; off += uint64(hostarch.PageSize) {
 							decommitAddPage(off)
 						}
-					} else {
-						newUncommittedBytes += uint64(hostarch.PageSize)
 					}
-				} else {
-					if !wasCommitted {
-						newCommittedBytes += uint64(hostarch.PageSize)
-					} else {
-						alreadyCommittedBytes += uint64(hostarch.PageSize)
-					}
+				case zero[i]:
+					newUncommittedBytes += run.Length()
+				case !wasCommitted:
+					newCommittedBytes += run.Length()
+				default:
+					alreadyCommittedBytes += run.Length()
 				}
-				maseg = updateAddRange(maseg, memmap.FileRange{Start: off, End: off + uint64(hostarch.PageSize)}, wasCommitted, !isZeroed)
+				maseg = updateAddRange(maseg, run, wasCommitted, !zero[i])
+				i = j
 			}
 			// f.UpdateUsage() may be called concurrently with f.SaveTo();
 			// occasionally unlock f.mu to ensure that the former can promptly
@@ -1109,6 +1112,40 @@ func (apfs *AsyncPagesFileSave) main() {
 		}
 		apfs.mu.Unlock()
 	}
+}
+
+// zeroPageScanMinPages is the fewest pages zeroPages() checks per goroutine.
+const zeroPageScanMinPages = 4096
+
+// zeroPageBuf is a read-only zero page shared by zeroPages().
+var zeroPageBuf [hostarch.MaxPageSize]byte
+
+// zeroPages returns whether each page in bs is zero. Pages are checked in
+// parallel, since each check is usually bound by a cache miss.
+func zeroPages(bs []byte) []bool {
+	pageSize := int(hostarch.PageSize)
+	zeroPage := zeroPageBuf[:pageSize]
+	zero := make([]bool, len(bs)/pageSize)
+	check := func(start, end int) {
+		for i := start; i < end; i++ {
+			zero[i] = bytes.Equal(bs[i*pageSize:(i+1)*pageSize], zeroPage)
+		}
+	}
+	shards := min(runtime.GOMAXPROCS(0), len(zero)/zeroPageScanMinPages)
+	if shards <= 1 {
+		check(0, len(zero))
+		return zero
+	}
+	var wg sync.WaitGroup
+	for s := range shards {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			check(len(zero)*s/shards, len(zero)*(s+1)/shards)
+		}()
+	}
+	wg.Wait()
+	return zero
 }
 
 // LoadOpts provides options to MemoryFile.LoadFrom().
