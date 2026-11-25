@@ -44,7 +44,6 @@ GAZELLE_PACKAGES = [
     "pkg/safemem",
     "pkg/seccomp/precompiledseccomp",
     "pkg/seccomp/precompiledseccomp/example",
-    "pkg/secio",
     "pkg/sentry/checkpoint",
     "pkg/sentry/contexttest",
     "pkg/sentry/devices/memdev",
