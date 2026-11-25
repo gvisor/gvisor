@@ -53,6 +53,9 @@ func fdbasedLinkEqual(a, b sentryapi.FDBasedLink) bool {
 	if a.QDisc != b.QDisc {
 		return false
 	}
+	if a.NoARP != b.NoARP {
+		return false
+	}
 	// LinkAddress is randomly assigned for veth pairs, so compare lengths.
 	if len(a.LinkAddress) != len(b.LinkAddress) {
 		return false
@@ -773,6 +776,142 @@ func TestCollectLinksAndRoutes_DownInterface(t *testing.T) {
 
 	if !loopbackLinksEqual(args.LoopbackLinks, nil) {
 		t.Errorf("LoopbackLinks mismatch:\ngot  %+v\nwant nil", args.LoopbackLinks)
+	}
+}
+
+// createNetkitPair creates the netkit device name, with its peer down, or
+// skips the test if the kernel has no netkit support.
+func createNetkitPair(t *testing.T, name string, mode netlink.NetkitMode) {
+	t.Helper()
+	nk := &netlink.Netkit{
+		LinkAttrs:  netlink.LinkAttrs{Name: name},
+		Mode:       mode,
+		Policy:     netlink.NETKIT_POLICY_FORWARD,
+		PeerPolicy: netlink.NETKIT_POLICY_FORWARD,
+	}
+	peer := netlink.NewLinkAttrs()
+	peer.Name = name + "-peer"
+	nk.SetPeerAttrs(&peer)
+	if err := netlink.LinkAdd(nk); err != nil {
+		t.Skipf("Failed to create netkit device (requires Linux 6.7 or later): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := netlink.LinkDel(nk); err != nil {
+			t.Errorf("Failed to delete netkit device: %v", err)
+		}
+	})
+}
+
+// TestCollectLinksAndRoutes_LinkFraming checks the link address and NoARP of
+// links that differ in how they frame packets and resolve link addresses.
+func TestCollectLinksAndRoutes_LinkFraming(t *testing.T) {
+	requireRoot(t)
+	for _, tc := range []struct {
+		name string
+		// create creates the link "testlink0".
+		create func(t *testing.T)
+		// wantZeroAddress is true if LinkAddress must be an all-zero
+		// Ethernet address, and false if it must be the link's own.
+		wantZeroAddress bool
+		wantNoARP       bool
+	}{
+		{
+			// An Ethernet device with an all-zero address and IFF_NOARP.
+			name: "netkit L3",
+			create: func(t *testing.T) {
+				createNetkitPair(t, "testlink0", netlink.NETKIT_MODE_L3)
+			},
+			wantZeroAddress: true,
+			wantNoARP:       true,
+		},
+		{
+			name: "netkit L3 with ARP on",
+			create: func(t *testing.T) {
+				createNetkitPair(t, "testlink0", netlink.NETKIT_MODE_L3)
+				link, err := netlink.LinkByName("testlink0")
+				if err != nil {
+					t.Fatalf("Failed to get link: %v", err)
+				}
+				if err := netlink.LinkSetARPOn(link); err != nil {
+					t.Fatalf("Failed to clear IFF_NOARP: %v", err)
+				}
+			},
+			wantZeroAddress: true,
+		},
+		{
+			name: "netkit L2",
+			create: func(t *testing.T) {
+				createNetkitPair(t, "testlink0", netlink.NETKIT_MODE_L2)
+			},
+		},
+		{
+			name: "veth with ARP off",
+			create: func(t *testing.T) {
+				link := createVethPair(t, "testlink0")
+				if err := netlink.LinkSetARPOff(link); err != nil {
+					t.Fatalf("Failed to set IFF_NOARP: %v", err)
+				}
+			},
+		},
+		{
+			// A device without a hardware address gets no Ethernet framing.
+			name: "tun",
+			create: func(t *testing.T) {
+				tun := &netlink.Tuntap{
+					LinkAttrs: netlink.LinkAttrs{Name: "testlink0"},
+					Mode:      netlink.TUNTAP_MODE_TUN,
+				}
+				if err := netlink.LinkAdd(tun); err != nil {
+					t.Fatalf("Failed to create tun device: %v", err)
+				}
+				t.Cleanup(func() {
+					if err := netlink.LinkDel(tun); err != nil {
+						t.Errorf("Failed to delete tun device: %v", err)
+					}
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupTestNamespace(t)
+			setupLoopback(t)
+			tc.create(t)
+			link, err := netlink.LinkByName("testlink0")
+			if err != nil {
+				t.Fatalf("Failed to get link: %v", err)
+			}
+			if err := netlink.LinkSetUp(link); err != nil {
+				t.Fatalf("Failed to bring up interface: %v", err)
+			}
+			if err := netlink.AddrAdd(link, &netlink.Addr{
+				IPNet: &net.IPNet{IP: net.ParseIP("10.0.0.1"), Mask: net.CIDRMask(24, 32)},
+			}); err != nil {
+				t.Fatalf("Failed to add address: %v", err)
+			}
+
+			conf := &config.Config{
+				XDP: config.XDP{Mode: config.XDPModeOff},
+			}
+			args, err := collectLinksAndRoutes(conf, false, false)
+			if err != nil {
+				t.Fatalf("collectLinksAndRoutes failed: %v", err)
+			}
+
+			if len(args.FDBasedLinks) != 1 {
+				t.Fatalf("got %d FDBasedLinks, want 1: %+v", len(args.FDBasedLinks), args.FDBasedLinks)
+			}
+			got := args.FDBasedLinks[0]
+			want := link.Attrs().HardwareAddr
+			if tc.wantZeroAddress {
+				want = make(net.HardwareAddr, ethernetAddressLen)
+			}
+			if !bytes.Equal(got.LinkAddress, want) {
+				t.Errorf("LinkAddress = %v, want %v", got.LinkAddress, want)
+			}
+			if got.NoARP != tc.wantNoARP {
+				t.Errorf("NoARP = %t, want %t", got.NoARP, tc.wantNoARP)
+			}
+		})
 	}
 }
 

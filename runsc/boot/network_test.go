@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"bytes"
 	"net"
 	"os"
 	"testing"
@@ -27,8 +28,11 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/pkg/waiter"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
@@ -253,6 +257,239 @@ func TestCreateLinksAndRoutesExternalLoopback(t *testing.T) {
 			waitForStatIncrement(t, "InvalidSourceAddressesReceived", invalidSrc, beforeInvalidSrc)
 			if got := delivered.Value() - beforeDelivered; got != 0 {
 				t.Errorf("eth0 IPv4 loopback src PacketsDelivered delta = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// noARPLink holds a sandbox stack with one fdbased link that does not resolve
+// link addresses, and the peer end of the link.
+type noARPLink struct {
+	s    *stack.Stack
+	peer *os.File
+	nic  tcpip.NICID
+}
+
+var (
+	noARPZeroMAC = tcpip.LinkAddress(make([]byte, header.EthernetAddressSize))
+	noARPPeerMAC = tcpip.LinkAddress([]byte{0x02, 0, 0, 0, 0, 0x09})
+)
+
+func newNoARPLink(t *testing.T) *noARPLink {
+	t.Helper()
+	creator := &sandboxNetstackCreator{clock: tcpip.NewStdClock(), uid: &testUniqueIDProvider{}}
+	inetStack, err := creator.CreateStack()
+	if err != nil {
+		t.Fatalf("CreateStack(): %v", err)
+	}
+	s := inetStack.(*netstack.Stack).Stack
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	epFile := os.NewFile(uintptr(fds[0]), "eth0-ep")
+	peer := os.NewFile(uintptr(fds[1]), "eth0-peer")
+	// Destroy the stack before closing the peer: the dispatcher does not
+	// stop on EOF.
+	t.Cleanup(func() { epFile.Close(); peer.Close() })
+	t.Cleanup(s.Destroy)
+
+	n := &Network{Stack: s}
+	args := &sentryapi.CreateLinksAndRoutesArgs{
+		FilePayload: urpc.FilePayload{Files: []*os.File{epFile}},
+		FDBasedLinks: []sentryapi.FDBasedLink{{
+			Name:        "eth0",
+			MTU:         1500,
+			Multicast:   true,
+			LinkAddress: make(net.HardwareAddr, header.EthernetAddressSize),
+			NoARP:       true,
+			Addresses: []sentryapi.IPWithPrefix{
+				{Address: net.IPv4(10, 0, 0, 2).To4(), PrefixLen: 24},
+				{Address: net.ParseIP("fd00::2"), PrefixLen: 64},
+			},
+			Routes: []sentryapi.Route{
+				{Destination: net.IPNet{IP: net.IPv4(10, 0, 0, 0).To4(), Mask: net.CIDRMask(24, 32)}},
+				{Destination: net.IPNet{IP: net.ParseIP("fd00::"), Mask: net.CIDRMask(64, 128)}},
+				{Destination: net.IPNet{IP: net.IPv4(224, 0, 0, 0).To4(), Mask: net.CIDRMask(4, 32)}},
+				{Destination: net.IPNet{IP: net.ParseIP("ff00::"), Mask: net.CIDRMask(8, 128)}},
+			},
+			NumChannels:   1,
+			IsPacket:      []bool{false},
+			PreConfigured: true,
+		}},
+		Defaultv4Gateway: sentryapi.DefaultRoute{Name: "eth0", Route: sentryapi.Route{
+			Destination: net.IPNet{IP: net.IPv4zero.To4(), Mask: net.CIDRMask(0, 32)},
+			Gateway:     net.IPv4(10, 0, 0, 1).To4(),
+		}},
+		Defaultv6Gateway: sentryapi.DefaultRoute{Name: "eth0", Route: sentryapi.Route{
+			Destination: net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+			Gateway:     net.ParseIP("fd00::1"),
+		}},
+	}
+	if err := n.CreateLinksAndRoutes(args, nil); err != nil {
+		t.Fatalf("CreateLinksAndRoutes(): %v", err)
+	}
+	for id, info := range s.NICInfo() {
+		if info.Name == "eth0" {
+			return &noARPLink{s: s, peer: peer, nic: id}
+		}
+	}
+	t.Fatalf("no NIC named eth0 in %v", s.NICInfo())
+	return nil
+}
+
+// nextFrame returns the first frame from the sandbox that is ARP, an NDP
+// neighbor solicitation, or carries the given transport protocol.
+func (l *noARPLink) nextFrame(t *testing.T, transport uint8) header.Ethernet {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ms := int(time.Until(deadline).Milliseconds())
+		if ms <= 0 {
+			t.Fatalf("timed out waiting for a frame")
+		}
+		pfd := []unix.PollFd{{Fd: int32(l.peer.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(pfd, ms)
+		if err == unix.EINTR || n == 0 {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+		b := make([]byte, 2048)
+		n, err = unix.Read(int(l.peer.Fd()), b)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		eth := header.Ethernet(b[:n])
+		switch eth.Type() {
+		case header.ARPProtocolNumber:
+			return eth
+		case header.IPv4ProtocolNumber:
+			if header.IPv4(eth[header.EthernetMinimumSize:]).Protocol() == transport {
+				return eth
+			}
+		case header.IPv6ProtocolNumber:
+			ip := header.IPv6(eth[header.EthernetMinimumSize:])
+			if ip.NextHeader() == uint8(header.ICMPv6ProtocolNumber) &&
+				header.ICMPv6(ip.Payload()).Type() == header.ICMPv6NeighborSolicit {
+				return eth
+			}
+			if ip.NextHeader() == transport {
+				return eth
+			}
+		}
+	}
+}
+
+func (l *noARPLink) inject(t *testing.T, proto tcpip.NetworkProtocolNumber, pkt []byte) {
+	t.Helper()
+	if _, err := l.peer.Write(wrapEthernetFrame(noARPZeroMAC, noARPPeerMAC, proto, pkt)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+}
+
+// sendUDP sends a UDP datagram from the sandbox stack to addr.
+func (l *noARPLink) sendUDP(t *testing.T, proto tcpip.NetworkProtocolNumber, addr tcpip.Address, port uint16) {
+	t.Helper()
+	var wq waiter.Queue
+	ep, err := l.s.NewEndpoint(udp.ProtocolNumber, proto, &wq)
+	if err != nil {
+		t.Fatalf("NewEndpoint: %s", err)
+	}
+	t.Cleanup(ep.Close)
+	ep.SocketOptions().SetBroadcast(true)
+	to := tcpip.FullAddress{NIC: l.nic, Addr: addr, Port: port}
+	if _, err := ep.Write(bytes.NewReader([]byte("hello")), tcpip.WriteOptions{To: &to}); err != nil {
+		t.Fatalf("Write: %s", err)
+	}
+}
+
+// TestCreateLinksAndRoutesNoARP checks the frames that the sandbox sends on a
+// link created with FDBasedLink.NoARP. The expected destination addresses are
+// those that Linux uses on an IFF_NOARP Ethernet device: the multicast address
+// for multicast, and the device's own address for everything else.
+func TestCreateLinksAndRoutesNoARP(t *testing.T) {
+	own := noARPZeroMAC
+	for _, tc := range []struct {
+		name    string
+		send    func(t *testing.T, l *noARPLink)
+		proto   tcpip.NetworkProtocolNumber
+		l4      uint8
+		wantDst tcpip.LinkAddress
+	}{
+		{
+			name: "IPv4 via gateway",
+			send: func(t *testing.T, l *noARPLink) {
+				l.inject(t, header.IPv4ProtocolNumber, buildICMPv4EchoPacket(tcpip.AddrFrom4([4]byte{192, 0, 2, 5}), tcpip.AddrFrom4([4]byte{10, 0, 0, 2})))
+			},
+			proto: header.IPv4ProtocolNumber, l4: uint8(header.ICMPv4ProtocolNumber), wantDst: own,
+		},
+		{
+			name: "IPv4 on link",
+			send: func(t *testing.T, l *noARPLink) {
+				l.inject(t, header.IPv4ProtocolNumber, buildICMPv4EchoPacket(tcpip.AddrFrom4([4]byte{10, 0, 0, 7}), tcpip.AddrFrom4([4]byte{10, 0, 0, 2})))
+			},
+			proto: header.IPv4ProtocolNumber, l4: uint8(header.ICMPv4ProtocolNumber), wantDst: own,
+		},
+		{
+			name: "IPv6 via gateway",
+			send: func(t *testing.T, l *noARPLink) {
+				l.inject(t, header.IPv6ProtocolNumber, buildICMPv6EchoPacket(tcpip.AddrFrom16Slice(net.ParseIP("2001:db8::5")), tcpip.AddrFrom16Slice(net.ParseIP("fd00::2"))))
+			},
+			proto: header.IPv6ProtocolNumber, l4: uint8(header.ICMPv6ProtocolNumber), wantDst: own,
+		},
+		{
+			name: "IPv6 on link",
+			send: func(t *testing.T, l *noARPLink) {
+				l.inject(t, header.IPv6ProtocolNumber, buildICMPv6EchoPacket(tcpip.AddrFrom16Slice(net.ParseIP("fd00::7")), tcpip.AddrFrom16Slice(net.ParseIP("fd00::2"))))
+			},
+			proto: header.IPv6ProtocolNumber, l4: uint8(header.ICMPv6ProtocolNumber), wantDst: own,
+		},
+		{
+			name: "IPv4 limited broadcast",
+			send: func(t *testing.T, l *noARPLink) {
+				l.sendUDP(t, header.IPv4ProtocolNumber, tcpip.AddrFrom4([4]byte{255, 255, 255, 255}), 67)
+			},
+			proto: header.IPv4ProtocolNumber, l4: uint8(header.UDPProtocolNumber), wantDst: own,
+		},
+		{
+			name: "IPv4 subnet broadcast",
+			send: func(t *testing.T, l *noARPLink) {
+				l.sendUDP(t, header.IPv4ProtocolNumber, tcpip.AddrFrom4([4]byte{10, 0, 0, 255}), 67)
+			},
+			proto: header.IPv4ProtocolNumber, l4: uint8(header.UDPProtocolNumber), wantDst: own,
+		},
+		{
+			name: "IPv4 multicast",
+			send: func(t *testing.T, l *noARPLink) {
+				l.sendUDP(t, header.IPv4ProtocolNumber, tcpip.AddrFrom4([4]byte{224, 0, 0, 251}), 5353)
+			},
+			proto: header.IPv4ProtocolNumber, l4: uint8(header.UDPProtocolNumber),
+			wantDst: tcpip.LinkAddress([]byte{0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb}),
+		},
+		{
+			name: "IPv6 multicast",
+			send: func(t *testing.T, l *noARPLink) {
+				l.sendUDP(t, header.IPv6ProtocolNumber, tcpip.AddrFrom16Slice(net.ParseIP("ff02::fb")), 5353)
+			},
+			proto: header.IPv6ProtocolNumber, l4: uint8(header.UDPProtocolNumber),
+			wantDst: tcpip.LinkAddress([]byte{0x33, 0x33, 0x00, 0x00, 0x00, 0xfb}),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newNoARPLink(t)
+			tc.send(t, l)
+			eth := l.nextFrame(t, tc.l4)
+			if got := eth.Type(); got != tc.proto {
+				t.Fatalf("got a frame of type %v (destination %v), want type %v", got, eth.DestinationAddress(), tc.proto)
+			}
+			if got := eth.DestinationAddress(); got != tc.wantDst {
+				t.Errorf("DestinationAddress() = %v, want %v", got, tc.wantDst)
+			}
+			if got := eth.SourceAddress(); got != own {
+				t.Errorf("SourceAddress() = %v, want %v", got, own)
 			}
 		})
 	}

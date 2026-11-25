@@ -365,6 +365,9 @@ func removeLinkAddresses(linkName string, addresses []sentryapi.IPWithPrefix) er
 	return nil
 }
 
+// ethernetAddressLen is the length of an Ethernet hardware address.
+const ethernetAddressLen = 6
+
 // collectLinksAndRoutes queries the network interfaces in the current network
 // namespace and scrapes their configuration (addresses, routes, neighbors).
 // It returns the args to create them in the sandbox. This function has no
@@ -502,6 +505,17 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6, excludeRDMADevices 
 				GVisorGRO:         conf.GVisorGRO,
 			})
 		} else {
+			// The netlink package omits an all-zero hardware address. An
+			// Ethernet device with that address (e.g. netkit in L3 mode) still
+			// needs Ethernet framing.
+			zeroLinkAddress := len(linkAddress) == 0 && ifaceLink.Attrs().EncapType == "ether"
+			if zeroLinkAddress {
+				linkAddress = make(net.HardwareAddr, ethernetAddressLen)
+			}
+			// Link address resolution is off only on IFF_NOARP devices with
+			// an all-zero address. Other IFF_NOARP devices keep it, so that
+			// static neighbor entries copied from the host stay in use.
+			noARP := zeroLinkAddress && ifaceLink.Attrs().RawFlags&unix.IFF_NOARP != 0
 			link := sentryapi.FDBasedLink{
 				Name:                 iface.Name,
 				Multicast:            iface.Flags&net.FlagMulticast != 0,
@@ -516,6 +530,7 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6, excludeRDMADevices 
 				TBFBurst:             uint32(conf.TBFBurst),
 				Neighbors:            neighbors,
 				LinkAddress:          linkAddress,
+				NoARP:                noARP,
 				Addresses:            addresses,
 				GVisorGRO:            conf.GVisorGRO,
 			}
