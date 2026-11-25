@@ -78,10 +78,25 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 			return nil, err
 		}
 	}
-	// The gofer opens the container's devices for the sentry.
+	// nvproxy opens the NVIDIA devices, which are identified by the major
+	// numbers of the NVIDIA drivers.
+	var nvidiaMajors []int64
+	if specutils.NVProxyEnabled(spec, conf) {
+		if nvidiaMajors, err = nvidiaCharMajors(); err != nil {
+			return nil, err
+		}
+	}
 	if spec.Linux != nil {
 		for _, dev := range spec.Linux.Devices {
+			if !specDeviceNeedsHostAccess(conf, spec, &dev, nvidiaMajors) {
+				continue
+			}
 			if err := add(dev.Path, "rw"); err != nil {
+				// A spec entry whose host path is not a device has no host
+				// device to allow.
+				if errors.Is(err, errNotDevice) {
+					continue
+				}
 				return nil, err
 			}
 		}
@@ -91,16 +106,52 @@ func sandboxDeviceRules(conf *config.Config, spec *specs.Spec) ([]cgroup.DeviceR
 		// the device files for the GPUs visible to the container inside its
 		// rootfs, where the image can spoof them. Allow the NVIDIA drivers'
 		// devices by major number instead.
-		majors, err := nvidiaCharMajors()
-		if err != nil {
-			return nil, err
-		}
-		for _, major := range majors {
+		for _, major := range nvidiaMajors {
 			rules = append(rules, cgroup.DeviceRule{Type: "c", Major: major, Minor: cgroup.DeviceAny, Access: "rwm"})
 		}
 	}
 	return rules, nil
 }
+
+// specDeviceNeedsHostAccess returns true if a sandbox process may open the
+// host device of the spec entry dev. nvidiaMajors are the major numbers of
+// the NVIDIA devices that nvproxy opens, if nvproxy is enabled.
+func specDeviceNeedsHostAccess(conf *config.Config, spec *specs.Spec, dev *specs.LinuxDevice, nvidiaMajors []int64) bool {
+	// The gofer may run CreateContainer hooks, which are host programs that
+	// may open any device that the spec lists.
+	if spec.Hooks != nil && len(spec.Hooks.CreateContainer) > 0 {
+		return dev.Type != "p"
+	}
+	// The sentry implements no block devices and does not pass them through,
+	// and device cgroups do not apply to FIFOs.
+	if dev.Type != "c" && dev.Type != "u" {
+		return false
+	}
+	// Device proxies open their devices through the dev gofer.
+	if slices.Contains(nvidiaMajors, dev.Major) || proxiedDevice(conf, spec, dev.Path) {
+		return true
+	}
+	// With passthrough, device files on gofer mounts may be opened on the
+	// host. Otherwise, the sentry implements the device or fails to open it.
+	return conf.CharacterDevicePolicy.AllowsPassthrough()
+}
+
+// proxiedDevice returns true if the device at path belongs to tpuproxy or
+// rdmaproxy, and that proxy is enabled for spec.
+func proxiedDevice(conf *config.Config, spec *specs.Spec, path string) bool {
+	switch {
+	case strings.HasPrefix(path, "/dev/accel"), strings.HasPrefix(path, "/dev/vfio/"):
+		return specutils.TPUProxyEnabled(spec, conf)
+	case strings.HasPrefix(path, "/dev/infiniband/uverbs"):
+		return specutils.RDMAEnabled(spec, conf)
+	default:
+		return false
+	}
+}
+
+// errNotDevice is returned by deviceRuleForPath for a path that is not a
+// device.
+var errNotDevice = errors.New("not a device")
 
 func deviceRuleForPath(path, access string) (cgroup.DeviceRule, error) {
 	var st unix.Stat_t
@@ -118,7 +169,7 @@ func deviceRuleForPath(path, access string) (cgroup.DeviceRule, error) {
 	case unix.S_IFBLK:
 		r.Type = "b"
 	default:
-		return r, fmt.Errorf("%q is not a device", path)
+		return r, fmt.Errorf("%q: %w", path, errNotDevice)
 	}
 	return r, nil
 }
