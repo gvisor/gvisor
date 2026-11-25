@@ -8,7 +8,7 @@ gVisor is an application kernel written in Go that implements a substantial port
 
 ## 1. Core Principles
 
-1. **Go deep first:** Read the surrounding subsystem context, trace lock lifecycles and error paths end-to-end, compare behavior against the Linux kernel and relevant RFCs, and report only findings backed by concrete code, trace, or test evidence.
+1. **Go deep first:** Read the surrounding subsystem context, trace lock lifecycles and error paths end-to-end, compare behavior against the Linux ABI, using Linux kernel source to judge fidelity and syscall tests as the regression evidence, and against relevant RFCs; report only findings backed by concrete code, trace, or test evidence.
 2. **Calibrated skepticism:** When a change is small, coherent, and correct, say so plainly and approve. Never invent hypothetical problems to appear thorough. Conversely, request changes whenever there is a real correctness bug, Linux or RFC incompatibility, security regression, concurrency hazard, missing required test, or build breakage.
 3. **Prefer structural enforcement over prose:** When an invariant can be enforced by the type system, a static analyzer (`+checklocks`, `+checkescape`, `nogo`), or a test, require the structural check rather than a prose comment.
 4. **Zero noise on settled changes:** Check current PR state and existing review threads before commenting so reviews never duplicate already-resolved feedback.
@@ -56,6 +56,7 @@ The coordinator agent is responsible for collecting and synthesizing sub-agent f
 - **Architecture, YAGNI & Control-Flow Readability:**
   - Check for **Split Ownership** (multiple components mutating or caching the same state without a single authoritative owner), **Duplicate Mechanisms** for the same task, **Hand-Synced Lists**, and dead struct fields, unread parameters, or obsolete exported symbols left behind by the change.
   - **Single-Implementation Abstractions (`Minor`):** Introducing an interface, factory, or pass-through wrapper type/function with only one concrete implementation and no cross-package boundary or external-I/O test seam requirement.
+  - **Types That Say What They Mean (`Minor`):** Flag a `bool` parameter whose call sites are unreadable (use a named enum), and parallel index lists or slices that describe one record (use a typed struct).
   - **Speculative Knobs & Fallbacks (`Minor`):** Adding unrequested CLI flags, configuration options, or fallback branches for hypothetical contingencies.
   - **Default-Option Caller Dodging (`Minor`):** Adding default parameter values or nil-defaulting option fields to internal functions, methods, or constructors solely to avoid updating in-repo callers, hiding behavioral choices that call sites should pass explicitly (verify caller fan-out across the repository).
   - **Wheel Reinvention & Excessive Glue (`Minor`):** Re-implementing retry loops, parsers, or synchronization helpers already provided by the Go standard library (`slices`, `maps`, `errors`, `filepath`) or existing gVisor packages (`pkg/sync`, `pkg/cleanup`, `pkg/usermem`, `pkg/safemem`, `pkg/buffer`), while respecting `CONTRIBUTING.md` dependency restrictions on `core` and `runsc`.
@@ -86,7 +87,9 @@ The coordinator agent is responsible for collecting and synthesizing sub-agent f
 
 - **Linux Kernel ABI & RFC Equivalence:**
   - Behavior visible to sandboxed applications—syscall semantics, `errno` values, ABI struct layouts, signal delivery, network wire behavior, and `/proc` or `/sys` contents—must match Linux.
-  - Locate and verify the analogous Linux kernel behavior and relevant RFCs from public documentation.
+  - Scope: this applies to behavior visible to applications. Changes to `runsc` (the OCI runtime and CLI), the gofer, and platforms are judged against their own contracts: the OCI spec and documented flags, host-boundary safety, and identical behavior on every platform.
+  - Note Linux fidelity explicitly. State whether the change matches Linux's implementation or only its ABI. Users come to rely on implementation behavior, so an implementation detail can be part of the expected ABI, and breaking a workload that depends on it is a regression even if the old behavior was a bug or was never documented (Linux's "no regressions" rule, `Documentation/process/handling-regressions.rst`).
+  - Cite `file:function` in Linux to locate where gVisor's behavior departs from the ABI. The native syscall test is the proof of the expected behavior.
   - Encourage citing the Linux documentation or RFC section in a brief comment when implementing or fixing subtle compatibility behavior.
   - Check representation differences between gVisor and Linux (for example, whether an option flag can be `true` when its associated value is `0`, or where a helper runs relative to sequence-number or permission checks).
 
@@ -109,6 +112,7 @@ The coordinator agent is responsible for collecting and synthesizing sub-agent f
 
 - **Test Integrity, Mocking & Proportionality:**
   - **Linux-observable behavior:** Require syscall tests in `test/syscalls/linux` (GoogleTest C++) that run identically against both native Linux (`native`) and gVisor (`runsc_*`), using syscall matchers (`SyscallSucceeds()`, `SyscallSucceedsWithValue(...)`, `SyscallFailsWithErrno(...)`). Do not accept Go unit tests as a substitute for application-observable syscall, filesystem, ioctl, socket, `/proc`, or `/sys` behavior. For wire-level network behavior that socket syscalls cannot deterministically synthesize, use `test/packetimpact` or `test/packetdrill`.
+  - **Bug-fix regression tests:** A bug fix comes with a regression test that fails on the pre-fix code and passes with the fix, on the exact path the bug takes.
   - **Undefined behavior on native Linux:** When a test exercises behavior that Linux leaves undefined (such as racing direct host mutations against a mounted overlay layer), verify stability on native Linux or gate gVisor-specific assertions appropriately (`IsRunningOnGvisor()`).
   - **gVisor-internal & runtime features:** Go unit tests are appropriate for self-contained internal data structures and allocators (`pkg/sentry/pgalloc`, `pkg/segment`, `pkg/buffer`); for `runsc` CLI, container lifecycle, checkpoint/restore, and gofer integration, prefer real container integration tests (`runsc/container`) over mock-heavy unit tests.
   - **Tautological or Vacuous Tests (`Blocking`):** Flag tests that assert stubbed mock return values, verify mock call counts without checking observable state/output, fail to exercise each conjunct of a new condition, or continue passing if the production fix is reverted.
