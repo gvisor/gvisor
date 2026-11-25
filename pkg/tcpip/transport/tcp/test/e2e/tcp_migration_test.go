@@ -635,3 +635,148 @@ func TestSaveAfterRestoreWithReplaceConfig(t *testing.T) {
 		t.Fatalf("restoredStack2.CheckLocalAddress(IPv6) = %d, want %d", got, preservedNICID)
 	}
 }
+
+// TestTCPMigrationGSOChange checks that a connected endpoint that restores
+// onto a NIC with different GSO support sends packets that match the new NIC.
+func TestTCPMigrationGSOChange(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		srcHostGSO bool
+		dstGSO     stack.SupportedGSO
+		dstMTU     uint32
+		wantGSO    stack.GSOType
+	}{
+		{
+			name:       "NoGSOToGVisorGSO",
+			srcHostGSO: false,
+			dstGSO:     stack.GVisorGSOSupported,
+			dstMTU:     e2e.DefaultMTU,
+			wantGSO:    stack.GSOGvisor,
+		},
+		{
+			name:       "NoGSOToHostGSO",
+			srcHostGSO: false,
+			dstGSO:     stack.HostGSOSupported,
+			dstMTU:     e2e.DefaultMTU,
+			wantGSO:    stack.GSOTCPv4,
+		},
+		{
+			name:       "NoGSOToHostGSOSmallMTU",
+			srcHostGSO: false,
+			dstGSO:     stack.HostGSOSupported,
+			dstMTU:     500,
+			wantGSO:    stack.GSOTCPv4,
+		},
+		{
+			name:       "HostGSOToNoGSO",
+			srcHostGSO: true,
+			dstGSO:     stack.GSONotSupported,
+			dstMTU:     e2e.DefaultMTU,
+			wantGSO:    stack.GSONone,
+		},
+		{
+			name:       "HostGSOToGVisorGSO",
+			srcHostGSO: true,
+			dstGSO:     stack.GVisorGSOSupported,
+			dstMTU:     e2e.DefaultMTU,
+			wantGSO:    stack.GSOGvisor,
+		},
+		{
+			name:       "HostGSOToHostGSO",
+			srcHostGSO: true,
+			dstGSO:     stack.HostGSOSupported,
+			dstMTU:     e2e.DefaultMTU,
+			wantGSO:    stack.GSOTCPv4,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testcontext.New(t, e2e.DefaultMTU)
+			defer c.Cleanup()
+			c.SetGSOEnabled(tc.srcHostGSO)
+
+			c.Stack().SetAllowLiveTCPMigration(true)
+			c.Stack().SetRemoveConf(true)
+
+			c.CreateConnected(testcontext.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+
+			var buf bytes.Buffer
+			if _, err := state.Save(t.Context(), &buf, c.Stack()); err != nil {
+				t.Fatalf("Save failed: %v", err)
+			}
+
+			restoredStack := stack.New(stack.Options{
+				TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+			})
+			restoredStack.SetAllowLiveTCPMigration(true)
+			defer restoredStack.Destroy()
+
+			if _, err := state.Load(t.Context(), bytes.NewReader(buf.Bytes()), restoredStack); err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+
+			ep := channel.New(1000, tc.dstMTU, "")
+			ep.SupportedGSOKind = tc.dstGSO
+			defer ep.Close()
+			if err := restoredStack.CreateNIC(1, ep); err != nil {
+				t.Fatalf("CreateNIC failed: %v", err)
+			}
+			if err := restoredStack.AddProtocolAddress(1, tcpip.ProtocolAddress{
+				Protocol:          header.IPv4ProtocolNumber,
+				AddressWithPrefix: testcontext.StackAddrWithPrefix,
+			}, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress failed: %v", err)
+			}
+			restoredStack.SetRouteTable([]tcpip.Route{
+				{
+					Destination: header.IPv4EmptySubnet,
+					NIC:         1,
+				},
+			})
+
+			restoredStack.Restore()
+			eps := restoredStack.RegisteredEndpoints()
+			if len(eps) != 1 {
+				t.Fatalf("len(restoredStack.RegisteredEndpoints()) = %d, want 1", len(eps))
+			}
+			restoredEP, ok := eps[0].(tcpip.Endpoint)
+			if !ok {
+				t.Fatalf("restoredStack.RegisteredEndpoints()[0] = %T, want tcpip.Endpoint", eps[0])
+			}
+			mss, err := restoredEP.GetSockOptInt(tcpip.MaxSegOption)
+			if err != nil {
+				t.Fatalf("GetSockOptInt(MaxSegOption) failed: %v", err)
+			}
+			if maxMSS := int(tc.dstMTU) - header.IPv4MinimumSize - header.TCPMinimumSize; mss > maxMSS {
+				t.Fatalf("MSS = %d, want <= %d for MTU %d", mss, maxMSS, tc.dstMTU)
+			}
+
+			payload := bytes.Repeat([]byte{'a'}, 2*int(e2e.DefaultMTU))
+			var r bytes.Reader
+			r.Reset(payload)
+			if _, err := restoredEP.Write(&r, tcpip.WriteOptions{}); err != nil {
+				t.Fatalf("restoredEP.Write failed: %v", err)
+			}
+
+			n, total := 0, 0
+			for pkt := ep.Read(); pkt != nil; pkt = ep.Read() {
+				n++
+				gso := pkt.GSOOptions
+				size := pkt.Data().Size()
+				total += size
+				pkt.DecRef()
+				switch {
+				case gso.Type != tc.wantGSO:
+					t.Errorf("packet %d: GSO type = %v, want %v", n, gso.Type, tc.wantGSO)
+				case gso.Type == stack.GSONone && size > mss:
+					t.Errorf("packet %d: payload size = %d, want <= MSS %d", n, size, mss)
+				case gso.Type != stack.GSONone && int(gso.MSS) != mss:
+					t.Errorf("packet %d: GSO MSS = %d, want %d", n, gso.MSS, mss)
+				}
+			}
+			if total <= mss {
+				t.Errorf("sent %d payload bytes in %d packets, want more than MSS %d", total, n, mss)
+			}
+		})
+	}
+}
