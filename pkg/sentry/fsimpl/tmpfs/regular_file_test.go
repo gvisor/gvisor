@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -437,6 +438,129 @@ func TestDiskBackedWriteHostFault(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRegularFilePagesAccounting(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
+	fs := rf.inode.fs
+	pgSize := uint64(hostarch.PageSize)
+	blocksPerPage := pgSize / 512
+
+	checkPages := func(step string, wantPages uint64) {
+		t.Helper()
+		if got := rf.pages.Load(); got != wantPages {
+			t.Errorf("%s: rf.pages = %d, want %d", step, got, wantPages)
+		}
+		rf.dataMu.RLock()
+		spanPages := rf.data.Span() >> hostarch.PageShift
+		rf.dataMu.RUnlock()
+		if spanPages != wantPages {
+			t.Errorf("%s: rf.data.Span()/PageSize = %d, want %d", step, spanPages, wantPages)
+		}
+		if got := fs.pagesUsed.Load(); got != wantPages {
+			t.Errorf("%s: fs.pagesUsed = %d, want %d", step, got, wantPages)
+		}
+		stat, err := fd.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_BLOCKS})
+		if err != nil {
+			t.Fatalf("%s: fd.Stat failed: %v", step, err)
+		}
+		if wantBlocks := wantPages * blocksPerPage; stat.Blocks != wantBlocks {
+			t.Errorf("%s: stat.Blocks = %d, want %d", step, stat.Blocks, wantBlocks)
+		}
+	}
+
+	checkPages("initial", 0)
+
+	// Sparse grow allocates no pages.
+	if err := fd.SetStat(ctx, vfs.SetStatOptions{
+		Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: 16 * pgSize},
+	}); err != nil {
+		t.Fatalf("SetStat grow failed: %v", err)
+	}
+	checkPages("sparse grow", 0)
+
+	// Scattered writes allocate one page each; overwriting does not double-count.
+	oneByte := []byte{'x'}
+	if _, err := fd.PWrite(ctx, usermem.BytesIOSequence(oneByte), int64(2*pgSize), vfs.WriteOptions{}); err != nil {
+		t.Fatalf("PWrite page 2 failed: %v", err)
+	}
+	checkPages("write page 2", 1)
+
+	if _, err := fd.PWrite(ctx, usermem.BytesIOSequence(oneByte), int64(10*pgSize), vfs.WriteOptions{}); err != nil {
+		t.Fatalf("PWrite page 10 failed: %v", err)
+	}
+	checkPages("write page 10", 2)
+
+	if _, err := fd.PWrite(ctx, usermem.BytesIOSequence(oneByte), int64(2*pgSize+10), vfs.WriteOptions{}); err != nil {
+		t.Fatalf("PWrite overwrite page 2 failed: %v", err)
+	}
+	checkPages("overwrite page 2", 2)
+
+	// Allocate fills only missing pages; repeating is a no-op.
+	if err := fd.Allocate(ctx, 0, 4*pgSize, 3*pgSize); err != nil {
+		t.Fatalf("Allocate failed: %v", err)
+	}
+	checkPages("fallocate 3 pages", 5)
+
+	if err := fd.Allocate(ctx, 0, 4*pgSize, 3*pgSize); err != nil {
+		t.Fatalf("repeat Allocate failed: %v", err)
+	}
+	checkPages("repeat fallocate", 5)
+
+	// Shrink into the middle of page 4 drops pages 5, 6, and 10, keeping pages 2 and 4.
+	if err := fd.SetStat(ctx, vfs.SetStatOptions{
+		Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: 4*pgSize + 100},
+	}); err != nil {
+		t.Fatalf("SetStat shrink failed: %v", err)
+	}
+	checkPages("partial-page shrink", 2)
+
+	if err := fd.SetStat(ctx, vfs.SetStatOptions{
+		Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: 8 * pgSize},
+	}); err != nil {
+		t.Fatalf("SetStat regrow failed: %v", err)
+	}
+	checkPages("regrow", 2)
+
+	// afterLoad rebuilds rf.pages from rf.data.
+	rf.dataMu.Lock()
+	rf.pages.Store(0)
+	rf.dataMu.Unlock()
+	rf.afterLoad(ctx)
+	checkPages("afterLoad rebuild", 2)
+
+	// Truncating to zero frees all pages.
+	if err := fd.SetStat(ctx, vfs.SetStatOptions{
+		Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: 0},
+	}); err != nil {
+		t.Fatalf("SetStat zero failed: %v", err)
+	}
+	checkPages("truncate to 0", 0)
+
+	// Translate accounts faulted pages accurately.
+	if err := fd.SetStat(ctx, vfs.SetStatOptions{
+		Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: 4 * pgSize},
+	}); err != nil {
+		t.Fatalf("SetStat grow for Translate failed: %v", err)
+	}
+	mr := memmap.MappableRange{Start: pgSize, End: 2 * pgSize}
+	if _, err := rf.Translate(ctx, mr, mr, hostarch.Read); err != nil {
+		t.Fatalf("Translate failed: %v", err)
+	}
+	rf.dataMu.RLock()
+	wantAfterFault := rf.data.Span() >> hostarch.PageShift
+	rf.dataMu.RUnlock()
+	if wantAfterFault == 0 {
+		t.Fatalf("Translate allocated 0 pages")
+	}
+	checkPages("after Translate", wantAfterFault)
 }
 
 // BenchmarkDiskBackedWrite measures overwrites of populated pages of a file in

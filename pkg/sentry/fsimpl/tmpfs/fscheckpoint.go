@@ -149,6 +149,7 @@ func (cb *fsckptTarReaderCallbacks) regularFileRead(ctx context.Context, hdr *ta
 		return fmt.Errorf("restored filesystem would exceed size limit of %d pages", cb.fs.maxSizeInPages)
 	}
 	rf.size.Store(size)
+	rf.pages.Store(n)
 	gap := rf.data.FirstGap()
 	for _, seg := range segs {
 		gap = rf.data.Insert(gap, memmap.MappableRange{seg.Start, seg.End}, seg.Value).NextGap()

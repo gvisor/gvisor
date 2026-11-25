@@ -859,9 +859,7 @@ func (i *inode) statTo(stat *linux.Statx) {
 	switch impl := i.impl.(type) {
 	case *regularFile:
 		stat.Size = uint64(impl.size.Load())
-		// TODO(jamieliu): This should be impl.data.Span() / 512, but this is
-		// too expensive to compute here. Cache it in regularFile.
-		stat.Blocks = allocatedBlocksForSize(stat.Size)
+		stat.Blocks = impl.pages.Load() * (uint64(hostarch.PageSize) / 512)
 	case *directory:
 		stat.Size = direntSize * (2 + uint64(impl.numChildren.Load()))
 		// stat.Blocks is 0.
@@ -1015,15 +1013,6 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs.
 	}
 
 	return nil
-}
-
-// allocatedBlocksForSize returns the number of 512B blocks needed to
-// accommodate the given size in bytes, as appropriate for struct
-// stat::st_blocks and struct statx::stx_blocks. (Note that this 512B block
-// size is independent of the "preferred block size for I/O", struct
-// stat::st_blksize and struct statx::stx_blksize.)
-func allocatedBlocksForSize(size uint64) uint64 {
-	return (size + 511) / 512
 }
 
 func (i *inode) direntType() uint8 {

@@ -2137,6 +2137,67 @@ TEST_F(OverlayXattrTest, RemovexattrCopiesUp) {
               SyscallFailsWithErrno(ENODATA));
 }
 
+// Overlay forwards SEEK_DATA, SEEK_HOLE, and st_blocks to both lower-only and
+// upper-created tmpfs files.
+TEST_F(OverlayOnTmpfsTest, SeekDataHoleAndBlocks) {
+  const std::string lower_file = LowerPath("sparse");
+  {
+    const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(lower_file, O_RDWR | O_CREAT | O_EXCL, 0644));
+    struct stat st;
+    ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+    SKIP_IF(!IsRunningOnGvisor() && st.st_blksize != kPageSize);
+    ASSERT_THAT(ftruncate(fd.get(), 6 * kPageSize), SyscallSucceeds());
+    const char kL = 'L';
+    const char kM = 'M';
+    ASSERT_THAT(pwrite(fd.get(), &kL, 1, kPageSize),
+                SyscallSucceedsWithValue(1));
+    ASSERT_THAT(pwrite(fd.get(), &kM, 1, 4 * kPageSize),
+                SyscallSucceedsWithValue(1));
+  }
+
+  ASSERT_NO_ERRNO(MountOverlay());
+  const blkcnt_t kBlocksPerPage = kPageSize / 512;
+
+  // Lower-only read-only open.
+  {
+    const FileDescriptor fd =
+        ASSERT_NO_ERRNO_AND_VALUE(Open(MergedPath("sparse"), O_RDONLY));
+    struct stat st;
+    ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+    EXPECT_EQ(st.st_blocks, 2 * kBlocksPerPage);
+    EXPECT_THAT(lseek(fd.get(), 0, SEEK_DATA),
+                SyscallSucceedsWithValue(kPageSize));
+    EXPECT_THAT(lseek(fd.get(), kPageSize, SEEK_HOLE),
+                SyscallSucceedsWithValue(2 * kPageSize));
+    EXPECT_THAT(lseek(fd.get(), 2 * kPageSize, SEEK_DATA),
+                SyscallSucceedsWithValue(4 * kPageSize));
+    EXPECT_THAT(lseek(fd.get(), 4 * kPageSize, SEEK_HOLE),
+                SyscallSucceedsWithValue(5 * kPageSize));
+    EXPECT_THAT(lseek(fd.get(), 5 * kPageSize, SEEK_DATA),
+                SyscallFailsWithErrno(ENXIO));
+  }
+
+  // Upper-only sparse file created through merged mount.
+  {
+    const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(MergedPath("upper_sparse"), O_RDWR | O_CREAT | O_EXCL, 0644));
+    ASSERT_THAT(ftruncate(fd.get(), 6 * kPageSize), SyscallSucceeds());
+    const char kU = 'U';
+    ASSERT_THAT(pwrite(fd.get(), &kU, 1, 2 * kPageSize),
+                SyscallSucceedsWithValue(1));
+    struct stat st;
+    ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+    EXPECT_EQ(st.st_blocks, kBlocksPerPage);
+    EXPECT_THAT(lseek(fd.get(), 0, SEEK_DATA),
+                SyscallSucceedsWithValue(2 * kPageSize));
+    EXPECT_THAT(lseek(fd.get(), 2 * kPageSize, SEEK_HOLE),
+                SyscallSucceedsWithValue(3 * kPageSize));
+    EXPECT_THAT(lseek(fd.get(), 3 * kPageSize, SEEK_DATA),
+                SyscallFailsWithErrno(ENXIO));
+  }
+}
+
 }  // namespace
 
 }  // namespace testing
