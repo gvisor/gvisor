@@ -113,6 +113,11 @@ type directoryFD struct {
 	mu      directoryFDMutex `state:"nosave"`
 	off     int64
 	dirents []vfs.Dirent
+
+	// direntsHeld is true if this FD is counted in its dentry's direntsFDs. A
+	// rewind clears dirents but keeps direntsHeld, so the dentry still caches
+	// its listing for the next read. direntsHeld is protected by mu.
+	direntsHeld bool
 }
 
 func (fd *directoryFD) lockIndex() directoryFDlockNameIndex {
@@ -121,6 +126,9 @@ func (fd *directoryFD) lockIndex() directoryFDlockNameIndex {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *directoryFD) Release(ctx context.Context) {
+	if fd.direntsHeld {
+		fd.dentry().putDirents()
+	}
 }
 
 // IterDirents implements vfs.FileDescriptionImpl.IterDirents.
@@ -131,7 +139,7 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 	defer fd.mu.NestedUnlock(fdIdx)
 
 	if fd.dirents == nil {
-		ds, err := d.getDirents(ctx)
+		ds, err := d.getDirents(ctx, fd)
 		if err != nil {
 			return err
 		}
@@ -147,15 +155,39 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 	return nil
 }
 
-// Preconditions: d.isDir().
-func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
+// getDirents returns d's directory listing for fd, which holds it until fd is
+// released.
+//
+// Preconditions:
+//   - d.isDir().
+//   - fd.mu must be locked.
+func (d *dentry) getDirents(ctx context.Context, fd *directoryFD) ([]vfs.Dirent, error) {
 	renameIdx := d.fs.renameLockIndex()
 	d.fs.renameMu.NestedRLock(renameIdx)
 	defer d.fs.renameMu.NestedRUnlock(renameIdx)
 	dirIdx := d.dirLockIndex(dirLockD1)
 	d.dirMu.NestedLock(dirIdx)
 	defer d.dirMu.NestedUnlock(dirIdx)
-	return d.getDirentsLocked(ctx)
+	dirents, err := d.getDirentsLocked(ctx)
+	if err == nil && !fd.direntsHeld {
+		fd.direntsHeld = true
+		d.direntsFDs++
+	}
+	return dirents, err
+}
+
+// putDirents drops a directoryFD's hold on d's directory listing. The listing
+// is cached only while a directoryFD holds it, as in Linux's ovl_cache_put().
+//
+// Preconditions: d.isDir().
+func (d *dentry) putDirents() {
+	dirIdx := d.dirLockIndex(dirLockD1)
+	d.dirMu.NestedLock(dirIdx)
+	d.direntsFDs--
+	if d.direntsFDs == 0 {
+		d.dirents = nil
+	}
+	d.dirMu.NestedUnlock(dirIdx)
 }
 
 // Preconditions:
@@ -163,6 +195,9 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 //   - d.dirMu must be locked.
 //   - d.isDir().
 func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
+	if d.direntsStale.Swap(false) {
+		d.dirents = nil
+	}
 	if d.dirents != nil {
 		return d.dirents, nil
 	}

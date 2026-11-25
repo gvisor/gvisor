@@ -384,6 +384,7 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		d.devMajor.Store(upperStat.DevMajor)
 		d.devMinor.Store(upperStat.DevMinor)
 		d.ino.Store(upperStat.Ino)
+		parent.direntsStale.Store(true)
 
 		// Lower level dentries for non-directories are no longer accessible from
 		// the overlayfs anymore after copyup. Ask filesystems to release their
@@ -534,6 +535,10 @@ func (d *dentry) copyUpDescendantsAtDepthLocked(ctx context.Context, ds **[]*den
 	dirents, err := d.getDirentsLocked(ctx)
 	if err != nil {
 		return err
+	}
+	if d.direntsFDs == 0 {
+		// No directoryFD holds the listing, so it must not stay cached.
+		d.dirents = nil
 	}
 	for _, dirent := range dirents {
 		if dirent.Name == "." || dirent.Name == ".." {
