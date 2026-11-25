@@ -343,6 +343,11 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.FSContext().DecRef(t)
 	t.fdTable.DecRef(t)
 
+	// Run pending task work, as Linux's do_exit() calls exit_task_work() after
+	// exit_mm() and exit_files(). Like the releases in fdTable.DecRef, it runs
+	// before t's namespaces are released.
+	t.runExitTaskWork()
+
 	// Detach task from all cgroups. This must happen before potentially the
 	// last ref to the cgroupfs mount is dropped below.
 	t.LeaveCgroups()

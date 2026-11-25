@@ -18,21 +18,51 @@ package kernel
 //
 // This must be savable.
 type TaskWorker interface {
-	// TaskWork will be executed prior to returning to user space. Note that
-	// TaskWork may call RegisterWork again, but this will not be executed until
-	// the next return to user space, unlike in Linux. This effectively allows
-	// registration of indefinite user return hooks, but not by default.
+	// TaskWork will be executed prior to returning to user space, or once
+	// when the task exits. Note that TaskWork may call RegisterWork again, but
+	// this will not be executed until the next return to user space, unlike in
+	// Linux. This effectively allows registration of indefinite user return
+	// hooks, but not by default.
+	//
+	// When run on exit, TaskWork runs after the task has released its
+	// MemoryManager and FD table, as in Linux's kernel/exit.c:do_exit(), so it
+	// must not access the task's memory. Work registered from then on, by
+	// TaskWork or otherwise, is refused by RegisterWork and never runs.
 	TaskWork(t *Task)
 }
 
-// RegisterWork can be used to register additional task work that will be
-// performed prior to returning to user space. See TaskWorker.TaskWork for
-// semantics regarding registration.
+// RegisterWork registers work to be performed prior to t's next return to
+// user space, or when t exits. It returns false, without registering work, if
+// t has already run its task work on exit, as Linux's
+// kernel/task_work.c:task_work_add() returns -ESRCH after exit_task_work().
+// Callers whose work only matters before t returns to user space may ignore
+// the result. See TaskWorker.TaskWork for semantics regarding registration.
 //
 // +checklocksexclude:t.taskWorkMu
-func (t *Task) RegisterWork(work TaskWorker) {
+func (t *Task) RegisterWork(work TaskWorker) bool {
 	t.taskWorkMu.Lock()
 	defer t.taskWorkMu.Unlock()
+	if t.taskWorkExited {
+		return false
+	}
 	t.taskWorkCount.Add(1)
 	t.taskWork = append(t.taskWork, work)
+	return true
+}
+
+// runExitTaskWork runs t's pending task work, which would otherwise never
+// run, and makes RegisterWork fail from then on. It is Linux's
+// kernel/exit.c:do_exit() calling exit_task_work().
+//
+// +checklocksexclude:t.taskWorkMu
+func (t *Task) runExitTaskWork() {
+	t.taskWorkMu.Lock()
+	queue := t.taskWork
+	t.taskWork = nil
+	t.taskWorkCount.Store(0)
+	t.taskWorkExited = true
+	t.taskWorkMu.Unlock()
+	for _, work := range queue {
+		work.TaskWork(t)
+	}
 }

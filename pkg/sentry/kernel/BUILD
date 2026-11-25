@@ -445,6 +445,7 @@ go_test(
         "task_signals_test.go",
         "task_syscall_benchmark_test.go",
         "task_test.go",
+        "task_work_test.go",
         "timekeeper_test.go",
     ],
     embed = [":kernel"],

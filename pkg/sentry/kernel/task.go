@@ -97,6 +97,11 @@ type Task struct {
 	// +checklocks:taskWorkMu
 	taskWork []TaskWorker
 
+	// taskWorkExited is true once the task has run its task work on exit.
+	//
+	// +checklocks:taskWorkMu
+	taskWorkExited bool
+
 	// haveSyscallReturn is true if image.Arch().Return() represents a value
 	// returned by a syscall (or set by ptrace after a syscall).
 	//
