@@ -1052,11 +1052,11 @@ func pcapAndNAT(args *sentryapi.CreateLinksAndRoutesArgs, conf *config.Config) e
 
 	// Pass PCAP log file if present.
 	if conf.PCAP != "" {
-		args.PCAP = true
-		pcap, err := os.OpenFile(conf.PCAP, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0664)
+		pcap, err := specutils.OpenAndTruncateRegularFile(conf.PCAP, 0664)
 		if err != nil {
-			return fmt.Errorf("failed to open PCAP file %s: %v", conf.PCAP, err)
+			return fmt.Errorf("failed to open PCAP file: %w", err)
 		}
+		args.PCAP = true
 		args.FilePayload.Files = append(args.FilePayload.Files, pcap)
 	}
 

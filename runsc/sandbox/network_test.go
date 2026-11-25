@@ -1294,3 +1294,62 @@ func TestLoopbackLinkNetgoferProxyLoopback(t *testing.T) {
 		t.Errorf("loopbackLink(NetgoferModeProxyLoopback) =\n%+v\nwant\n%+v", got, want)
 	}
 }
+
+func closePayloadFiles(t *testing.T, args *sentryapi.CreateLinksAndRoutesArgs) {
+	t.Helper()
+	for _, f := range args.FilePayload.Files {
+		if err := f.Close(); err != nil {
+			t.Errorf("f.Close() failed: %v", err)
+		}
+	}
+}
+
+func TestPcapAndNAT_RegularFile(t *testing.T) {
+	pcapPath := filepath.Join(t.TempDir(), "capture.pcap")
+	if err := os.WriteFile(pcapPath, []byte("old-bytes"), 0600); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", pcapPath, err)
+	}
+
+	var args sentryapi.CreateLinksAndRoutesArgs
+	if err := pcapAndNAT(&args, &config.Config{PCAP: pcapPath}); err != nil {
+		t.Fatalf("pcapAndNAT(%q) failed: %v", pcapPath, err)
+	}
+	defer closePayloadFiles(t, &args)
+
+	if !args.PCAP {
+		t.Errorf("args.PCAP = false, want true")
+	}
+	if len(args.FilePayload.Files) != 1 {
+		t.Fatalf("len(args.FilePayload.Files) = %d, want 1", len(args.FilePayload.Files))
+	}
+	got, err := os.ReadFile(pcapPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) failed: %v", pcapPath, err)
+	}
+	if len(got) != 0 {
+		t.Errorf("file content = %q, want empty", string(got))
+	}
+}
+
+func TestPcapAndNAT_RejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "target")
+	if err := os.WriteFile(targetPath, nil, 0600); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", targetPath, err)
+	}
+
+	symlinkPath := filepath.Join(dir, "capture.pcap")
+	if err := os.Symlink(targetPath, symlinkPath); err != nil {
+		t.Fatalf("os.Symlink(%q, %q) failed: %v", targetPath, symlinkPath, err)
+	}
+
+	var args sentryapi.CreateLinksAndRoutesArgs
+	err := pcapAndNAT(&args, &config.Config{PCAP: symlinkPath})
+	defer closePayloadFiles(t, &args)
+	if !errors.Is(err, unix.ELOOP) {
+		t.Errorf("pcapAndNAT(%q) error = %v, want ELOOP", symlinkPath, err)
+	}
+	if args.PCAP || len(args.FilePayload.Files) != 0 {
+		t.Errorf("unexpected payload state: PCAP=%v, files=%d", args.PCAP, len(args.FilePayload.Files))
+	}
+}
