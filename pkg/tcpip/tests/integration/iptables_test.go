@@ -2830,6 +2830,12 @@ func TestSNATHandlePortOrIdentConflicts(t *testing.T) {
 				return &stack.SNATTarget{NetworkProtocol: netProto, Addr: addr, ChangeAddress: true, ChangePort: true}
 			},
 		},
+		{
+			name: "SNAT without port range",
+			target: func(netProto tcpip.NetworkProtocolNumber, addr tcpip.Address) stack.Target {
+				return &stack.SNATTarget{NetworkProtocol: netProto, Addr: addr, ChangeAddress: true}
+			},
+		},
 	}
 
 	for _, test := range tests {

@@ -325,15 +325,16 @@ func (cn *conn) ConfigureNAT(portsOrIdents PortOrIdentRange, natAddress tcpip.Ad
 	}
 
 	// Everything below here is port-fiddling.
-	// TODO: b/486197011 - Handle reply tuple collisions when changePort
-	// is false. Check for tuple uniqueness or find a unique tuple.
-	// Ref: net/netfilter/nf_nat_core.c:nf_nat_l4proto_unique_tuple.
 	if !changePort {
-		return true
+		if natType == DNAT {
+			return true
+		}
+		portsOrIdents = defaultPortOrIdentRange(cn.reply.tupleID.transProto, *portOrIdent)
 	}
 
-	// Does the current port/ident fit in the range?
-	if portsOrIdents.Start <= *portOrIdent && *portOrIdent <= lastPortOrIdent {
+	// Does the current port/ident fit in the range? A rule without a port
+	// range keeps any port/ident.
+	if !changePort || (portsOrIdents.Start <= *portOrIdent && *portOrIdent <= lastPortOrIdent) {
 		// Yes, is the current reply tuple unique?
 		//
 		// Or, does the reply tuple refer to the same connection as the current one that
@@ -394,6 +395,17 @@ func (cn *conn) ConfigureNAT(portsOrIdents PortOrIdentRange, natAddress tcpip.Ad
 	// We did not find a unique tuple, use the last used port anyways.
 	// TODO(https://gvisor.dev/issue/6850): Handle not finding a unique tuple
 	// better (e.g. remove the connection and drop the packet).
+}
+
+// defaultPortOrIdentRange returns the range of ports or idents that NAT maps
+// portOrIdent into when the rule specifies no range.
+func defaultPortOrIdentRange(transProto tcpip.TransportProtocolNumber, portOrIdent uint16) PortOrIdentRange {
+	switch transProto {
+	case header.ICMPv4ProtocolNumber, header.ICMPv6ProtocolNumber:
+		return PortOrIdentRange{Start: 0, Size: math.MaxUint16 + 1}
+	default:
+		return targetPortRangeForTCPAndUDP(portOrIdent)
+	}
 }
 
 // IPTPerformNAT performs NAT on the packet and updates the connection.
