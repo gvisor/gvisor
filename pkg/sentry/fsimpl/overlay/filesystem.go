@@ -237,8 +237,14 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			Root:  childVD,
 			Start: childVD,
 		}
+		// The link count of the topmost lower file decides
+		// child.landlockLinked. Not all layers report it.
+		statMask := mask
+		if topLookupLayer == lookupLayerNone && !isUpper && fs.opts.UpperRoot.Ok() {
+			statMask |= linux.STATX_NLINK
+		}
 		stat, err := vfsObj.StatAt(ctx, fs.creds, childPop, &vfs.StatOptions{
-			Mask: mask,
+			Mask: statMask,
 		})
 		if err != nil {
 			lookupErr = err
@@ -302,6 +308,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			child.devMajor = atomicbitops.FromUint32(stat.DevMajor)
 			child.devMinor = atomicbitops.FromUint32(stat.DevMinor)
 			child.ino = atomicbitops.FromUint64(stat.Ino)
+			child.landlockLinked = statMask&linux.STATX_NLINK != 0 && !isDir && stat.Mask&linux.STATX_NLINK != 0 && stat.Nlink > 1
 		}
 
 		// For non-directory files, only the topmost layer that contains a file
@@ -1940,24 +1947,30 @@ func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, si
 		return nil, err
 	}
 
-	return fs.listXattr(ctx, d, size)
+	return fs.listXattr(ctx, d, rp.Credentials())
 }
 
-func (fs *filesystem) listXattr(ctx context.Context, d *dentry, size uint64) ([]string, error) {
+func (fs *filesystem) listXattr(ctx context.Context, d *dentry, creds *auth.Credentials) ([]string, error) {
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
 	top := d.topLayer()
-	names, err := vfsObj.ListXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: top, Start: top}, size)
+	// A bounded size gets FUSE to return names; the syscall layer checks size.
+	names, err := vfsObj.ListXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: top, Start: top}, linux.XATTR_LIST_MAX)
 	if err != nil {
 		return nil, err
 	}
 
-	// Filter out all overlay attributes.
+	// Filter out overlay attributes and hidden trusted.* names.
+	canListTrusted := creds.HasRootCapability(linux.CAP_SYS_ADMIN)
 	n := 0
 	for _, name := range names {
-		if !fs.isOverlayXattr(name) {
-			names[n] = name
-			n++
+		if fs.isOverlayXattr(name) {
+			continue
 		}
+		if !canListTrusted && strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
+			continue
+		}
+		names[n] = name
+		n++
 	}
 	return names[:n], err
 }
@@ -2204,6 +2217,11 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
+// WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
+func (fs *filesystem) WalkAncestors(d *vfs.Dentry, visit func(*vfs.Dentry) bool) {
+	genericWalkAncestors(fs, d.Impl().(*dentry), visit)
 }
 
 // MountOptions implements vfs.FilesystemImpl.MountOptions.

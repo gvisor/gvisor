@@ -1,4 +1,4 @@
-// Copyright 2023 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.20
+//go:build arm64
+// +build arm64
 
-package gohacks
+package systrap
 
-import (
-	"unsafe"
-)
+import "golang.org/x/sys/unix"
 
-// Slice returns a slice whose underlying array starts at ptr an which length
-// and capacity are len.
-//
-// Slice is a wrapper around unsafe.Slice. Prefer to use unsafe.Slice directly
-// if possible.
-func Slice[T any](ptr *T, length int) []T {
-	return unsafe.Slice(ptr, length)
-}
+// testBadArch is a compat architecture.
+const testBadArch = unix.AUDIT_ARCH_ARM

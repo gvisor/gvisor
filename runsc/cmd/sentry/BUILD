@@ -14,7 +14,6 @@ go_binary(
     visibility = ["//visibility:public"],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
-        "//runsc/cgoextras",
         "//runsc/cli/sentrycli",
         "//runsc/gvisorbinaries",
     ],
@@ -33,7 +32,6 @@ go_binary(
     ],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
-        "//runsc/cgoextras",
         "//runsc/cli/sentrycli",
         "//runsc/gvisorbinaries",
     ],
@@ -45,7 +43,7 @@ COVERAGE_SRCS = [
     "//:go.sum",
     "//:gopath",
     "//tools:build_cover.sh",
-    "//tools:go-allow-internal.patch",
+    "//tools:go_cover_toolchain",
 ]
 
 COVERAGE_CMD = (
@@ -55,7 +53,7 @@ COVERAGE_CMD = (
     "\"$(execpath //:go.mod)\" " +
     "\"$(execpath //:go.sum)\" " +
     "\"$(execpath sentry_main.go)\" " +
-    "\"$(execpath //tools:go-allow-internal.patch)\" " +
+    "\"$(execpath //tools:go_cover_toolchain)\" " +
     "\"%s\" "
 )
 
@@ -89,7 +87,6 @@ go_binary(
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//pkg/sentry/socket/plugin/stack",
-        "//runsc/cgoextras",
         "//runsc/cli",
         "//runsc/cli/sentrycli",
         "//runsc/cmd/sentry/sentrycmd",
@@ -104,7 +101,6 @@ deps_test(
     # Keep this tight.
     allowed = [
         "//runsc/autoplatform",
-        "//runsc/cgoextras",
         "//runsc/cli",
         "//runsc/cli/sentrycli",
         "//runsc/cmd/nvproxy",

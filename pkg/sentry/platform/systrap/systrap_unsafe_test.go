@@ -12,12 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package cgoextras provides cgo-only runtime workarounds and initialization
-// for runsc and sentry binaries.
-//
-// In pure-Go binaries (CGO_ENABLED=0), cgo code in this package is not built.
-// When cgo is enabled (e.g., -race, network plugins), this package is compiled
-// with cgo and runs early process initialization such as disabling host ARM64
-// Pointer Authentication (PAC) keys via an ELF .init_array constructor before
-// libpthread or the Go runtime spawns threads.
-package cgoextras
+package systrap
+
+import (
+	"testing"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+)
+
+// futexWakeCount wakes one waiter on addr and returns the number of woken
+// waiters.
+func futexWakeCount(t *testing.T, addr *uint32) int {
+	t.Helper()
+	n, _, errno := unix.Syscall(unix.SYS_FUTEX, uintptr(unsafe.Pointer(addr)), linux.FUTEX_WAKE, 1)
+	if errno != 0 {
+		t.Fatalf("cannot wake futex: %v", errno)
+	}
+	return int(n)
+}

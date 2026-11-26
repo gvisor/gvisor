@@ -292,8 +292,7 @@ steps:
     <<: *source_test
     label: ":ship: Release tests"
     commands:
-      - make BAZEL_OPTIONS=--config=x86_64 artifacts/x86_64
-      - make BAZEL_OPTIONS=--config=aarch64 artifacts/aarch64
+      - make artifacts-all
       - make release
     agents:
       arch: "amd64"
@@ -527,13 +526,6 @@ steps:
       arch: "amd64"
       queue: "default"
   - <<: *common
-    <<: *source_test
-    label: ":coffee: Do tests"
-    command: make do-tests
-    agents:
-      arch: "amd64"
-      queue: "default"
-  - <<: *common
     <<: *docker
     <<: *source_test
     label: ":person_in_lotus_position: KVM tests"
@@ -577,8 +569,8 @@ steps:
   - <<: *common
     <<: *docker
     <<: *source_test
-    label: ":docker: Containerd 1.7.31 tests"
-    command: make containerd-test-1.7.31
+    label: ":docker: Containerd 2.0.14 tests"
+    command: make containerd-test-2.0.14
     agents:
       <<: *ubuntu_agents
       <<: *containerd_agents
@@ -586,8 +578,8 @@ steps:
   - <<: *common
     <<: *docker
     <<: *source_test
-    label: ":docker: Containerd 2.0.8 tests"
-    command: make containerd-test-2.0.8
+    label: ":docker: Containerd 2.3.7 tests"
+    command: make containerd-test-2.3.7
     agents:
       <<: *ubuntu_agents
       <<: *containerd_agents
@@ -595,17 +587,8 @@ steps:
   - <<: *common
     <<: *docker
     <<: *source_test
-    label: ":docker: Containerd 2.1.7 tests"
-    command: make containerd-test-2.1.7
-    agents:
-      <<: *ubuntu_agents
-      <<: *containerd_agents
-      queue: "default"
-  - <<: *common
-    <<: *docker
-    <<: *source_test
-    label: ":docker: Containerd 2.2.3 tests"
-    command: make containerd-test-2.2.3
+    label: ":docker: Containerd 2.4.2 tests"
+    command: make containerd-test-2.4.2
     agents:
       <<: *ubuntu_agents
       <<: *containerd_agents

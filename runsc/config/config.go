@@ -162,6 +162,9 @@ type Config struct {
 	// GVisorGRO enables gVisor's generic receive offload.
 	GVisorGRO bool `flag:"gvisor-gro"`
 
+	// TCPDelayedACK controls whether netstack TCP delays ACKs.
+	TCPDelayedACK TCPDelayedACK `flag:"tcp-delayed-ack"`
+
 	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
 	TXChecksumOffload bool `flag:"tx-checksum-offload"`
 
@@ -311,6 +314,10 @@ type Config struct {
 	// duration of the container execution. Requires ProfileEnabled.
 	ProfileHeap string `flag:"profile-heap"`
 
+	// ProfileHeapRate sets the Sentry's heap sampling interval in bytes.
+	// Zero keeps the Go runtime default. Requires ProfileEnable when nonzero.
+	ProfileHeapRate int `flag:"profile-heap-rate"`
+
 	// ProfileMutex collects a mutex profile to the passed file for the
 	// duration of the container execution. Requires ProfileEnabled.
 	ProfileMutex string `flag:"profile-mutex"`
@@ -387,6 +394,10 @@ type Config struct {
 	// IOUring enables support for the IO_URING API calls to perform
 	// asynchronous I/O operations.
 	IOUring bool `flag:"iouring"`
+
+	// Landlock controls whether the Landlock syscalls are available. See
+	// LandlockMode.
+	Landlock LandlockMode `flag:"landlock"`
 
 	// DirectFS sets up the sandbox to directly access/mutate the filesystem from
 	// the sentry. Sentry runs with escalated privileges. Gofer process still
@@ -655,6 +666,12 @@ func (c *Config) Validate() error {
 	}
 	if c.ProfileCPU != "" && !c.ProfileEnable {
 		return fmt.Errorf("profile-cpu flag requires enabling profiling with profile flag")
+	}
+	if c.ProfileHeapRate < 0 {
+		return fmt.Errorf("profile-heap-rate must be >= 0")
+	}
+	if c.ProfileHeapRate != 0 && !c.ProfileEnable {
+		return fmt.Errorf("profile-heap-rate flag requires enabling profiling with profile flag")
 	}
 	if c.ProfileHeap != "" && !c.ProfileEnable {
 		return fmt.Errorf("profile-heap flag requires enabling profiling with profile flag")
@@ -1311,6 +1328,54 @@ func (n InodeNumbers) String() string {
 	}
 }
 
+// TCPDelayedACK controls whether netstack TCP delays ACKs.
+//
+// TODO: Remove this flag once delayed ACKs have run in production without
+// issues.
+type TCPDelayedACK int
+
+const (
+	// TCPDelayedACKEnabled delays ACKs like Linux.
+	TCPDelayedACKEnabled TCPDelayedACK = iota
+
+	// TCPDelayedACKDisabled sends every ACK immediately.
+	TCPDelayedACKDisabled
+)
+
+func tcpDelayedACKPtr(v TCPDelayedACK) *TCPDelayedACK {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (d *TCPDelayedACK) Set(v string) error {
+	switch v {
+	case "enabled":
+		*d = TCPDelayedACKEnabled
+	case "disabled":
+		*d = TCPDelayedACKDisabled
+	default:
+		return fmt.Errorf("invalid TCP delayed ACK mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (d *TCPDelayedACK) Get() any {
+	return *d
+}
+
+// String implements flag.Value.
+func (d TCPDelayedACK) String() string {
+	switch d {
+	case TCPDelayedACKEnabled:
+		return "enabled"
+	case TCPDelayedACKDisabled:
+		return "disabled"
+	default:
+		panic(fmt.Sprintf("Invalid TCP delayed ACK mode %d", d))
+	}
+}
+
 // TarTimestampResolution is the resolution of modification times in tar
 // archives of sandbox filesystems.
 type TarTimestampResolution int
@@ -1919,6 +1984,57 @@ func (p SignalUnkillablePolicy) String() string {
 		return "linux"
 	default:
 		panic(fmt.Sprintf("invalid signal unkillable policy %d", p))
+	}
+}
+
+// LandlockMode tells whether the Landlock syscalls are available in the
+// sandbox.
+type LandlockMode int
+
+// LandlockMode values.
+const (
+	// LandlockDisabled makes the Landlock syscalls fail with ENOSYS.
+	LandlockDisabled LandlockMode = iota
+
+	// LandlockEnabled makes the Landlock syscalls available. A task that has
+	// restricted itself fails the filesystem operations that the sentry does
+	// not check against its Landlock domain.
+	LandlockEnabled
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (m *LandlockMode) Set(v string) error {
+	switch v {
+	case "disabled":
+		*m = LandlockDisabled
+	case "enabled":
+		*m = LandlockEnabled
+	default:
+		return fmt.Errorf("invalid landlock mode %q (must be one of: disabled, enabled)", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to m.
+// Useful in flag declaration line.
+func (m LandlockMode) Ptr() *LandlockMode {
+	return &m
+}
+
+// Get implements flag.Getter.
+func (m *LandlockMode) Get() any {
+	return *m
+}
+
+// String implements flag.Value.
+func (m LandlockMode) String() string {
+	switch m {
+	case LandlockDisabled:
+		return "disabled"
+	case LandlockEnabled:
+		return "enabled"
+	default:
+		panic(fmt.Sprintf("invalid landlock mode %d", m))
 	}
 }
 

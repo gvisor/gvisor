@@ -94,11 +94,13 @@ func (c *controller) registerHandlers() {
 	l := c.manager.l
 	c.srv.Register(c.manager)
 	c.srv.Register(&control.Cgroups{Kernel: l.k})
-	c.srv.Register(&control.Fs{Kernel: l.k})
+	c.srv.Register(&control.Fs{
+		Kernel:             l.k,
+		CheckDirectFSMount: l.checkDirectFSMount,
+	})
 	c.srv.Register(&control.Lifecycle{Kernel: l.k})
 	c.srv.Register(&control.Logging{})
 	c.srv.Register(&control.Proc{Kernel: l.k})
-	c.srv.Register(&control.State{Kernel: l.k})
 	c.srv.Register(&control.Usage{Kernel: l.k})
 	c.srv.Register(&control.Metrics{})
 	c.srv.Register(&debug{})
@@ -778,14 +780,19 @@ func (cm *containerManager) Signal(args *sentryapi.SignalArgs, _ *struct{}) erro
 // CreateTraceSession creates a new trace session.
 func (cm *containerManager) CreateTraceSession(args *sentryapi.CreateTraceSessionArgs, _ *struct{}) error {
 	log.Debugf("containerManager.CreateTraceSession: config: %+v", args.Config)
+	if len(args.SinkIndexes) != len(args.Files) {
+		return fmt.Errorf("got %d sink indexes for %d sink endpoints", len(args.SinkIndexes), len(args.Files))
+	}
 	for i, sinkFile := range args.Files {
-		if sinkFile != nil {
-			fd, err := fd.NewFromFile(sinkFile)
-			if err != nil {
-				return err
-			}
-			args.Config.Sinks[i].FD = fd
+		sinkIdx := args.SinkIndexes[i]
+		if sinkIdx < 0 || sinkIdx >= len(args.Config.Sinks) {
+			return fmt.Errorf("sink index %d of endpoint %d is out of range, session has %d sinks", sinkIdx, i, len(args.Config.Sinks))
 		}
+		fd, err := fd.NewFromFile(sinkFile)
+		if err != nil {
+			return err
+		}
+		args.Config.Sinks[sinkIdx].FD = fd
 	}
 	return seccheck.Create(&args.Config, args.Force)
 }
@@ -928,11 +935,12 @@ func (cm *containerManager) Mount(args *sentryapi.MountArgs, _ *struct{}) error 
 		Path:  fspath.Parse(dest),
 	}
 
+	// EROFS consumes the image FD even if mounting fails.
+	cu.Release()
 	if _, err := t.Kernel().VFS().MountAt(ctx, t.Credentials(), source, &pop, fstype, &opts); err != nil {
 		return err
 	}
 	log.Infof("Mounted %q to %q type: %s, internal-options: %q, in container %q", source, dest, fstype, opts.GetFilesystemOptions.Data, args.ContainerID)
-	cu.Release()
 	return nil
 }
 

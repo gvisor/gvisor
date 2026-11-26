@@ -28,6 +28,7 @@
 //		        *** "memmap.Mappable locks taken by Translate" below this point
 //		        dentry.dataMu
 //		      filesystem.ancestryMu
+//		      vfs.Filesystem.landlockMu (taken by vfs.Filesystem.ShareLandlockObject)
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
@@ -154,6 +155,11 @@ type filesystem struct {
 	// stackDepth is the 1-based overlay stacking depth of this filesystem,
 	// analogous to Linux's super_block.s_stack_depth. stackDepth is immutable.
 	stackDepth int
+
+	// landlock maps the layer files that overlay files' Landlock identities
+	// follow to the overlay files' Landlock objects. See
+	// dentry.LandlockSlot.
+	landlock vfs.LandlockKeyMap
 }
 
 func layerStackDepth(vd vfs.VirtualDentry) int {
@@ -176,19 +182,10 @@ func computeStackDepth(opts FilesystemOptions) int {
 	return depth + 1
 }
 
-// maxLockdepStackDepth is the number of per-depth lockdep subclasses declared
-// for overlay locks, matching Linux's FILESYSTEM_MAX_STACK_DEPTH.
-const maxLockdepStackDepth = 2
-
+// depthIndex returns the index of fs' stacking depth among the per-depth lock
+// subclasses. Overlay locks have one lockdep subclass per depth, and
+// GetFilesystem limits the depth to linux.FILESYSTEM_MAX_STACK_DEPTH.
 func (fs *filesystem) depthIndex() int {
-	// GetFilesystem does not restrict stackDepth; clamping keeps the slice
-	// index in bounds when stackDepth > maxLockdepStackDepth (with lockdep
-	// enabled, traversing from depth >= 3 into depth 2 will still trigger a
-	// nested-locking panic on subclass "d2"; without lockdep, this index is
-	// ignored).
-	if fs.stackDepth >= maxLockdepStackDepth {
-		return maxLockdepStackDepth - 1
-	}
 	return fs.stackDepth - 1
 }
 
@@ -230,6 +227,11 @@ type createCredsKey struct {
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+	// The layers of an overlay that a task restricted by Landlock creates
+	// would escape its domain, so such a task may not create overlays.
+	if vfs.LandlockDomainOf(creds) != nil {
+		return nil, nil, linuxerr.EPERM
+	}
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsoptsRaw := opts.InternalData
 	fsopts, ok := fsoptsRaw.(FilesystemOptions)
@@ -396,6 +398,11 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		ctx.Infof("overlay.FilesystemType.GetFilesystem: at least two lower layers are required when no upper layer is present")
 		return nil, nil, linuxerr.EINVAL
 	}
+	stackDepth := computeStackDepth(fsopts)
+	if stackDepth > linux.FILESYSTEM_MAX_STACK_DEPTH {
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: stacking depth %d exceeds maximum %d", stackDepth, linux.FILESYSTEM_MAX_STACK_DEPTH)
+		return nil, nil, linuxerr.EINVAL
+	}
 	const maxLowerLayers = 500 // Linux: fs/overlay/super.c:OVL_MAX_STACK
 	if len(fsopts.LowerRoots) > maxLowerLayers {
 		ctx.Infof("overlay.FilesystemType.GetFilesystem: %d lower layers specified, maximum %d", len(fsopts.LowerRoots), maxLowerLayers)
@@ -433,7 +440,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		lowerDevMinors: make(map[layerDevNumber]uint32),
 		dirInoCache:    make(map[layerDevNoAndIno]uint64),
 		maxFilenameLen: linux.NAME_MAX,
-		stackDepth:     computeStackDepth(fsopts),
+		stackDepth:     stackDepth,
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
@@ -464,7 +471,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	rootTopVD := root.topLayer()
 	rootCleanup := cleanup.Make(func() {
-		root.destroyLocked(ctx)
+		root.DecRef(ctx)
 		fs.vfsfs.DecRef(ctx)
 	})
 	defer rootCleanup.Clean()
@@ -781,6 +788,18 @@ type dentry struct {
 	// dirInoHash is the entry hash in fs.dirInoCache. This is only set for
 	// directories.
 	dirInoHash layerDevNoAndIno
+
+	// landlockLinked is true if, when the dentry was looked up, its topmost
+	// layer file was a lower non-directory with more than one link in an
+	// overlay with an upper layer. Copy-up breaks such links, so each name of
+	// the file is a file of its own to Landlock. landlockLinked is immutable.
+	landlockLinked bool
+
+	// landlockLower and landlockUpper cache the slots that LandlockSlot
+	// returns before and after copy-up. They are computed on first use, so
+	// that lookups of files that no Landlock check visits cost nothing extra.
+	landlockLower atomic.Pointer[vfs.LandlockKeySlot] `state:"nosave"`
+	landlockUpper atomic.Pointer[vfs.LandlockKeySlot] `state:"nosave"`
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -958,6 +977,71 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie ui
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
 	return &d.watches
+}
+
+// LandlockSlot implements vfs.DentryImpl.LandlockSlot.
+//
+// The file's Landlock identity follows its topmost layer file: the topmost
+// lower file before copy-up, and the upper file after it. Copy-up carries the
+// identity over. For example, a rule added through a lower file still applies
+// after the file is copied up, and to hard links later made to the upper file
+// through the overlay.
+func (d *dentry) LandlockSlot() vfs.LandlockSlot {
+	if d.isCopiedUp() {
+		// Copy-up sets d.upperVD before it marks d copied up.
+		return d.cachedLandlockSlot(&d.landlockUpper, d.upperVD, false /* byName */)
+	}
+	return d.cachedLandlockSlot(&d.landlockLower, d.lowerVDs[0], d.landlockLinked)
+}
+
+// cachedLandlockSlot returns the slot in *cache, computing it from layer and
+// byName (see landlockSlot) on first use. It returns nil if Landlock rules
+// cannot name layer's file.
+func (d *dentry) cachedLandlockSlot(cache *atomic.Pointer[vfs.LandlockKeySlot], layer vfs.VirtualDentry, byName bool) vfs.LandlockSlot {
+	if s := cache.Load(); s != nil {
+		return s
+	}
+	s := d.fs.landlockSlot(layer, byName)
+	if s == nil {
+		return nil
+	}
+	// Concurrent callers compute equal slots, so either store may win.
+	cache.Store(s)
+	return s
+}
+
+// landlockSlot returns the slot under which fs finds the Landlock object of
+// an overlay file whose topmost layer file is layer, or nil if Landlock rules
+// cannot name layer's file.
+//
+// On layers that identify files by inode (tmpfs, gofer and erofs), the key is
+// the layer file's own LandlockSlot, so that hard links on the layer are one
+// file, unless byName is true. Otherwise the key is the layer dentry, so that
+// each name is a file of its own; this is the case on overlays and synthetic
+// filesystems. Either key stays unique while the overlay dentry holds a
+// reference on the layer dentry, which it does as long as its object does.
+func (fs *filesystem) landlockSlot(layer vfs.VirtualDentry, byName bool) *vfs.LandlockKeySlot {
+	layerSlot := layer.Dentry().Impl().LandlockSlot()
+	if layerSlot == nil {
+		return nil
+	}
+	var key any = layer.Dentry()
+	if !byName && layerIdentifiesFilesByInode(layer) {
+		key = layerSlot
+	}
+	slot := fs.landlock.Slot(key)
+	return &slot
+}
+
+// layerIdentifiesFilesByInode returns true if layer's filesystem gives all
+// names of a file one Landlock identity.
+func layerIdentifiesFilesByInode(layer vfs.VirtualDentry) bool {
+	switch layer.Mount().Filesystem().FilesystemType().Name() {
+	case "tmpfs", "9p", "erofs":
+		return true
+	default:
+		return false
+	}
 }
 
 // contextID is this package's type for context.Context.Value keys.
@@ -1159,7 +1243,7 @@ func (fd *fileDescription) dentry() *dentry {
 
 // ListXattr implements vfs.FileDescriptionImpl.ListXattr.
 func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.filesystem().listXattr(ctx, fd.dentry(), size)
+	return fd.filesystem().listXattr(ctx, fd.dentry(), auth.CredentialsFromContext(ctx))
 }
 
 // GetXattr implements vfs.FileDescriptionImpl.GetXattr.

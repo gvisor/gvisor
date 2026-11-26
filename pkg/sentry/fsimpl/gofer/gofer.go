@@ -1096,6 +1096,9 @@ type inode struct {
 	// a more in-depth discussion on this matter).
 	watches vfs.Watches
 
+	// landlock holds the Landlock object of this inode.
+	landlock vfs.LandlockFileSlot
+
 	// refs is the reference count of the inode. A dentry holds a reference on the inode
 	// it points to. rsfs is protected by fs.inodeMu.
 	refs inodeRefs
@@ -1880,6 +1883,19 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
+// LandlockSlot implements vfs.DentryImpl.LandlockSlot.
+//
+// The Landlock object belongs to the inode. Non-directory inodes are shared
+// by inoKey, so a non-directory keeps its object across dentry eviction and
+// revalidation, and hard links share it. Each directory dentry gets its own
+// inode (see getOrCreateInode), so each directory has an identity of its own.
+// In shared interop mode, if the host replaces a directory and revalidation
+// replaces its dentry, the new dentry has a new inode with no object, and
+// rules on the old directory no longer match.
+func (d *dentry) LandlockSlot() vfs.LandlockSlot {
+	return &d.inode.landlock
+}
+
 // contextID is this package's type for context.Context.Value keys.
 type contextID int
 
@@ -2392,38 +2408,47 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 		if openReadable && openWritable && (d.inode.readFD.RacyLoad() < 0 || d.inode.writeFD.RacyLoad() < 0 || d.inode.readFD.RacyLoad() != d.inode.writeFD.RacyLoad()) {
 			// Replace existing FDs with this one.
 			if d.inode.readFD.RacyLoad() >= 0 {
-				// We already have a readable FD that may be in use by
-				// concurrent callers of d.inode.mmapFile.FD(). Use dup3 to
-				// make the old file descriptor refer to the new file
-				// description, then close the new file descriptor (which is no
-				// longer needed).
-				if err := unix.Dup3(int(h.fd), int(d.inode.readFD.RacyLoad()), unix.O_CLOEXEC); err != nil {
-					oldFD := d.inode.readFD.RacyLoad()
-					d.inode.handleMu.Unlock()
-					ctx.Warningf("gofer.dentry.ensureSharedHandle: failed to dup fd %d to fd %d: %v", h.fd, oldFD, err)
-					h.close(ctx)
-					return err
-				}
-				// If overlayfsStaleRead is in effect, then the new FD may not
-				// be coherent with the existing one, so we have no choice but
-				// to switch to mappings of the new FD in both the application
-				// and sentry. Otherwise, racing callers of
-				// d.inode.mmapFile.FD() may use the old or new file
-				// description, but this doesn't matter since they refer to the
-				// same file, and any racing mappings must be read-only. Thus
-				// we can avoid invalidating existing translations, which is
-				// expensive.
+				oldFD := d.inode.readFD.RacyLoad()
 				if d.inode.fs.opts.overlayfsStaleRead {
-					if err := d.inode.mmapFile.RegenerateMappings(); err != nil {
+					// If overlayfsStaleRead is in effect, then the new FD may
+					// not be coherent with the existing one, so we have no
+					// choice but to switch to mappings of the new FD in both
+					// the application and sentry. Stage replacement mappings
+					// from h.fd before dup3 under mmapFile.mapsMu so a failure
+					// leaves both the shared FD and cached mappings on the old
+					// file description. RegenerateMappings does not change
+					// internal mappings that are already in use (e.g. cached in
+					// pmas), so these can read stale data until translations
+					// are invalidated below; any such mappings are read-only.
+					if err := d.inode.mmapFile.RegenerateMappings(int(h.fd), func() error {
+						return unix.Dup3(int(h.fd), int(oldFD), unix.O_CLOEXEC)
+					}); err != nil {
 						d.inode.handleMu.Unlock()
-						ctx.Warningf("gofer.dentry.ensureSharedHandle: failed to replace sentry mappings of old FD with mappings of new FD: %v", err)
+						ctx.Warningf("gofer.dentry.ensureSharedHandle: failed to replace sentry mappings of old FD %d with new FD %d: %v", oldFD, h.fd, err)
 						h.close(ctx)
 						return err
 					}
 					invalidateTranslations = true
+				} else {
+					// We already have a readable FD that may be in use by
+					// concurrent callers of d.inode.mmapFile.FD(). Use dup3 to
+					// make the old file descriptor refer to the new file
+					// description, then close the new file descriptor (which is
+					// no longer needed). Racing callers of
+					// d.inode.mmapFile.FD() may use the old or new file
+					// description, but this doesn't matter since they refer to
+					// the same file, and any racing mappings must be read-only.
+					// Thus we can avoid invalidating existing translations,
+					// which is expensive.
+					if err := unix.Dup3(int(h.fd), int(oldFD), unix.O_CLOEXEC); err != nil {
+						d.inode.handleMu.Unlock()
+						ctx.Warningf("gofer.dentry.ensureSharedHandle: failed to dup fd %d to fd %d: %v", h.fd, oldFD, err)
+						h.close(ctx)
+						return err
+					}
 				}
 				fdsToClose = append(fdsToClose, h.fd)
-				h.fd = d.inode.readFD.RacyLoad()
+				h.fd = oldFD
 			} else {
 				d.inode.readFD.Store(h.fd)
 			}
