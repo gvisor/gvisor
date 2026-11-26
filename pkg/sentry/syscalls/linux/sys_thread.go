@@ -380,6 +380,12 @@ func Waitid(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 			return 0, nil, linuxerr.EINVAL
 		}
 		tg, nonblock, err := t.ThreadGroupFromPIDFD(id)
+		if linuxerr.Equals(linuxerr.ESRCH, err) {
+			// The pidfd refers to a process that has already been reaped, so
+			// there is no child to wait for. Linux returns ECHILD here, even
+			// for a non-blocking pidfd.
+			return 0, nil, linuxerr.ECHILD
+		}
 		if err != nil {
 			return 0, nil, err
 		}
