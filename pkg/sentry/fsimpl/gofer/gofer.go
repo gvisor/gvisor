@@ -300,11 +300,19 @@ type filesystem struct {
 // inode-number reuse race (last writer takes the slot, degrading a later walk
 // to another miss rather than panicking).
 //
+// If created is true, the caller has just created the file on the host, so a
+// cached inode under its inoKey describes a file that the host has since
+// unlinked and whose inode number it recycled. The lookup is skipped, and the
+// new inode takes the cache slot; the superseded inode leaves the cache when
+// its last dentry is destroyed (dentry.destroyLocked deletes the key only if
+// it still maps to that inode). A hard link is not a creation: it shares the
+// target's inode.
+//
 // If a miss, `createInode` is called and the result is cached. If a hit,
 // `onCacheHit` is called. This path locks fs.inodeMu.
 //
 // The caller is responsible for decrementing the inode's reference count when done.
-func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache bool, onCacheHit func(), createInode func() *inode) *inode {
+func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache bool, created bool, onCacheHit func(), createInode func() *inode) *inode {
 	if dontCache {
 		// Create a new inode and return it bypassing the cache. This is used for
 		// creating inodes that are not meant to be shared across dentries.
@@ -312,7 +320,7 @@ func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache
 	}
 	fs.inodeMu.Lock()
 	defer fs.inodeMu.Unlock()
-	if cachedInode, ok := fs.inodeByKey[inoKey]; ok && cachedInode.fileType() == fileType {
+	if cachedInode, ok := fs.inodeByKey[inoKey]; ok && !created && cachedInode.fileType() == fileType {
 		onCacheHit()
 		cachedInode.incRef()
 		return cachedInode
@@ -705,7 +713,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if fs.opts.directfs.enabled {
 		fs.root, err = fs.getDirectfsRootDentry(ctx, rootHostFD, fs.client.NewFD(rootInode.ControlFD))
 	} else {
-		fs.root, err = fs.newLisafsDentry(ctx, &rootInode)
+		fs.root, err = fs.newLisafsDentry(ctx, &rootInode, false /* created */)
 	}
 	if err != nil {
 		fs.vfsfs.DecRef(ctx)

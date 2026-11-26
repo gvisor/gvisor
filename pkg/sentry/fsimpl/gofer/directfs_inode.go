@@ -93,7 +93,7 @@ func tryOpen(open func(int) (int, error)) (int, error) {
 // this mountpoint. getDirectfsRootInode takes ownership of rootHostFD and
 // rootControlFD.
 func (fs *filesystem) getDirectfsRootDentry(ctx context.Context, rootHostFD int, rootControlFD lisafs.ClientFD) (*dentry, error) {
-	dentry, err := fs.newDirectfsDentry(rootHostFD)
+	dentry, err := fs.newDirectfsDentry(rootHostFD, false /* created */)
 	if err != nil {
 		log.Warningf("newDirectfsDentry failed for mount point dentry: %v", err)
 		rootControlFD.Close(ctx, false /* flush */)
@@ -133,11 +133,15 @@ type directfsInode struct {
 //     initially has no references, but is not cached; it is the caller's
 //     responsibility to set the dentry's reference count and/or call
 //     dentry.checkCachingLocked() as appropriate.
-//  2. newDirectfsDentry checks if there is a corresponding inode in the cache.
-//     If not, it creates a new inode representing the given file.
+//  2. newDirectfsDentry checks if there is a corresponding inode in the cache,
+//     unless created is true. If not, it creates a new inode representing the
+//     given file.
+//
+// created is true if the caller just created the file on the host; see
+// filesystem.getOrCreateInode.
 //
 // newDirectfsDentry takes ownership of controlFD
-func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
+func (fs *filesystem) newDirectfsDentry(controlFD int, created bool) (*dentry, error) {
 	var stat unix.Statx_t
 	if err := unix.Statx(controlFD, "", unix.AT_EMPTY_PATH, unix.STATX_BASIC_STATS|unix.STATX_BTIME, &stat); err != nil {
 		log.Warningf("failed to stat FD %d: %v", controlFD, err)
@@ -172,7 +176,7 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 	// different paths (e.g., /mnt/ and /mnt/a/b/c if /mnt/a/b/c is a bind mount of /mnt/)
 	// can return the same device ID and inode number from a stat call.
 	var cacheHit bool
-	temp.d.inode = fs.getOrCreateInode(inoKey, fileType, isDir, /* dontCache */
+	temp.d.inode = fs.getOrCreateInode(inoKey, fileType, isDir /* dontCache */, created,
 		func() {
 			cacheHit = true
 			_ = unix.Close(controlFD)
@@ -540,7 +544,7 @@ func (i *directfsInode) getHostChild(name string) (*dentry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return i.fs.newDirectfsDentry(childFD)
+	return i.fs.newDirectfsDentry(childFD, false /* created */)
 }
 
 var xattrBufPool = sync.Pool{
@@ -636,9 +640,11 @@ func (i *directfsInode) removeXattr(ctx context.Context, name string, d *dentry)
 	return unix.Fremovexattr(i.controlFD, name)
 }
 
-// getCreatedChild opens the newly created child, sets its uid/gid, constructs
-// a disconnected dentry and returns it.
-func (i *directfsInode) getCreatedChild(name string, uid auth.KUID, gid auth.KGID, isDir bool, createDentry bool, d *dentry) (*dentry, error) {
+// getCreatedChild opens the child that this call just added to the host
+// directory, sets its uid/gid, constructs a disconnected dentry and returns
+// it. created is false if the child is a hard link to an existing file; see
+// filesystem.getOrCreateInode.
+func (i *directfsInode) getCreatedChild(name string, uid auth.KUID, gid auth.KGID, isDir bool, created bool, createDentry bool, d *dentry) (*dentry, error) {
 	unlinkFlags := 0
 	extraOpenFlags := 0
 	if isDir {
@@ -670,7 +676,7 @@ func (i *directfsInode) getCreatedChild(name string, uid auth.KUID, gid auth.KGI
 		_ = unix.Close(childFD)
 		return nil, nil
 	}
-	child, err := i.fs.newDirectfsDentry(childFD)
+	child, err := i.fs.newDirectfsDentry(childFD, created)
 	if err != nil {
 		// Ownership of childFD was passed to newDirectDentry(), so no need to
 		// clean that up.
@@ -705,7 +711,7 @@ func (i *directfsInode) mknod(ctx context.Context, name string, creds *auth.Cred
 	if err := unix.Mknodat(i.controlFD, name, uint32(opts.Mode), 0); err != nil {
 		return nil, err
 	}
-	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* createDentry */, d)
+	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* created */, true /* createDentry */, d)
 }
 
 // Precondition: opts.Endpoint != nil and is transport.HostBoundEndpoint type.
@@ -730,7 +736,7 @@ func (i *directfsInode) bindAt(ctx context.Context, name string, creds *auth.Cre
 		return nil, err
 	}
 	// Socket already has the right UID/GID set, so use uid = gid = -1.
-	child, err := i.getCreatedChild(name, auth.NoID /* uid */, auth.NoID /* gid */, false /* isDir */, true /* createDentry */, d)
+	child, err := i.getCreatedChild(name, auth.NoID /* uid */, auth.NoID /* gid */, false /* isDir */, true /* created */, true /* createDentry */, d)
 	if err != nil {
 		hbep.ResetBoundSocketFD(ctx)
 		return nil, err
@@ -755,21 +761,21 @@ func (i *directfsInode) link(target *dentry, name string, d *dentry) (*dentry, e
 	}
 	// Note that we don't need to set uid/gid for the new child. This is a hard
 	// link. The original file already has the right owner.
-	return i.getCreatedChild(name, auth.NoID /* uid */, auth.NoID /* gid */, false /* isDir */, true /* createDentry */, d)
+	return i.getCreatedChild(name, auth.NoID /* uid */, auth.NoID /* gid */, false /* isDir */, false /* created */, true /* createDentry */, d)
 }
 
 func (i *directfsInode) mkdir(name string, mode linux.FileMode, uid auth.KUID, gid auth.KGID, createDentry bool, d *dentry) (*dentry, error) {
 	if err := unix.Mkdirat(i.controlFD, name, uint32(mode)); err != nil {
 		return nil, err
 	}
-	return i.getCreatedChild(name, uid, gid, true /* isDir */, createDentry, d)
+	return i.getCreatedChild(name, uid, gid, true /* isDir */, true /* created */, createDentry, d)
 }
 
 func (i *directfsInode) symlink(name, target string, creds *auth.Credentials, d *dentry) (*dentry, error) {
 	if err := unix.Symlinkat(target, i.controlFD, name); err != nil {
 		return nil, err
 	}
-	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* createDentry */, d)
+	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* created */, true /* createDentry */, d)
 }
 
 func (i *directfsInode) openCreate(name string, accessFlags uint32, mode linux.FileMode, uid auth.KUID, gid auth.KGID, createDentry bool, d *dentry) (*dentry, handle, error) {
@@ -779,7 +785,7 @@ func (i *directfsInode) openCreate(name string, accessFlags uint32, mode linux.F
 		return nil, noHandle, err
 	}
 
-	child, err := i.getCreatedChild(name, uid, gid, false /* isDir */, createDentry, d)
+	child, err := i.getCreatedChild(name, uid, gid, false /* isDir */, true /* created */, createDentry, d)
 	if err != nil {
 		_ = unix.Close(childHandleFD)
 		return nil, noHandle, err
