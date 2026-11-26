@@ -28,11 +28,13 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/sandboxposture"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 	"gvisor.dev/gvisor/runsc/sandbox"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // This test checks the security posture of the Sentry (`boot`) process.
@@ -42,10 +44,11 @@ import (
 const postureFDLimit = 4096
 
 type postureCase struct {
-	name           string
-	directfs       bool
-	network        config.NetworkType
-	extraFDClasses []string
+	name             string
+	directfs         bool
+	suppressDirectFS bool
+	network          config.NetworkType
+	extraFDClasses   []string
 
 	// platform overrides the gVisor platform; leave empty to use the default.
 	platform string
@@ -68,6 +71,7 @@ func TestBootPosture(t *testing.T) {
 	for _, tc := range []postureCase{
 		{name: "default", directfs: true, network: config.NetworkSandbox},
 		{name: "hostinet", directfs: true, network: config.NetworkHost},
+		{name: "directfs_suppressed", directfs: true, suppressDirectFS: true, network: config.NetworkSandbox},
 		{name: "no_directfs", directfs: false, network: config.NetworkSandbox},
 		{name: "no_directfs_hostinet", directfs: false, network: config.NetworkHost},
 		{name: "kvm", directfs: true, network: config.NetworkSandbox, platform: "kvm", extraFDClasses: sandboxposture.KVMFDClasses()},
@@ -155,6 +159,26 @@ func testBootPosture(t *testing.T, tc postureCase) {
 	defer stop()
 
 	spec := testutil.NewSpecWithArgs("/bin/sleep", "10000")
+	if tc.suppressDirectFS {
+		spec.Annotations[sentryapi.RootfsPrefix+"source"] = spec.Root.Path
+		spec.Annotations[sentryapi.RootfsPrefix+"type"] = "bind"
+		spec.Annotations[sentryapi.RootfsPrefix+"directfs"] = "off"
+		for i, m := range spec.Mounts {
+			if !specutils.IsGoferMount(m) {
+				continue
+			}
+			source, err := filepath.EvalSymlinks(m.Source)
+			if err != nil {
+				t.Fatalf("Resolving mount source %q: %v", m.Source, err)
+			}
+			spec.Mounts[i].Source = source
+			prefix := fmt.Sprintf("%smount%d.", sentryapi.MountPrefix, i)
+			spec.Annotations[prefix+"source"] = source
+			spec.Annotations[prefix+"type"] = "bind"
+			spec.Annotations[prefix+"share"] = "shared"
+			spec.Annotations[prefix+"directfs"] = "off"
+		}
+	}
 	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 	if err != nil {
 		t.Fatalf("Error setting up container: %v", err)
@@ -177,6 +201,7 @@ func testBootPosture(t *testing.T, tc postureCase) {
 	}
 	opts := sandboxposture.ExpectedOpts{
 		DirectFS:             tc.directfs,
+		NoDirectFSMounts:     tc.suppressDirectFS,
 		NetworkMode:          tc.network.String(),
 		EnableRaw:            conf.EnableRaw,
 		RequiresCapSysPtrace: sandboxposture.PlatformCapSysPtrace[conf.Platform],
