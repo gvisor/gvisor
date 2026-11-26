@@ -258,6 +258,14 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			return false
 		}
 		isDir := stat.Mode&linux.S_IFMT == linux.S_IFDIR
+		if isDir {
+			if _, isLayerRoot := fs.layerRoots[childVD.Dentry()]; isLayerRoot {
+				// The layers overlap. Linux fails such lookups with ELOOP too.
+				ctx.Debugf("overlay.filesystem.lookupLocked: overlapping layers at %q", name)
+				lookupErr = linuxerr.ELOOP
+				return false
+			}
+		}
 		if topLookupLayer != lookupLayerNone && !isDir {
 			// Directories are not merged with non-directory files from lower
 			// layers; instead, layers including and below the first
@@ -1265,16 +1273,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	// renamed and oldParent need to be copied-up before they're renamed on the
-	// upper layer.
-	if err := renamed.copyUpLocked(ctx); err != nil {
+	// upper layer. If renamed is a directory, all of its descendants need to be
+	// copied-up too.
+	if err := renamed.copyUpWithDescendantsLocked(ctx, &ds); err != nil {
 		return err
-	}
-	// If renamed is a directory, all of its descendants need to be copied-up
-	// before they're renamed on the upper layer.
-	if renamed.isDir() {
-		if err := renamed.copyUpDescendantsLocked(ctx, &ds); err != nil {
-			return err
-		}
 	}
 	// newParent must be copied-up before it can contain renamed on the upper
 	// layer.
@@ -1284,17 +1286,17 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if exchange {
 		// replaced is also renamed on the upper layer, so it (and all of its
 		// descendants if it's a directory) must be copied-up too.
-		if err := replaced.copyUpLocked(ctx); err != nil {
-			return err
-		}
+		var err error
 		if replaced.isDir() {
 			replacedDirIdx := replaced.dirLockIndex(dirLockD1Replaced)
 			replaced.dirMu.NestedLock(replacedDirIdx)
-			err := replaced.copyUpDescendantsLocked(ctx, &ds)
+			err = replaced.copyUpWithDescendantsLocked(ctx, &ds)
 			replaced.dirMu.NestedUnlock(replacedDirIdx)
-			if err != nil {
-				return err
-			}
+		} else {
+			err = replaced.copyUpLocked(ctx)
+		}
+		if err != nil {
+			return err
 		}
 	} else if replaced != nil {
 		// replaced doesn't need to be copied-up, but we do need to serialize

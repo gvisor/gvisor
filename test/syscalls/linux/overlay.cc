@@ -1501,8 +1501,8 @@ TEST_F(OverlayRenameTest, FileReplaceDirWhiteout) {
 }
 
 // A directory on the lower layer is recursively copied up and renamed in
-// gVisor. Nesting two directories below the renamed one makes copy-up lock a
-// child and a grandchild directory at the same time.
+// gVisor. Nesting two directories below the renamed one makes the rename lock
+// a child and a grandchild directory at the same time.
 TEST_F(OverlayRenameTest, DirCopyUp) {
   // Linux overlayfs returns EXDEV when renaming a lower or merged directory
   // unless redirect_dir=on is enabled; gVisor copies up the directory subtree.
@@ -1525,6 +1525,49 @@ TEST_F(OverlayRenameTest, DirCopyUp) {
   EXPECT_THAT(Exists(src_dir_path), IsPosixErrorOkAndHolds(false));
 }
 
+// Renaming a lower directory with sibling subdirectories, files and a symlink
+// copies up the whole tree in gVisor:
+//
+//   src/
+//   |-- a/
+//   |   |-- file1
+//   |   `-- file2
+//   |-- c/
+//   |-- file3
+//   `-- link -> a/file2
+TEST_F(OverlayRenameTest, DirCopyUpTree) {
+  // Linux overlayfs returns EXDEV when renaming a lower or merged directory
+  // unless redirect_dir=on is enabled; gVisor copies up the directory subtree.
+  SKIP_IF(!IsRunningOnGvisor());
+
+  for (const char* dir : {"src", "src/a", "src/c"}) {
+    ASSERT_NO_ERRNO(Mkdir(LowerPath(dir)));
+  }
+  ASSERT_NO_ERRNO(CreateWithContents(LowerPath("src/a/file1"), "one"));
+  ASSERT_NO_ERRNO(CreateWithContents(LowerPath("src/a/file2"), "two"));
+  ASSERT_NO_ERRNO(CreateWithContents(LowerPath("src/file3"), "three"));
+  ASSERT_THAT(symlink("a/file2", LowerPath("src/link").c_str()),
+              SyscallSucceeds());
+  ASSERT_NO_ERRNO(MountOverlay());
+
+  ASSERT_THAT(rename(MergedPath("src").c_str(), MergedPath("dst").c_str()),
+              SyscallSucceeds());
+  std::set<std::string> paths;
+  ASSERT_NO_ERRNO(
+      RecursivelyCollectSubPaths(MergedPath("dst"), MergedPath("dst"), &paths));
+  EXPECT_THAT(paths, UnorderedElementsAreArray({"/a", "/a/file1", "/a/file2",
+                                                "/c", "/file3", "/link"}));
+  EXPECT_THAT(GetContents(MergedPath("dst/a/file1")),
+              IsPosixErrorOkAndHolds("one"));
+  EXPECT_THAT(GetContents(MergedPath("dst/file3")),
+              IsPosixErrorOkAndHolds("three"));
+  EXPECT_THAT(GetContents(MergedPath("dst/link")),
+              IsPosixErrorOkAndHolds("two"));
+  EXPECT_THAT(ReadLink(MergedPath("dst/link")),
+              IsPosixErrorOkAndHolds("a/file2"));
+  EXPECT_THAT(Exists(MergedPath("src")), IsPosixErrorOkAndHolds(false));
+}
+
 // Exchanging two lower directories copies up both subtrees in gVisor.
 TEST_F(OverlayRenameTest, DirExchangeCopyUp) {
   // As in DirCopyUp, Linux returns EXDEV here without redirect_dir=on.
@@ -1544,6 +1587,24 @@ TEST_F(OverlayRenameTest, DirExchangeCopyUp) {
               IsPosixErrorOkAndHolds("from y"));
   EXPECT_THAT(GetContents(MergedPath("y/a/b/file")),
               IsPosixErrorOkAndHolds("from x"));
+}
+
+// Renaming a lower directory in an overlay without an upper layer fails with
+// EROFS, even if the overlay's mounter cannot read the directory.
+TEST_F(OverlayRenameTest, DirRenameWithoutUpper) {
+  ASSERT_NO_ERRNO(Mkdir(LowerPath("src"), 0111));
+
+  // The overlay accesses its layers with its mounter's credentials. Mount
+  // without the capabilities that bypass read permission, so that the
+  // mounter cannot read src.
+  AutoCapability dac_override(CAP_DAC_OVERRIDE, false);
+  AutoCapability dac_read_search(CAP_DAC_READ_SEARCH, false);
+  const Cleanup overlay_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", o_.merged, "overlay", 0,
+            absl::StrCat("lowerdir=", o_.lower, ":", o_.upper), MNT_DETACH));
+
+  EXPECT_THAT(rename(MergedPath("src").c_str(), MergedPath("dst").c_str()),
+              SyscallFailsWithErrno(EROFS));
 }
 
 // An upper directory may replace an empty directory on the lower layer.
@@ -1629,6 +1690,209 @@ TEST_F(OverlayRenameTest, RenameFromDeletedDirFails) {
   EXPECT_THAT(renameat(dirfd.get(), "file", AT_FDCWD, dst.c_str()),
               SyscallFailsWithErrno(ENOENT));
   EXPECT_THAT(Exists(dst), IsPosixErrorOkAndHolds(false));
+}
+
+// ============================================================================
+// Overlapping layer tests
+// ============================================================================
+
+// Overlay layers must not overlap. On Linux, a lookup through the overlay
+// that reaches the root of a layer fails with ELOOP, and so does mounting a
+// lower layer at or below the root of another layer.
+class OverlayOverlappingLayersTest : public OverlayOnTmpfsTest {
+ protected:
+  PosixErrorOr<Cleanup> MountOverlayWithOpts(const std::string& opts) {
+    return Mount("overlay", o_.merged, "overlay", 0,
+                 absl::StrCat(opts, OverlayXattrOpt(o_.upper)), MNT_DETACH);
+  }
+};
+
+// The lower layer contains the upper layer:
+//
+//   base/          lowerdir
+//   |-- lower/
+//   |-- upper/     upperdir
+//   |-- work/      workdir
+//   `-- merged/    overlay mount point
+//
+// The upper layer root shows up as merged/upper. Looking it up fails, so
+// renaming it cannot copy it up into itself.
+TEST_F(OverlayOverlappingLayersTest, UpperInsideLower) {
+  const std::string base = o_.base.path();
+  const Cleanup overlay_mount =
+      ASSERT_NO_ERRNO_AND_VALUE(MountOverlayWithOpts(absl::StrCat(
+          "lowerdir=", base, ",upperdir=", o_.upper, ",workdir=", o_.work)));
+
+  struct stat st;
+  EXPECT_THAT(stat(MergedPath("lower").c_str(), &st), SyscallSucceeds());
+  EXPECT_THAT(stat(MergedPath("upper").c_str(), &st),
+              SyscallFailsWithErrno(ELOOP));
+  ASSERT_THAT(mkdir(MergedPath("newdir").c_str(), 0755), SyscallSucceeds());
+  EXPECT_THAT(
+      rename(MergedPath("upper").c_str(), MergedPath("newdir/upper").c_str()),
+      SyscallFailsWithErrno(ELOOP));
+}
+
+// A lower layer below the upper layer is rejected at mount.
+TEST_F(OverlayOverlappingLayersTest, LowerInsideUpperFailsMount) {
+  const std::string lower = UpperPath("sub");
+  ASSERT_NO_ERRNO(Mkdir(lower));
+  EXPECT_THAT(
+      MountOverlayWithOpts(absl::StrCat(
+          "lowerdir=", lower, ",upperdir=", o_.upper, ",workdir=", o_.work)),
+      PosixErrorIs(ELOOP));
+}
+
+// A lower layer below another lower layer is rejected at mount.
+TEST_F(OverlayOverlappingLayersTest, LowerInsideLowerFailsMount) {
+  const std::string inner = LowerPath("sub");
+  ASSERT_NO_ERRNO(Mkdir(inner));
+  EXPECT_THAT(
+      MountOverlayWithOpts(absl::StrCat("lowerdir=", o_.lower, ":", inner)),
+      PosixErrorIs(ELOOP));
+}
+
+// An upper layer that is also a lower layer is rejected at mount.
+TEST_F(OverlayOverlappingLayersTest, LowerSameAsUpperFailsMount) {
+  EXPECT_THAT(
+      MountOverlayWithOpts(absl::StrCat(
+          "lowerdir=", o_.lower, ",upperdir=", o_.lower, ",workdir=", o_.work)),
+      PosixErrorIs(ELOOP));
+}
+
+// A lower layer given twice is rejected at mount.
+TEST_F(OverlayOverlappingLayersTest, LowerSameAsLowerFailsMount) {
+  EXPECT_THAT(
+      MountOverlayWithOpts(absl::StrCat("lowerdir=", o_.lower, ":", o_.lower)),
+      PosixErrorIs(ELOOP));
+}
+
+// The upper layer is on a filesystem mounted inside the lower layer:
+//
+//   lower/         lowerdir
+//   `-- m/         mount point of another tmpfs
+//       |-- upper/ upperdir
+//       `-- work/  workdir
+//
+// Lookups in a layer do not cross mount points, so merged/m is the empty
+// directory under the mount, and the upper layer does not overlap the lower
+// layer.
+TEST_F(OverlayOverlappingLayersTest, UpperOnMountInsideLower) {
+  const std::string mnt = LowerPath("m");
+  ASSERT_NO_ERRNO(Mkdir(mnt));
+  const Cleanup tmpfs_mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount(kTmpfs, mnt, kTmpfs, 0, "", MNT_DETACH));
+  const std::string upper = JoinPath(mnt, "upper");
+  const std::string work = JoinPath(mnt, "work");
+  ASSERT_NO_ERRNO(Mkdir(upper));
+  ASSERT_NO_ERRNO(Mkdir(work));
+  const Cleanup overlay_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", o_.merged, "overlay", 0,
+            absl::StrCat("lowerdir=", o_.lower, ",upperdir=", upper,
+                         ",workdir=", work, OverlayXattrOpt(upper)),
+            MNT_DETACH));
+
+  EXPECT_THAT(IsDirectory(MergedPath("m")), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(MergedPath("m/upper")), IsPosixErrorOkAndHolds(false));
+}
+
+// The lower layer contains the upper layer one level below a lower directory:
+//
+//   base/          lowerdir
+//   |-- a/
+//   |   `-- upper/ upperdir
+//   |-- work/      workdir
+//   `-- merged/    overlay mount point
+//
+// Looking up merged/a succeeds. Renaming it fails: on Linux because merged/a
+// is a lower directory, and on gVisor because the copy-up of its contents
+// looks up merged/a/upper, the upper layer root.
+TEST_F(OverlayOverlappingLayersTest, UpperBelowLowerDir) {
+  const std::string base = o_.base.path();
+  const std::string dir = JoinPath(base, "a");
+  const std::string upper = JoinPath(dir, "upper");
+  ASSERT_NO_ERRNO(Mkdir(dir));
+  ASSERT_NO_ERRNO(Mkdir(upper));
+  const Cleanup overlay_mount =
+      ASSERT_NO_ERRNO_AND_VALUE(MountOverlayWithOpts(absl::StrCat(
+          "lowerdir=", base, ",upperdir=", upper, ",workdir=", o_.work)));
+
+  const std::string merged_dir = MergedPath("a");
+  EXPECT_THAT(IsDirectory(merged_dir), IsPosixErrorOkAndHolds(true));
+  const std::string merged_dir2 = MergedPath("a2");
+  if (!IsRunningOnGvisor()) {
+    // Linux fails renames of lower directories with EXDEV, unless the
+    // redirect_dir feature is on.
+    if (rename(merged_dir.c_str(), merged_dir2.c_str()) != 0) {
+      EXPECT_EQ(errno, EXDEV);
+    }
+    return;
+  }
+  // gVisor copies up the contents of the directory instead. Collecting them
+  // fails with ELOOP when it reaches the upper layer root, before anything is
+  // copied up.
+  EXPECT_THAT(rename(merged_dir.c_str(), merged_dir2.c_str()),
+              SyscallFailsWithErrno(ELOOP));
+  EXPECT_THAT(IsDirectory(merged_dir), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(JoinPath(upper, "a")), IsPosixErrorOkAndHolds(false));
+}
+
+// The lower layer of overlay B is overlay A, and B's upper layer is inside A's
+// upper layer:
+//
+//   base/
+//   |-- lower/          A's lowerdir
+//   |-- upper/          A's upperdir
+//   |   `-- sub/        B's upperdir, made by mkdir merged/sub
+//   |-- work/           A's workdir
+//   |-- merged/         A's mount point, B's lowerdir
+//   |-- outer_work/     B's workdir
+//   `-- outer_merged/   B's mount point
+//
+// Through A, B shows its own upper layer root as outer_merged/sub. Looking it
+// up succeeds, since B sees it through A and not as its upper layer root.
+// Renaming it must not recurse into its own copy.
+TEST_F(OverlayOverlappingLayersTest, StackedUpperInsideLower) {
+  ASSERT_NO_ERRNO(MountOverlay());
+  const std::string inner_sub = MergedPath("sub");
+  ASSERT_THAT(mkdir(inner_sub.c_str(), 0755), SyscallSucceeds());
+
+  const std::string base = o_.base.path();
+  const std::string outer_upper = UpperPath("sub");
+  const std::string outer_work = JoinPath(base, "outer_work");
+  const std::string outer_merged = JoinPath(base, "outer_merged");
+  for (const std::string& dir : {outer_work, outer_merged}) {
+    ASSERT_THAT(mkdir(dir.c_str(), 0755), SyscallSucceeds());
+  }
+  PosixErrorOr<Cleanup> outer_mount =
+      Mount("overlay", outer_merged, "overlay", 0,
+            absl::StrCat("lowerdir=", o_.merged, ",upperdir=", outer_upper,
+                         ",workdir=", outer_work, OverlayXattrOpt(outer_upper)),
+            MNT_DETACH);
+  // A's upper layer contains B's upper layer. With the index feature on, Linux
+  // fails the mount with EBUSY for that.
+  SKIP_IF(!IsRunningOnGvisor() && !outer_mount.ok() &&
+          outer_mount.error().errno_value() == EBUSY);
+  ASSERT_NO_ERRNO(outer_mount);
+
+  const std::string sub = JoinPath(outer_merged, "sub");
+  const std::string sub2 = JoinPath(outer_merged, "sub2");
+  EXPECT_THAT(IsDirectory(sub), IsPosixErrorOkAndHolds(true));
+  if (!IsRunningOnGvisor()) {
+    // Linux fails renames of lower directories with EXDEV, unless the
+    // redirect_dir feature is on.
+    if (rename(sub.c_str(), sub2.c_str()) != 0) {
+      EXPECT_EQ(errno, EXDEV);
+    }
+    return;
+  }
+  // gVisor copies up the contents of the directory instead. B cannot see that
+  // the directory is its own upper layer root, so the rename succeeds. The
+  // rename writes to A's upper layer behind A's back, so what A and B show
+  // afterwards is undefined; only check that the rename ends and the old name
+  // is gone.
+  EXPECT_THAT(rename(sub.c_str(), sub2.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Exists(sub), IsPosixErrorOkAndHolds(false));
 }
 
 // ============================================================================
