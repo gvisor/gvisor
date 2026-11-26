@@ -652,7 +652,6 @@ func (o *IPv4OptionGeneric) Contents() []byte { return *o }
 // IPv4OptionIterator is an iterator pointing to a specific IP option
 // at any point of time. It also holds information as to a new options buffer
 // that we are building up to hand back to the caller.
-// TODO(https://gvisor.dev/issues/5513): Add unit tests for IPv4OptionIterator.
 type IPv4OptionIterator struct {
 	options IPv4Options
 	// ErrCursor is where we are while parsing options. It is exported as any
