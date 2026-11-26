@@ -641,6 +641,11 @@ func (d *dentry) Watches() *vfs.Watches {
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
 func (d *dentry) OnZeroWatches(context.Context) {}
 
+// TouchAtime updates d's access time on mnt without modifying ctime.
+func (d *dentry) TouchAtime(mnt *vfs.Mount) {
+	d.inode.touchAtime(mnt)
+}
+
 // inode represents a filesystem object.
 //
 // +stateify savable

@@ -23,8 +23,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/test/testutil"
@@ -95,11 +97,16 @@ func TestOverlayMetacopy(t *testing.T) {
 		"trunc":  metacopyPattern(3, smallSize),
 		"otrunc": metacopyPattern(4, bigSize),
 		"tar":    metacopyPattern(5, smallSize),
+		"atime":  metacopyPattern(6, smallSize),
 	}
 	for name, data := range fixtures {
 		if err := os.WriteFile(filepath.Join(lowerDir, name), data, 0644); err != nil {
 			t.Fatalf("WriteFile(%s): %v", name, err)
 		}
+	}
+	oldTime := time.Unix(1000000, 0)
+	if err := os.Chtimes(filepath.Join(lowerDir, "atime"), oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes(atime): %v", err)
 	}
 
 	cont, conf, cleanup := startMetacopyContainer(t, "root:memory,size=1m,metacopy=on", "")
@@ -160,6 +167,36 @@ func TestOverlayMetacopy(t *testing.T) {
 	mustRun(cont, conf, fmt.Sprintf("chown 1003:1003 %q && printf 'short' > %q", otruncPath, otruncPath))
 	if got := readGuest(cont, conf, otruncPath); string(got) != "short" {
 		t.Fatalf("O_TRUNC content = %q, want %q", got, "short")
+	}
+
+	// Reading a metacopy file updates atime without changing mtime or ctime,
+	// while honoring O_NOATIME.
+	atimePath := pathOf("atime")
+	mustRun(cont, conf, fmt.Sprintf("chown 1005:1005 %q", atimePath))
+	statTimes := func(cmd string) (int64, string, string) {
+		t.Helper()
+		f := strings.Fields(runOutput(cont, conf, cmd))
+		sec, err := strconv.ParseInt(f[0], 10, 64)
+		if err != nil {
+			t.Fatalf("ParseInt(%q): %v", f[0], err)
+		}
+		return sec, f[1], f[2]
+	}
+	atime0, mtime0, ctime0 := statTimes(fmt.Sprintf("stat -c '%%X %%.9Y %%.9Z' %q", atimePath))
+	if atime0 != oldTime.Unix() {
+		t.Fatalf("initial atime = %d, want %d", atime0, oldTime.Unix())
+	}
+	mustRun(cont, conf, fmt.Sprintf("dd if=%q of=/dev/null bs=16 count=1 iflag=noatime status=none", atimePath))
+	if a, m, c := statTimes(fmt.Sprintf("stat -c '%%X %%.9Y %%.9Z' %q", atimePath)); a != atime0 || m != mtime0 || c != ctime0 {
+		t.Fatalf("O_NOATIME read changed times: (%d, %s, %s) != (%d, %s, %s)", a, m, c, atime0, mtime0, ctime0)
+	}
+	mustRun(cont, conf, fmt.Sprintf("dd if=%q of=/dev/null bs=16 count=1 status=none", atimePath))
+	atime1, mtime1, ctime1 := statTimes(fmt.Sprintf("stat -c '%%X %%.9Y %%.9Z' %q", atimePath))
+	if atime1 <= atime0 || mtime1 != mtime0 || ctime1 != ctime0 {
+		t.Fatalf("after read: got (%d, %s, %s), want atime>%d and mtime/ctime=(%s, %s)", atime1, mtime1, ctime1, atime0, mtime0, ctime0)
+	}
+	if fa, fm, fc := statTimes(fmt.Sprintf("stat -c '%%X %%.9Y %%.9Z' - < %q", atimePath)); fa != atime1 || fm != mtime0 || fc != ctime0 {
+		t.Fatalf("fstat after read: got (%d, %s, %s), want (%d, %s, %s)", fa, fm, fc, atime1, mtime0, ctime0)
 	}
 
 	// Tar export carries lower data inline without metacopy/redirect xattrs, and

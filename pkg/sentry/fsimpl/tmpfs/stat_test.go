@@ -234,3 +234,40 @@ func TestSetStat(t *testing.T) {
 		})
 	}
 }
+
+func TestDentryTouchAtime(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	oldAtime := linux.NsecToStatxTimestamp(100)
+	if err := fd.SetStat(ctx, vfs.SetStatOptions{Stat: linux.Statx{
+		Mask:  linux.STATX_ATIME,
+		Atime: oldAtime,
+	}}); err != nil {
+		t.Fatalf("SetStat: %v", err)
+	}
+	before, err := fd.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_ALL})
+	if err != nil {
+		t.Fatalf("Stat before: %v", err)
+	}
+
+	fd.Dentry().Impl().(*dentry).TouchAtime(fd.Mount())
+
+	after, err := fd.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_ALL})
+	if err != nil {
+		t.Fatalf("Stat after: %v", err)
+	}
+	if after.Atime.ToNsec() <= before.Atime.ToNsec() {
+		t.Errorf("atime = %d, want > %d", after.Atime.ToNsec(), before.Atime.ToNsec())
+	}
+	if after.Ctime != before.Ctime {
+		t.Errorf("ctime changed: got %+v, want %+v", after.Ctime, before.Ctime)
+	}
+	if after.Mtime != before.Mtime {
+		t.Errorf("mtime changed: got %+v, want %+v", after.Mtime, before.Mtime)
+	}
+}

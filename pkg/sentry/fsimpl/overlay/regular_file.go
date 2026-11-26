@@ -15,6 +15,8 @@
 package overlay
 
 import (
+	"io"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -320,6 +322,34 @@ func (fd *regularFileFD) Epollable() bool {
 	return wrappedFD.Epollable()
 }
 
+// atimeToucher is implemented by upper layer dentries that can update access
+// time without modifying ctime.
+type atimeToucher interface {
+	TouchAtime(mnt *vfs.Mount)
+}
+
+// touchMetacopyAtime updates the upper inode's access time after a read of a
+// metacopy file, honoring O_NOATIME and the overlay mount's atime policy.
+//
+// Preconditions: fd.dentry().isMetacopy() was observed true.
+func (fd *regularFileFD) touchMetacopyAtime() {
+	if fd.vfsfd.StatusFlags()&linux.O_NOATIME != 0 {
+		return
+	}
+	mnt := fd.vfsfd.Mount()
+	if mnt.Options().Flags.NoATime {
+		return
+	}
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return
+	}
+	defer mnt.EndWrite()
+	d := fd.dentry()
+	if at, ok := d.upperVD.Dentry().Impl().(atimeToucher); ok {
+		at.TouchAtime(d.upperVD.Mount())
+	}
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	wrappedFD, err := fd.getCurrentFD(ctx)
@@ -327,7 +357,11 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, err
 	}
 	defer wrappedFD.DecRef(ctx)
-	return wrappedFD.PRead(ctx, dst, offset, opts)
+	n, err := wrappedFD.PRead(ctx, dst, offset, opts)
+	if fd.dentry().isMetacopy() && dst.NumBytes() > 0 && (n > 0 || err == nil || err == io.EOF) {
+		fd.touchMetacopyAtime()
+	}
+	return n, err
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -335,12 +369,17 @@ func (fd *regularFileFD) Read(ctx context.Context, dst usermem.IOSequence, opts 
 	// Hold fd.mu during the read to serialize the file offset.
 	fdIdx := fd.lockIndex()
 	fd.mu.NestedLock(fdIdx)
-	defer fd.mu.NestedUnlock(fdIdx)
 	wrappedFD, err := fd.currentFDLocked(ctx)
 	if err != nil {
+		fd.mu.NestedUnlock(fdIdx)
 		return 0, err
 	}
-	return wrappedFD.Read(ctx, dst, opts)
+	n, err := wrappedFD.Read(ctx, dst, opts)
+	fd.mu.NestedUnlock(fdIdx)
+	if fd.dentry().isMetacopy() && dst.NumBytes() > 0 && (n > 0 || err == nil || err == io.EOF) {
+		fd.touchMetacopyAtime()
+	}
+	return n, err
 }
 
 // PWrite implements vfs.FileDescriptionImpl.PWrite.
