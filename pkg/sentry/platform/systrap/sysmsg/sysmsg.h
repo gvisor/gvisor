@@ -150,6 +150,7 @@ extern uint64_t __export_page_size;
 
 extern uint64_t __export_pr_sched_core;
 extern uint64_t __export_deep_sleep_timeout;
+extern uint64_t __export_stub_start;
 extern struct arch_state __export_arch_state;
 struct context_queue;
 extern struct context_queue* __export_context_queue_addr;
@@ -167,6 +168,11 @@ static void* sysmsg_sp() {
   return sp;
 }
 
+static int valid_sysmsg_sp(void* sp) {
+  return (uintptr_t)sp > __export_stub_start &&
+         (uintptr_t)sp < (uintptr_t)__export_context_queue_addr;
+}
+
 static struct sysmsg* sysmsg_addr(void* sp) {
   return (struct sysmsg*)(sp + MSG_OFFSET_FROM_START);
 }
@@ -179,15 +185,19 @@ long sys_futex(uint32_t* addr, int op, int val, struct __kernel_timespec* tv,
 
 static void __panic(int err, int err_additional, long line) {
   void* sp = sysmsg_sp();
-  struct sysmsg* sysmsg = sysmsg_addr(sp);
-  struct thread_context* ctx = sysmsg->context;
-  sysmsg->err = err;
-  sysmsg->err_additional = err_additional;
-  sysmsg->err_line = line;
-  // Wake up the goroutine waiting on the current context.
-  __atomic_store_n(&ctx->state, CONTEXT_STATE_UNEXPECTED_DEATH,
-                   __ATOMIC_RELEASE);
-  sys_futex(&ctx->state, FUTEX_WAKE, 1, NULL, NULL, 666);
+  if (valid_sysmsg_sp(sp)) {
+    struct sysmsg* sysmsg = sysmsg_addr(sp);
+    struct thread_context* ctx = sysmsg->context;
+    sysmsg->err = err;
+    sysmsg->err_additional = err_additional;
+    sysmsg->err_line = line;
+    if (ctx) {
+      // Wake up the goroutine waiting on the current context.
+      __atomic_store_n(&ctx->state, CONTEXT_STATE_UNEXPECTED_DEATH,
+                       __ATOMIC_RELEASE);
+      sys_futex(&ctx->state, FUTEX_WAKE, 1, NULL, NULL, 666);
+    }
+  }
   // crash the stub process.
   //
   // Normal user processes cannot map addresses lower than vm.mmap_min_addr

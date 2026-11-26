@@ -99,7 +99,8 @@ func (t *thread) clone() (*thread, error) {
 			unix.CLONE_FS |
 			unix.CLONE_PTRACE |
 			unix.CLONE_VM |
-			linux.SIGKILL)
+			unix.CLONE_PARENT |
+			uintptr(unix.SIGCHLD))
 	rval, err := t.syscallIgnoreInterrupt(
 		&t.initRegs,
 		unix.SYS_CLONE,

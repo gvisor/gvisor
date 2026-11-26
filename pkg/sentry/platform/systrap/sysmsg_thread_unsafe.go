@@ -26,10 +26,57 @@ import (
 )
 
 func (p *sysmsgThread) unmapStackFromSentry() {
+	if p.msg == nil {
+		return
+	}
 	errno := hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, sysmsg.MsgToStackAddr(uintptr(unsafe.Pointer(p.msg))), sysmsg.PerThreadSharedStackSize, 0)
 	if errno != 0 {
 		panic("failed to unmap: " + errno.Error())
 	}
+	p.msg = nil
+}
+
+func (p *sysmsgThread) ptraceAttach() error {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_ATTACH, uintptr(p.thread.tid), 0); errno != 0 {
+		return fmt.Errorf("unable to attach to sysmsg thread: %w", errno)
+	}
+	return nil
+}
+
+func (p *sysmsgThread) ptraceContSuppressSignal() error {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(p.thread.tid), 0); errno != 0 {
+		return fmt.Errorf("ptrace cont failed: %w", errno)
+	}
+	return nil
+}
+
+func (p *sysmsgThread) ptraceDetach() error {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(p.thread.tid), 0); errno != 0 {
+		return fmt.Errorf("ptrace detach failed: %w", errno)
+	}
+	return nil
+}
+
+func (p *sysmsgThread) sendSigsegv() error {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(p.thread.tgid), uintptr(p.thread.tid), uintptr(unix.SIGSEGV)); errno != 0 {
+		return fmt.Errorf("tgkill(SIGSEGV) failed: %w", errno)
+	}
+	return nil
+}
+
+func (p *sysmsgThread) sendSigcont() error {
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(p.thread.tgid), uintptr(p.thread.tid), uintptr(unix.SIGCONT)); errno != 0 {
+		return fmt.Errorf("tgkill(SIGCONT) failed: %w", errno)
+	}
+	return nil
+}
+
+func (p *sysmsgThread) unmaskAllSignalsAttached() error {
+	mask := uint64(0)
+	if errno := hostsyscall.RawSyscallErrno6(unix.SYS_PTRACE, linux.PTRACE_SETSIGMASK, uintptr(p.thread.tid), 8, uintptr(unsafe.Pointer(&mask)), 0, 0); errno != 0 {
+		return fmt.Errorf("unable to setmask: %w", errno)
+	}
+	return nil
 }
 
 func (p *sysmsgThread) setMsg(addr uintptr) {

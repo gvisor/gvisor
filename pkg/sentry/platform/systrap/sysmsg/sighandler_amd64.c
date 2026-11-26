@@ -240,7 +240,9 @@ void __export_sighandler(int signo, siginfo_t* siginfo, void* _ucontext) {
   void* sp = sysmsg_sp();
   struct sysmsg* sysmsg = sysmsg_addr(sp);
 
-  if (sysmsg != sysmsg->self) panic(STUB_ERROR_BAD_SYSMSG, 0);
+  if (!valid_sysmsg_sp(sp) || sysmsg != sysmsg->self) {
+    panic(STUB_ERROR_BAD_SYSMSG, 0);
+  }
   int32_t thread_state = atomic_load(&sysmsg->state);
   struct thread_context* ctx = NULL;
   enum context_state ctx_state = CONTEXT_STATE_INVALID;
@@ -442,8 +444,13 @@ static void transition_syshandler_to_sighandler(struct sysmsg* sysmsg) {
 }
 
 void __syshandler() {
-  struct sysmsg* sysmsg;
-  asm volatile("movq %%gs:0, %0\n" : "=r"(sysmsg) : :);
+  void* sp = sysmsg_sp();
+  struct sysmsg* sysmsg = sysmsg_addr(sp);
+  struct sysmsg* gs_sysmsg;
+  asm volatile("movq %%gs:0, %0\n" : "=r"(gs_sysmsg) : :);
+  if (!valid_sysmsg_sp(sp) || sysmsg != gs_sysmsg || sysmsg != sysmsg->self) {
+    panic(STUB_ERROR_BAD_SYSMSG, 0);
+  }
   // SYSMSG_STATE_PREP is set to postpone interrupts. Look at
   // __export_sighandler for more details.
   int state = atomic_load(&sysmsg->state);

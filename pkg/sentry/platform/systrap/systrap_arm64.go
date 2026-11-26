@@ -63,6 +63,10 @@ func initStubArchGlobals(stubSysmsg []byte) {
 	*stubGlobal(stubSysmsg, sysmsg.Sighandler_blob_offset____export_page_size) = uint64(hostarch.PageSize)
 }
 
+func advanceToTrapInstruction(r *arch.Registers) {
+	r.Pc += initRegsRipAdjustment
+}
+
 // pointerAuthWarnOnce is used to ensure a warning about disabling PAC failing is only printed
 // once to avoid console output spam.
 var pointerAuthWarnOnce sync.Once

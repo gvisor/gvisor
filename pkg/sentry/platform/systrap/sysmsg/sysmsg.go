@@ -317,21 +317,19 @@ const (
 
 // Init initializes the message.
 func (m *Msg) Init(threadID uint32) {
-	m.Err = 0
-	m.ErrAdditional = 0
-	m.Line = -1
-	m.ThreadID = threadID
-	m.Context = 0
+	*m = Msg{
+		Line:     -1,
+		ThreadID: threadID,
+	}
 }
 
 // Init initializes the ThreadContext instance.
 func (c *ThreadContext) Init(initialThreadID uint32) {
-	c.FPStateChanged = 1
-	c.Regs = linux.PtraceRegs{}
-	c.Signo = 0
-	c.SignalInfo = linux.SignalInfo{}
-	c.State = ContextStateNone
-	c.ThreadID = initialThreadID
+	*c = ThreadContext{
+		FPStateChanged: 1,
+		State:          ContextStateNone,
+		ThreadID:       initialThreadID,
+	}
 }
 
 // ConvertSysmsgErr converts m.Err to platform.ContextError.

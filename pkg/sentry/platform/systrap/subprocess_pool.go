@@ -16,6 +16,8 @@ package systrap
 
 import (
 	"sync"
+
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 // subprocessPool exists to solve these distinct problems:
@@ -43,14 +45,15 @@ func (p *subprocessPool) markAvailable(s *subprocess) {
 	p.available = append(p.available, s)
 }
 
-func (p *subprocessPool) fetchAvailable() *subprocess {
+func (p *subprocessPool) fetchAvailable(memoryFile *pgalloc.MemoryFile) *subprocess {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.available) > 0 {
-		s := p.available[len(p.available)-1]
-		p.available = p.available[:len(p.available)-1]
-
-		return s
+	for i := len(p.available) - 1; i >= 0; i-- {
+		if p.available[i].memoryFile == memoryFile {
+			s := p.available[i]
+			p.available = append(p.available[:i], p.available[i+1:]...)
+			return s
+		}
 	}
 	return nil
 }

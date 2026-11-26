@@ -108,7 +108,9 @@ void __export_sighandler(int signo, siginfo_t* siginfo, void* _ucontext) {
   void* sp = sysmsg_sp();
   struct sysmsg* sysmsg = sysmsg_addr(sp);
 
-  if (sysmsg != sysmsg->self) panic(STUB_ERROR_BAD_SYSMSG, 0);
+  if (!valid_sysmsg_sp(sp) || sysmsg != sysmsg->self) {
+    panic(STUB_ERROR_BAD_SYSMSG, 0);
+  }
   int32_t thread_state = atomic_load(&sysmsg->state);
 
   uint32_t ctx_state = CONTEXT_STATE_INVALID;

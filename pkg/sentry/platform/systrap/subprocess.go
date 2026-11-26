@@ -152,6 +152,7 @@ type subprocess struct {
 	// threadContextRegion defines the ThreadContext memory region start
 	// within the sentry address space.
 	threadContextRegion uintptr
+	threadContextFR     memmap.FileRange
 
 	// memoryFile is used to allocate a sysmsg stack which is shared between a
 	// stub process and the Sentry.
@@ -180,7 +181,8 @@ type subprocess struct {
 
 	// contextQueue is a queue of all contexts that are ready to switch back to
 	// user mode.
-	contextQueue *contextQueue
+	contextQueue   *contextQueue
+	contextQueueFR memmap.FileRange
 
 	// aliveMu synchronizes active subprocess operations with termination.
 	aliveMu sync.RWMutex
@@ -361,7 +363,7 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 // disablePatching prevents this subprocess from patching syscall
 // instructions in the application's address space.
 func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile, seccompNotify bool, disablePatching bool) (*subprocess, error) {
-	if sp := globalPool.fetchAvailable(); sp != nil {
+	if sp := globalPool.fetchAvailable(memoryFile); sp != nil {
 		sp.subprocessRefs.InitRefs()
 		sp.usertrap = usertrap.New(disablePatching)
 		return sp, nil
@@ -398,14 +400,10 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	}
 
 	go func() { // S/R-SAFE: Platform-related.
-
-		// Wait for requests to create threads.
+		// Wait for requests to create threads until the subprocess is destroyed.
 		for req := range requests {
 			sp.handlePtraceSyscallRequest(req)
 		}
-
-		// Requests should never be closed.
-		panic("unreachable")
 	}()
 
 	sp.unmap()
@@ -460,6 +458,7 @@ func (s *subprocess) mapSharedRegions() {
 	}
 
 	s.contextQueue = contextQueue
+	s.contextQueueFR = contextQueueFR
 
 	// Map thread context region into the sentry.
 	threadContextFR, err := s.memoryFile.Allocate(uint64(stubContextRegionLen), opts)
@@ -490,6 +489,7 @@ func (s *subprocess) mapSharedRegions() {
 	}
 
 	s.threadContextRegion = sentryThreadContextRegionAddr
+	s.threadContextFR = threadContextFR
 }
 
 func (s *subprocess) mapPrivateRegions() {
@@ -525,17 +525,166 @@ func (s *subprocess) Release() {
 	s.DecRef(s.release)
 }
 
+// disableSubprocessPool disables globalPool reuse in benchmarks comparing pool
+// reuse against full subprocess teardown.
+var disableSubprocessPool bool
+
 func (s *subprocess) release() {
-	if s.alive() {
+	if !disableSubprocessPool && s.resetForPool() {
 		globalPool.markAvailable(s)
 		return
 	}
+	s.destroyResources()
+}
+
+func waitThreadKilled(tid int32) {
+	var wstatus unix.WaitStatus
+	for {
+		_, err := unix.Wait4(int(tid), &wstatus, unix.WALL, nil)
+		if err == unix.EINTR || err == unix.EAGAIN {
+			continue
+		}
+		return
+	}
+}
+
+// resetForPool prunes excess sysmsg threads, ptrace-resets the single kept
+// sysmsg thread onto a clean kernel sigframe, and reinitializes shared and
+// private stub regions before returning s to globalPool.
+func (s *subprocess) resetForPool() bool {
+	if !s.alive() || s.contextQueue == nil || s.syscallThread == nil {
+		return false
+	}
+
+	s.kickSysmsgMu.Lock()
+	s.sysmsgThreadsMu.Lock()
+	var kept *sysmsgThread
+	var extras []*sysmsgThread
+	for id, st := range s.sysmsgThreads {
+		if kept == nil {
+			kept = st
+		} else {
+			extras = append(extras, st)
+			delete(s.sysmsgThreads, id)
+		}
+	}
+	if kept != nil {
+		s.numSysmsgThreads = 1
+	} else {
+		s.numSysmsgThreads = 0
+	}
+	s.sysmsgThreadsMu.Unlock()
+	s.kickSysmsgMu.Unlock()
+	if kept == nil {
+		return false
+	}
+
+	munmapFailed := false
+	for _, extra := range extras {
+		extra.thread.kill()
+		waitThreadKilled(extra.thread.tid)
+		if !munmapFailed {
+			if _, err := s.syscall(
+				unix.SYS_MUNMAP,
+				arch.SyscallArgument{Value: extra.sysmsgPerThreadMemAddr()},
+				arch.SyscallArgument{Value: sysmsg.PerThreadMemSize},
+			); err != nil {
+				munmapFailed = true
+			}
+		}
+		extra.unmapStackFromSentry()
+		if extra.stackRange.Length() > 0 {
+			s.memoryFile.DecRef(extra.stackRange)
+		}
+		s.sysmsgStackPool.Put(extra.thread.sysmsgStackID)
+	}
+	if munmapFailed {
+		return false
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := kept.attachForReset(); err != nil {
+		return false
+	}
+
+	// kept is now stopped in the kernel and all extra sysmsg threads have been
+	// reaped, so no stub thread is executing while shared regions are reset.
+	s.contextQueue.init()
+	atomic.StoreUint32(&s.contextQueue.numThreadsToWakeup, 1)
+	if _, err := s.syscall(
+		unix.SYS_MMAP,
+		arch.SyscallArgument{Value: stubSpinningThreadQueueAddr},
+		arch.SyscallArgument{Value: sysmsg.SpinningQueueMemSize},
+		arch.SyscallArgument{Value: unix.PROT_READ | unix.PROT_WRITE},
+		arch.SyscallArgument{Value: unix.MAP_PRIVATE | unix.MAP_ANONYMOUS | unix.MAP_FIXED},
+		arch.SyscallArgument{Value: 0},
+		arch.SyscallArgument{Value: 0},
+	); err != nil {
+		_ = kept.ptraceDetach()
+		return false
+	}
+
+	if err := kept.reinitAttached(s); err != nil {
+		return false
+	}
+
+	s.mu.Lock()
+	clear(s.faultedContexts)
+	s.mu.Unlock()
+	return true
+}
+
+func (s *subprocess) destroyResources() {
+	s.kill()
+	if s.requests != nil {
+		close(s.requests)
+		s.requests = nil
+	}
+
+	s.sysmsgThreadsMu.Lock()
+	threads := make([]*sysmsgThread, 0, len(s.sysmsgThreads))
+	for id, st := range s.sysmsgThreads {
+		threads = append(threads, st)
+		delete(s.sysmsgThreads, id)
+	}
+	s.sysmsgThreadsMu.Unlock()
+	for _, st := range threads {
+		st.thread.kill()
+		waitThreadKilled(st.thread.tid)
+		st.unmapStackFromSentry()
+		if st.stackRange.Length() > 0 && s.memoryFile != nil {
+			s.memoryFile.DecRef(st.stackRange)
+		}
+	}
+
 	if s.syscallThread != nil {
 		if s.syscallThread.seccompNotify != nil {
 			s.syscallThread.seccompNotify.Close()
+			s.syscallThread.seccompNotify = nil
 		}
-		wstatus := unix.WaitStatus(0)
-		unix.Wait4(int(s.syscallThread.thread.tid), &wstatus, unix.WNOHANG, nil)
+		if s.syscallThread.thread != nil {
+			s.syscallThread.thread.kill()
+			waitThreadKilled(s.syscallThread.thread.tid)
+		}
+		unmapSentryRegion(s.syscallThread.sentryAddr, uintptr(s.syscallThread.stackRange.Length()))
+		s.syscallThread.sentryAddr = 0
+		if s.syscallThread.stackRange.Length() > 0 && s.memoryFile != nil {
+			s.memoryFile.DecRef(s.syscallThread.stackRange)
+			s.syscallThread.stackRange = memmap.FileRange{}
+		}
+	}
+
+	s.unmapContextQueueFromSentry()
+	if s.contextQueueFR.Length() > 0 && s.memoryFile != nil {
+		s.memoryFile.DecRef(s.contextQueueFR)
+		s.contextQueueFR = memmap.FileRange{}
+	}
+	unmapSentryRegion(s.threadContextRegion, uintptr(s.threadContextFR.Length()))
+	s.threadContextRegion = 0
+	if s.threadContextFR.Length() > 0 && s.memoryFile != nil {
+		s.memoryFile.DecRef(s.threadContextFR)
+		s.threadContextFR = memmap.FileRange{}
 	}
 }
 
@@ -558,6 +707,22 @@ func (s *subprocess) withAliveRLock(fn func() error) error {
 // This is only done on expected events that indicate we can't proceed using this
 // subprocess (e.g. stub threads unexpectedly die during execution). Well-behaved
 // subprocesses do no call this.
+func (s *subprocess) killWithoutAliveLock() {
+	if s.dead.CompareAndSwap(false, true) {
+		s.wakeAllContexts()
+	}
+	if s.syscallThread != nil && s.syscallThread.thread != nil {
+		s.syscallThread.thread.kill()
+	}
+	s.sysmsgThreadsMu.RLock()
+	for _, st := range s.sysmsgThreads {
+		if st.thread != nil {
+			st.thread.kill()
+		}
+	}
+	s.sysmsgThreadsMu.RUnlock()
+}
+
 func (s *subprocess) kill() {
 	if !s.dead.CompareAndSwap(false, true) {
 		return
@@ -571,9 +736,7 @@ func (s *subprocess) kill() {
 	s.aliveMu.Lock()
 	defer s.aliveMu.Unlock()
 
-	if s.syscallThread != nil && s.syscallThread.thread != nil {
-		s.syscallThread.thread.kill()
-	}
+	s.killWithoutAliveLock()
 }
 
 // attach attaches to the thread.
@@ -1243,12 +1406,7 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 	}
 
 	sysThread.setMsg(sysmsg.StackAddrToMsg(sentryStackAddr))
-	sysThread.msg.Init(threadID)
-	sysThread.msg.Self = uint64(sysmsgStackAddr + sysmsg.MsgOffsetFromSharedStack)
-	sysThread.msg.SyshandlerStack = uint64(sysmsg.StackAddrToSyshandlerStack(sysThread.sysmsgPerThreadMemAddr()))
-	sysThread.msg.Syshandler = uint64(stubSysmsgStart + uintptr(sysmsg.Sighandler_blob_offset____export_syshandler))
-
-	sysThread.msg.State.Set(sysmsg.ThreadStateInitializing)
+	sysThread.resetMsg(sysmsg.ThreadStateInitializing)
 
 	if err := unix.Setpriority(unix.PRIO_PROCESS, int(p.tid), sysmsgThreadPriority); err != nil {
 		log.Warningf("Unable to change priority of a stub thread: %s", err)

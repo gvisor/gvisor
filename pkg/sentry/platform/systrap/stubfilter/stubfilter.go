@@ -79,7 +79,8 @@ func StubProcess(vars precompiledseccomp.Values) *seccomp.Program {
 						unix.CLONE_FS |
 						unix.CLONE_VM |
 						unix.CLONE_PTRACE |
-						linux.SIGKILL)},
+						unix.CLONE_PARENT |
+						unix.SIGCHLD)},
 			},
 
 			// For the initial process creation.

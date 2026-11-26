@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -54,6 +55,104 @@ type sysmsgThread struct {
 // space.
 func (p *sysmsgThread) sysmsgPerThreadMemAddr() uintptr {
 	return stubSysmsgStack + sysmsg.PerThreadMemSize*uintptr(p.thread.sysmsgStackID)
+}
+
+func (p *sysmsgThread) msgAddr() uintptr {
+	return p.sysmsgPerThreadMemAddr() + sysmsg.PerThreadSharedStackOffset + sysmsg.MsgOffsetFromSharedStack
+}
+
+func (p *sysmsgThread) resetMsg(state sysmsg.ThreadState) {
+	p.msg.Init(uint32(p.thread.sysmsgStackID))
+	p.msg.Self = uint64(p.msgAddr())
+	p.msg.SyshandlerStack = uint64(sysmsg.StackAddrToSyshandlerStack(p.sysmsgPerThreadMemAddr()))
+	p.msg.Syshandler = uint64(stubSysmsgStart + uintptr(sysmsg.Sighandler_blob_offset____export_syshandler))
+	p.msg.State.Set(state)
+}
+
+// attachForReset attaches ptrace to p.thread and drains any pending signals
+// until the PTRACE_ATTACH SIGSTOP is observed.
+//
+// Preconditions: Caller must hold runtime.LockOSThread().
+func (p *sysmsgThread) attachForReset() error {
+	if err := p.ptraceAttach(); err != nil {
+		return err
+	}
+	for {
+		sig, err := p.thread.wait(stopped)
+		if err != nil {
+			p.ptraceDetach()
+			return err
+		}
+		if sig == unix.SIGSTOP {
+			break
+		}
+		if err := p.ptraceContSuppressSignal(); err != nil {
+			p.ptraceDetach()
+			return err
+		}
+	}
+	if err := p.thread.init(); err != nil {
+		p.ptraceDetach()
+		return err
+	}
+	return nil
+}
+
+// reinitAttached drains any signals that were blocked while p was inside
+// sighandler, resets p's sysmsg struct and registers, queues SIGSEGV so it
+// re-enters __export_sighandler on a fresh kernel sigframe, and detaches ptrace.
+//
+// Preconditions: p must be attached via attachForReset on the locked OS thread.
+func (p *sysmsgThread) reinitAttached(s *subprocess) error {
+	if err := p.unmaskAllSignalsAttached(); err != nil {
+		p.ptraceDetach()
+		return err
+	}
+	trapRegs := s.sysmsgInitRegs
+	advanceToTrapInstruction(&trapRegs)
+	if err := p.thread.setRegs(&trapRegs); err != nil {
+		p.ptraceDetach()
+		return err
+	}
+	for {
+		if err := p.ptraceContSuppressSignal(); err != nil {
+			p.ptraceDetach()
+			return err
+		}
+		sig, err := p.thread.wait(stopped)
+		if err != nil {
+			p.ptraceDetach()
+			return err
+		}
+		if sig == unix.SIGTRAP {
+			var si linux.SignalInfo
+			if err := p.thread.getSignalInfo(&si); err != nil {
+				p.ptraceDetach()
+				return err
+			}
+			if si.Code > 0 {
+				break
+			}
+		}
+	}
+
+	p.resetMsg(sysmsg.ThreadStateInitializing)
+	tregs := &arch.Registers{}
+	s.resetSysemuRegs(tregs)
+	setArchSpecificRegs(p, tregs)
+	if err := p.thread.setRegs(tregs); err != nil {
+		p.ptraceDetach()
+		return err
+	}
+	if err := p.sendSigsegv(); err != nil {
+		p.ptraceDetach()
+		return err
+	}
+	if err := p.sendSigcont(); err != nil {
+		p.ptraceDetach()
+		return err
+	}
+	return p.ptraceDetach()
 }
 
 // mapStack maps a sysmsg stack into the thread address space.
