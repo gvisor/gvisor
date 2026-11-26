@@ -56,6 +56,7 @@ go_test(
         "container_test.go",
         "devices_test.go",
         "fscheckpoint_cordon_test.go",
+        "metacopy_test.go",
         "metric_server_test.go",
         "multi_container_save_restore_test.go",
         "multi_container_test.go",
