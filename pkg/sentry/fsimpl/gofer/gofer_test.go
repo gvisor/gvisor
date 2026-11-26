@@ -59,7 +59,7 @@ func TestDestroyIdempotent(t *testing.T) {
 			Mode: linux.S_IFDIR | 0666,
 		},
 	}
-	parent, err := fs.newLisafsDentry(ctx, &parentInode)
+	parent, err := fs.newLisafsDentry(ctx, &parentInode, false /* created */)
 	if err != nil {
 		t.Fatalf("fs.newDentry(): %v", err)
 	}
@@ -73,7 +73,7 @@ func TestDestroyIdempotent(t *testing.T) {
 		},
 	}
 
-	child, err := fs.newLisafsDentry(ctx, &childInode)
+	child, err := fs.newLisafsDentry(ctx, &childInode, false /* created */)
 	if err != nil {
 		t.Fatalf("fs.newDentry(): %v", err)
 	}
@@ -214,6 +214,31 @@ type recycledInoConnImpl struct {
 	mu         sync.Mutex
 	rootStat   lisafs.Statx
 	targetStat lisafs.Statx
+
+	// openHostFD and createHostFD, when non-negative, are host FDs whose
+	// duplicates are donated by Open and OpenCreate respectively.
+	openHostFD   int
+	createHostFD int
+}
+
+func (s *recycledInoConnImpl) setHostFDs(openHostFD, createHostFD int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.openHostFD = openHostFD
+	s.createHostFD = createHostFD
+}
+
+// donateHostFD returns a duplicate of hostFD for donation to the client, or -1
+// if hostFD is negative. The server closes donated FDs after sending them.
+func donateHostFD(hostFD int) int {
+	if hostFD < 0 {
+		return -1
+	}
+	dupFD, err := unix.Dup(hostFD)
+	if err != nil {
+		return -1
+	}
+	return dupFD
 }
 
 func (s *recycledInoConnImpl) getTargetStat() lisafs.Statx {
@@ -249,6 +274,7 @@ func (s *recycledInoConnImpl) SupportedMessages() []lisafs.MID {
 		lisafs.Walk,
 		lisafs.WalkStat,
 		lisafs.OpenAt,
+		lisafs.OpenCreateAt,
 		lisafs.Close,
 		lisafs.Flush,
 	}
@@ -320,7 +346,41 @@ func (fd *recycledInoControlFD) WalkStat(path lisafs.StringArray, recordStat fun
 func (fd *recycledInoControlFD) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 	ofd := &recycledInoOpenFD{stat: fd.stat}
 	ofd.Init(fd.FD(), flags, ofd)
-	return &ofd.OpenFD, -1, nil
+	fd.connImpl.mu.Lock()
+	hostFD := fd.connImpl.openHostFD
+	fd.connImpl.mu.Unlock()
+	return &ofd.OpenFD, donateHostFD(hostFD), nil
+}
+
+// OpenCreate creates a child of the root. The new file reports the current
+// target stat, which lets a test make the host recycle the inode number of
+// "target" for the created file.
+//
+// +checklocksread:fd.ControlFD.conn.server.renameMu
+// +checklocksexclude:fd.ControlFD.conn.fdsMu
+func (fd *recycledInoControlFD) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lisafs.GID, name string, flags uint32) (*lisafs.ControlFD, lisafs.Statx, *lisafs.OpenFD, int, error) {
+	if !fd.isRoot || name == "target" || name == "target_link" {
+		return nil, lisafs.Statx{}, nil, -1, unix.EEXIST
+	}
+	st := fd.connImpl.getTargetStat()
+	var childNode *lisafs.Node
+	fd.Node().WithChildrenMu(func() {
+		childNode = fd.Node().LookupChildLocked(name)
+		if childNode == nil {
+			childNode = &lisafs.Node{}
+			childNode.InitLocked(name, fd.Node())
+		} else {
+			childNode.IncRef()
+		}
+	})
+	child := &recycledInoControlFD{connImpl: fd.connImpl, stat: st}
+	child.Init(fd.Conn(), childNode, linux.FileMode(st.Mode), child) // +checklocksignore
+	ofd := &recycledInoOpenFD{stat: st}
+	ofd.Init(child.FD(), flags, ofd)
+	fd.connImpl.mu.Lock()
+	hostFD := fd.connImpl.createHostFD
+	fd.connImpl.mu.Unlock()
+	return child.FD(), st, &ofd.OpenFD, donateHostFD(hostFD), nil
 }
 
 type recycledInoOpenFD struct {
@@ -352,9 +412,13 @@ func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts 
 	t.Cleanup(func() { srv.Destroy() })
 
 	connImpl := &recycledInoConnImpl{
+		openHostFD:   -1,
+		createHostFD: -1,
 		rootStat: lisafs.Statx{
-			Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO,
-			Mode:     linux.S_IFDIR | 0755,
+			Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO,
+			// World-writable: the test credentials are nobody with no
+			// capabilities, and the root's owner is the mount's dfltuid.
+			Mode:     linux.S_IFDIR | 0777,
 			DevMajor: 0,
 			DevMinor: 1,
 			Ino:      1,
@@ -795,5 +859,83 @@ func TestValidateRestoredFileType(t *testing.T) {
 				t.Errorf("validateRestoredFileType(%#o, %d, %d) = %v, want vfs.ErrCorruption", test.restoredMode, test.restoredRdev[0], test.restoredRdev[1], err)
 			}
 		})
+	}
+}
+
+// TestOpenCreateRecycledInoSameType reproduces host inode number recycling
+// between two regular files: the host unlinks an open file and creates a new
+// regular file with the same (dev, ino), which the sandbox then creates a
+// name for with O_CREAT|O_EXCL. The created file must get its own inode; the
+// still-open inode of the deleted file must keep its host FDs.
+func TestOpenCreateRecycledInoSameType(t *testing.T) {
+	regStat := lisafs.Statx{
+		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO | linux.STATX_SIZE,
+		Mode:     linux.S_IFREG | 0644,
+		DevMajor: 0,
+		DevMinor: 1,
+		Ino:      42,
+		Size:     64,
+	}
+	ctx, creds, connImpl, vfsObj, root := mountTestLisafsFS(t, regStat)
+
+	fileA, err := unix.MemfdCreate("fileA", 0)
+	if err != nil {
+		t.Fatalf("MemfdCreate(fileA): %v", err)
+	}
+	t.Cleanup(func() { unix.Close(fileA) })
+	fileB, err := unix.MemfdCreate("fileB", 0)
+	if err != nil {
+		t.Fatalf("MemfdCreate(fileB): %v", err)
+	}
+	t.Cleanup(func() { unix.Close(fileB) })
+	connImpl.setHostFDs(fileA, fileB)
+
+	// 1. Open "/target" (ino=42, backed by fileA) and keep it open, so its
+	// inode stays in fs.inodeByKey with the donated host FD installed.
+	targetPop := vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse("target"),
+	}
+	fdA, err := vfsObj.OpenAt(ctx, creds, &targetPop, &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	if err != nil {
+		t.Fatalf("OpenAt(target): %v", err)
+	}
+	defer fdA.DecRef(ctx)
+	inodeA := fdA.Impl().(*regularFileFD).dentry().inode
+	mmapFDA := inodeA.mmapFD.Load()
+	if mmapFDA < 0 {
+		t.Fatalf("OpenAt(target): inode has no host mmap FD; fixture did not donate one")
+	}
+
+	// 2. The host unlinks "/target" and creates a new regular file backed by
+	// fileB that reuses st_ino=42. The sentry observes nothing.
+	//
+	// 3. The sandbox creates "/created" with O_CREAT|O_EXCL. The host assigns
+	// it ino=42. This reaches createAndOpenChildLocked, whose new inode must
+	// not be the still-open inode of the deleted file.
+	createdPop := vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse("created"),
+	}
+	fdB, err := vfsObj.OpenAt(ctx, creds, &createdPop, &vfs.OpenOptions{
+		Flags: linux.O_RDWR | linux.O_CREAT | linux.O_EXCL,
+		Mode:  0644,
+	})
+	if err != nil {
+		t.Fatalf("OpenAt(created, O_CREAT|O_EXCL): %v", err)
+	}
+	defer fdB.DecRef(ctx)
+	inodeB := fdB.Impl().(*regularFileFD).dentry().inode
+
+	if inodeA == inodeB {
+		t.Errorf("created file shares the inode of the open deleted file")
+	}
+	if got := inodeA.mmapFD.Load(); got != mmapFDA {
+		t.Errorf("open deleted file's mmapFD changed from %d to %d", mmapFDA, got)
+	}
+	if got := inodeA.mmapFile.FD(); got != int(mmapFDA) {
+		t.Errorf("open deleted file's mmapFile.FD() = %d, want %d", got, mmapFDA)
 	}
 }

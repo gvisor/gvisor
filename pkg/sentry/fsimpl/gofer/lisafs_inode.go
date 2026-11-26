@@ -102,8 +102,11 @@ type lisafsInode struct {
 //     If not, it creates a new inode representing the given file and takes
 //     ownership of controlFD.
 //
+// created is true if the caller just created the file on the host; see
+// filesystem.getOrCreateInode.
+//
 // newLisafsDentry takes ownership of ino.
-func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*dentry, error) {
+func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode, created bool) (*dentry, error) {
 	if ino.Stat.Mask&linux.STATX_TYPE == 0 {
 		ctx.Warningf("can't create gofer.inode without file type")
 		fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
@@ -136,7 +139,7 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 	// different paths (e.g., /mnt/ and /mnt/a/b/c if /mnt/a/b/c is a bind mount of /mnt/)
 	// can return the same device ID and inode number from a stat call.
 	var cacheHit bool
-	temp.d.inode = fs.getOrCreateInode(inoKey, fileType, isDir, /* dontCache */
+	temp.d.inode = fs.getOrCreateInode(inoKey, fileType, isDir /* dontCache */, created,
 		func() {
 			cacheHit = true
 			fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
@@ -380,7 +383,7 @@ func (i *lisafsInode) getRemoteChild(ctx context.Context, name string) (*dentry,
 	if err != nil {
 		return nil, err
 	}
-	return i.fs.newLisafsDentry(ctx, &childInode)
+	return i.fs.newLisafsDentry(ctx, &childInode, false /* created */)
 }
 
 // Preconditions:
@@ -451,7 +454,7 @@ func (i *lisafsInode) getRemoteChildAndWalkPathLocked(ctx context.Context, rp re
 		} else {
 			// Create and cache the new dentry.
 			var err error
-			child, err = d.inode.fs.newLisafsDentry(ctx, &inodes[i])
+			child, err = d.inode.fs.newLisafsDentry(ctx, &inodes[i], false /* created */)
 			if err != nil {
 				dentryCreationErr = err
 				curParentUnlock()
@@ -478,8 +481,11 @@ func (i *lisafsInode) getRemoteChildAndWalkPathLocked(ctx context.Context, rp re
 	return ret, dentryCreationErr
 }
 
-func (i *lisafsInode) newChildDentry(ctx context.Context, childIno *lisafs.Inode, childName string) (*dentry, error) {
-	child, err := i.fs.newLisafsDentry(ctx, childIno)
+// newChildDentry wraps newLisafsDentry for a child that this call just added
+// to the host directory, unlinking it again on failure. created is false only
+// for hard links, which share an existing inode rather than creating one.
+func (i *lisafsInode) newChildDentry(ctx context.Context, childIno *lisafs.Inode, childName string, created bool) (*dentry, error) {
+	child, err := i.fs.newLisafsDentry(ctx, childIno, created)
 	if err != nil {
 		if err := i.controlFD.UnlinkAt(ctx, childName, 0 /* flags */); err != nil {
 			log.Warningf("failed to clean up created child %q after newDentry() failed: %v", childName, err)
@@ -494,7 +500,7 @@ func (i *lisafsInode) mknod(ctx context.Context, name string, creds *auth.Creden
 		if err != nil {
 			return nil, err
 		}
-		return i.newChildDentry(ctx, &childInode, name)
+		return i.newChildDentry(ctx, &childInode, name, true /* created */)
 	}
 
 	// This mknod(2) is coming from unix bind(2), as opts.Endpoint is set.
@@ -511,7 +517,7 @@ func (i *lisafsInode) mknod(ctx context.Context, name string, creds *auth.Creden
 		i.fs.client.CloseFD(ctx, childInode.ControlFD, false /* flush */)
 		return nil, err
 	}
-	child, err := i.newChildDentry(ctx, &childInode, name)
+	child, err := i.newChildDentry(ctx, &childInode, name, true /* created */)
 	if err != nil {
 		hbep.ResetBoundSocketFD(ctx)
 		return nil, err
@@ -528,7 +534,7 @@ func (i *lisafsInode) link(ctx context.Context, target *lisafsInode, name string
 	if err != nil {
 		return nil, err
 	}
-	return i.newChildDentry(ctx, &linkInode, name)
+	return i.newChildDentry(ctx, &linkInode, name, false /* created */)
 }
 
 func (i *lisafsInode) mkdir(ctx context.Context, name string, mode linux.FileMode, uid auth.KUID, gid auth.KGID, createDentry bool) (*dentry, error) {
@@ -539,7 +545,7 @@ func (i *lisafsInode) mkdir(ctx context.Context, name string, mode linux.FileMod
 	if !createDentry {
 		return nil, nil
 	}
-	return i.newChildDentry(ctx, &childDirInode, name)
+	return i.newChildDentry(ctx, &childDirInode, name, true /* created */)
 }
 
 func (i *lisafsInode) symlink(ctx context.Context, name, target string, creds *auth.Credentials) (*dentry, error) {
@@ -547,7 +553,7 @@ func (i *lisafsInode) symlink(ctx context.Context, name, target string, creds *a
 	if err != nil {
 		return nil, err
 	}
-	return i.newChildDentry(ctx, &symlinkInode, name)
+	return i.newChildDentry(ctx, &symlinkInode, name, true /* created */)
 }
 
 func (i *lisafsInode) openCreate(ctx context.Context, name string, flags uint32, mode linux.FileMode, uid auth.KUID, gid auth.KGID, createDentry bool) (*dentry, handle, error) {
@@ -563,7 +569,7 @@ func (i *lisafsInode) openCreate(ctx context.Context, name string, flags uint32,
 	if !createDentry {
 		return nil, h, nil
 	}
-	child, err := i.fs.newLisafsDentry(ctx, &ino)
+	child, err := i.fs.newLisafsDentry(ctx, &ino, true /* created */)
 	if err != nil {
 		h.close(ctx)
 		return nil, noHandle, err

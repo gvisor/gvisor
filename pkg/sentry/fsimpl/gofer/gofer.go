@@ -300,11 +300,23 @@ type filesystem struct {
 // inode-number reuse race (last writer takes the slot, degrading a later walk
 // to another miss rather than panicking).
 //
+// If created is true, the caller has just created the file on the host (via
+// O_CREAT|O_EXCL, mkdir, mknod, symlink, ...), so no live host file can share
+// its inoKey. A cached inode under that key is then necessarily stale: the
+// host unlinked the file it describes and recycled its inode number while the
+// sentry still holds the inode open. Such an inode must never be shared with
+// the new file -- its open host FDs, page cache and memory mappings belong to
+// the deleted file -- so the lookup is skipped and the new inode takes over
+// the cache slot. The stale inode drops out of the cache on its own when its
+// last reference goes away (inode.destroyLocked only deletes the key if it
+// still maps to that inode). Hard links are not creations in this sense: they
+// legitimately share an existing inode, so link() passes created=false.
+//
 // If a miss, `createInode` is called and the result is cached. If a hit,
 // `onCacheHit` is called. This path locks fs.inodeMu.
 //
 // The caller is responsible for decrementing the inode's reference count when done.
-func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache bool, onCacheHit func(), createInode func() *inode) *inode {
+func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache bool, created bool, onCacheHit func(), createInode func() *inode) *inode {
 	if dontCache {
 		// Create a new inode and return it bypassing the cache. This is used for
 		// creating inodes that are not meant to be shared across dentries.
@@ -312,10 +324,12 @@ func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache
 	}
 	fs.inodeMu.Lock()
 	defer fs.inodeMu.Unlock()
-	if cachedInode, ok := fs.inodeByKey[inoKey]; ok && cachedInode.fileType() == fileType {
-		onCacheHit()
-		cachedInode.incRef()
-		return cachedInode
+	if !created {
+		if cachedInode, ok := fs.inodeByKey[inoKey]; ok && cachedInode.fileType() == fileType {
+			onCacheHit()
+			cachedInode.incRef()
+			return cachedInode
+		}
 	}
 	inode := createInode()
 	fs.inodeByKey[inoKey] = inode
@@ -705,7 +719,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if fs.opts.directfs.enabled {
 		fs.root, err = fs.getDirectfsRootDentry(ctx, rootHostFD, fs.client.NewFD(rootInode.ControlFD))
 	} else {
-		fs.root, err = fs.newLisafsDentry(ctx, &rootInode)
+		fs.root, err = fs.newLisafsDentry(ctx, &rootInode, false /* created */)
 	}
 	if err != nil {
 		fs.vfsfs.DecRef(ctx)
