@@ -300,17 +300,13 @@ type filesystem struct {
 // inode-number reuse race (last writer takes the slot, degrading a later walk
 // to another miss rather than panicking).
 //
-// If created is true, the caller has just created the file on the host (via
-// O_CREAT|O_EXCL, mkdir, mknod, symlink, ...), so no live host file can share
-// its inoKey. A cached inode under that key is then necessarily stale: the
-// host unlinked the file it describes and recycled its inode number while the
-// sentry still holds the inode open. Such an inode must never be shared with
-// the new file -- its open host FDs, page cache and memory mappings belong to
-// the deleted file -- so the lookup is skipped and the new inode takes over
-// the cache slot. The stale inode drops out of the cache on its own when its
-// last reference goes away (inode.destroyLocked only deletes the key if it
-// still maps to that inode). Hard links are not creations in this sense: they
-// legitimately share an existing inode, so link() passes created=false.
+// If created is true, the caller has just created the file on the host, so a
+// cached inode under its inoKey describes a file that the host has since
+// unlinked and whose inode number it recycled. The lookup is skipped, and the
+// new inode takes the cache slot; the superseded inode leaves the cache when
+// its last dentry is destroyed (dentry.destroyLocked deletes the key only if
+// it still maps to that inode). A hard link is not a creation: it shares the
+// target's inode.
 //
 // If a miss, `createInode` is called and the result is cached. If a hit,
 // `onCacheHit` is called. This path locks fs.inodeMu.
@@ -324,12 +320,10 @@ func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache
 	}
 	fs.inodeMu.Lock()
 	defer fs.inodeMu.Unlock()
-	if !created {
-		if cachedInode, ok := fs.inodeByKey[inoKey]; ok && cachedInode.fileType() == fileType {
-			onCacheHit()
-			cachedInode.incRef()
-			return cachedInode
-		}
+	if cachedInode, ok := fs.inodeByKey[inoKey]; ok && !created && cachedInode.fileType() == fileType {
+		onCacheHit()
+		cachedInode.incRef()
+		return cachedInode
 	}
 	inode := createInode()
 	fs.inodeByKey[inoKey] = inode

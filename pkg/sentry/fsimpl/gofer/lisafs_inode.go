@@ -98,9 +98,9 @@ type lisafsInode struct {
 //     initially has no references, but is not cached; it is the caller's
 //     responsibility to set the dentry's reference count and/or call.
 //     dentry.checkCachingLocked() as appropriate.
-//  2. newLisafsDentry checks if there is a corresponding inode in the cache.
-//     If not, it creates a new inode representing the given file and takes
-//     ownership of controlFD.
+//  2. newLisafsDentry checks if there is a corresponding inode in the cache,
+//     unless created is true. If not, it creates a new inode representing the
+//     given file and takes ownership of controlFD.
 //
 // created is true if the caller just created the file on the host; see
 // filesystem.getOrCreateInode.
@@ -482,8 +482,9 @@ func (i *lisafsInode) getRemoteChildAndWalkPathLocked(ctx context.Context, rp re
 }
 
 // newChildDentry wraps newLisafsDentry for a child that this call just added
-// to the host directory, unlinking it again on failure. created is false only
-// for hard links, which share an existing inode rather than creating one.
+// to the host directory, unlinking it again on failure. created is false if
+// the child is a hard link to an existing file; see
+// filesystem.getOrCreateInode.
 func (i *lisafsInode) newChildDentry(ctx context.Context, childIno *lisafs.Inode, childName string, created bool) (*dentry, error) {
 	child, err := i.fs.newLisafsDentry(ctx, childIno, created)
 	if err != nil {

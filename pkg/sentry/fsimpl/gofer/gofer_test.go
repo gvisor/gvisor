@@ -865,77 +865,111 @@ func TestValidateRestoredFileType(t *testing.T) {
 // TestOpenCreateRecycledInoSameType reproduces host inode number recycling
 // between two regular files: the host unlinks an open file and creates a new
 // regular file with the same (dev, ino), which the sandbox then creates a
-// name for with O_CREAT|O_EXCL. The created file must get its own inode; the
-// still-open inode of the deleted file must keep its host FDs.
+// name for with O_CREAT|O_EXCL. The created file must get its own inode and
+// its own host FD; the still-open inode of the deleted file must keep its
+// host FDs and metadata.
 func TestOpenCreateRecycledInoSameType(t *testing.T) {
-	regStat := lisafs.Statx{
-		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO | linux.STATX_SIZE,
-		Mode:     linux.S_IFREG | 0644,
-		DevMajor: 0,
-		DevMinor: 1,
-		Ino:      42,
-		Size:     64,
-	}
-	ctx, creds, connImpl, vfsObj, root := mountTestLisafsFS(t, regStat)
+	for _, tc := range []struct {
+		name      string
+		mountOpts string
+	}{
+		{name: "regularFileFD"},
+		{name: "specialFileFD", mountOpts: moptDisableFileHandleSharing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			regStat := lisafs.Statx{
+				Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO | linux.STATX_SIZE,
+				Mode:     linux.S_IFREG | 0644,
+				DevMajor: 0,
+				DevMinor: 1,
+				Ino:      42,
+				Size:     64,
+			}
+			ctx, creds, connImpl, vfsObj, root := mountTestLisafsFSWithOpts(t, regStat, tc.mountOpts)
 
-	fileA, err := unix.MemfdCreate("fileA", 0)
-	if err != nil {
-		t.Fatalf("MemfdCreate(fileA): %v", err)
-	}
-	t.Cleanup(func() { unix.Close(fileA) })
-	fileB, err := unix.MemfdCreate("fileB", 0)
-	if err != nil {
-		t.Fatalf("MemfdCreate(fileB): %v", err)
-	}
-	t.Cleanup(func() { unix.Close(fileB) })
-	connImpl.setHostFDs(fileA, fileB)
+			fileA, err := unix.MemfdCreate("fileA", 0)
+			if err != nil {
+				t.Fatalf("MemfdCreate(fileA): %v", err)
+			}
+			t.Cleanup(func() { unix.Close(fileA) })
+			fileB, err := unix.MemfdCreate("fileB", 0)
+			if err != nil {
+				t.Fatalf("MemfdCreate(fileB): %v", err)
+			}
+			t.Cleanup(func() { unix.Close(fileB) })
+			connImpl.setHostFDs(fileA, fileB)
 
-	// 1. Open "/target" (ino=42, backed by fileA) and keep it open, so its
-	// inode stays in fs.inodeByKey with the donated host FD installed.
-	targetPop := vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse("target"),
-	}
-	fdA, err := vfsObj.OpenAt(ctx, creds, &targetPop, &vfs.OpenOptions{Flags: linux.O_RDONLY})
-	if err != nil {
-		t.Fatalf("OpenAt(target): %v", err)
-	}
-	defer fdA.DecRef(ctx)
-	inodeA := fdA.Impl().(*regularFileFD).dentry().inode
-	mmapFDA := inodeA.mmapFD.Load()
-	if mmapFDA < 0 {
-		t.Fatalf("OpenAt(target): inode has no host mmap FD; fixture did not donate one")
-	}
+			// 1. Open "/target" (ino=42, size 64, backed by fileA) and keep it
+			// open, so its inode stays in fs.inodeByKey with the donated host
+			// FD installed.
+			targetPop := vfs.PathOperation{
+				Root:  root,
+				Start: root,
+				Path:  fspath.Parse("target"),
+			}
+			fdA, err := vfsObj.OpenAt(ctx, creds, &targetPop, &vfs.OpenOptions{Flags: linux.O_RDONLY})
+			if err != nil {
+				t.Fatalf("OpenAt(target): %v", err)
+			}
+			defer fdA.DecRef(ctx)
+			inodeA := fdA.Dentry().Impl().(*dentry).inode
+			mmapFDA := inodeA.mmapFD.Load()
+			if tc.mountOpts == "" && mmapFDA < 0 {
+				t.Fatalf("OpenAt(target): inode has no host mmap FD; fixture did not donate one")
+			}
 
-	// 2. The host unlinks "/target" and creates a new regular file backed by
-	// fileB that reuses st_ino=42. The sentry observes nothing.
-	//
-	// 3. The sandbox creates "/created" with O_CREAT|O_EXCL. The host assigns
-	// it ino=42. This reaches createAndOpenChildLocked, whose new inode must
-	// not be the still-open inode of the deleted file.
-	createdPop := vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse("created"),
-	}
-	fdB, err := vfsObj.OpenAt(ctx, creds, &createdPop, &vfs.OpenOptions{
-		Flags: linux.O_RDWR | linux.O_CREAT | linux.O_EXCL,
-		Mode:  0644,
-	})
-	if err != nil {
-		t.Fatalf("OpenAt(created, O_CREAT|O_EXCL): %v", err)
-	}
-	defer fdB.DecRef(ctx)
-	inodeB := fdB.Impl().(*regularFileFD).dentry().inode
+			// 2. The host unlinks "/target" and creates a new, empty regular
+			// file backed by fileB that reuses st_ino=42. The sentry observes
+			// nothing.
+			emptyStat := regStat
+			emptyStat.Size = 0
+			connImpl.setTargetStat(emptyStat)
 
-	if inodeA == inodeB {
-		t.Errorf("created file shares the inode of the open deleted file")
-	}
-	if got := inodeA.mmapFD.Load(); got != mmapFDA {
-		t.Errorf("open deleted file's mmapFD changed from %d to %d", mmapFDA, got)
-	}
-	if got := inodeA.mmapFile.FD(); got != int(mmapFDA) {
-		t.Errorf("open deleted file's mmapFile.FD() = %d, want %d", got, mmapFDA)
+			// 3. The sandbox creates "/created" with O_CREAT|O_EXCL. The host
+			// assigns it ino=42. This reaches createAndOpenChildLocked, whose
+			// new inode must not be the still-open inode of the deleted file.
+			createdPop := vfs.PathOperation{
+				Root:  root,
+				Start: root,
+				Path:  fspath.Parse("created"),
+			}
+			fdB, err := vfsObj.OpenAt(ctx, creds, &createdPop, &vfs.OpenOptions{
+				Flags: linux.O_RDWR | linux.O_CREAT | linux.O_EXCL,
+				Mode:  0644,
+			})
+			if err != nil {
+				t.Fatalf("OpenAt(created, O_CREAT|O_EXCL): %v", err)
+			}
+			defer fdB.DecRef(ctx)
+			inodeB := fdB.Dentry().Impl().(*dentry).inode
+
+			if inodeA == inodeB {
+				t.Fatalf("created file shares the inode of the open deleted file")
+			}
+			if got := inodeA.size.Load(); got != 64 {
+				t.Errorf("open deleted file's size changed from 64 to %d", got)
+			}
+			if got := inodeB.size.Load(); got != 0 {
+				t.Errorf("created file's size = %d, want 0", got)
+			}
+			if tc.mountOpts != "" {
+				return
+			}
+			if got := inodeA.mmapFD.Load(); got != mmapFDA {
+				t.Errorf("open deleted file's mmapFD changed from %d to %d", mmapFDA, got)
+			}
+			if got := inodeA.mmapFile.FD(); got != int(mmapFDA) {
+				t.Errorf("open deleted file's mmapFile.FD() = %d, want %d", got, mmapFDA)
+			}
+			if got := inodeB.mmapFD.Load(); got < 0 || got == mmapFDA {
+				t.Errorf("created file's mmapFD = %d, want a host FD other than %d", got, mmapFDA)
+			}
+			if got := inodeB.readFD.Load(); got != inodeB.mmapFD.Load() {
+				t.Errorf("created file's readFD = %d, want %d", got, inodeB.mmapFD.Load())
+			}
+			if got := inodeB.writeFD.Load(); got != inodeB.mmapFD.Load() {
+				t.Errorf("created file's writeFD = %d, want %d", got, inodeB.mmapFD.Load())
+			}
+		})
 	}
 }
