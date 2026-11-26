@@ -498,11 +498,12 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 }
 
 // StartSubcontainer starts running a sub-container inside the sandbox.
-func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error {
+// It reports whether the restored kernel started.
+func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) (bool, error) {
 	log.Debugf("Start sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.Load())
 
 	if err := s.configureStdios(conf, stdios); err != nil {
-		return err
+		return false, err
 	}
 	s.fixPidns(spec)
 
@@ -511,7 +512,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 		var err error
 		rootfsUpperTarFile, err = os.OpenFile(path, rootfsUpperTarFlags(path), 0644)
 		if err != nil {
-			return fmt.Errorf("opening rootfs upper tar file: %v", err)
+			return false, fmt.Errorf("opening rootfs upper tar file: %v", err)
 		}
 	}
 	if rootfsUpperTarFile != nil {
@@ -550,12 +551,9 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 	// may be the last container that the restore was waiting for.
 	var reply sentryapi.RestoreReply
 	if err := s.call(sentryapi.ContMgrStartSubcontainer, &args, &reply); err != nil {
-		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
+		return false, fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
 	}
-	if !reply.KernelStarted {
-		return nil
-	}
-	return s.applyAppCPULimit(cpuPhaseLifecycle)
+	return reply.KernelStarted, nil
 }
 
 // DirectIO controls whether the checkpoint pages file is read with O_DIRECT.
@@ -815,11 +813,12 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 }
 
 // RestoreSubcontainer sends the restore call for a sub-container in the sandbox.
-func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestoreFiles []*os.File, devIOFile *os.File, goferMountConf []specutils.GoferMountConf) error {
+// It reports whether the restored kernel started.
+func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestoreFiles []*os.File, devIOFile *os.File, goferMountConf []specutils.GoferMountConf) (bool, error) {
 	log.Debugf("Restore sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.Load())
 
 	if err := s.configureStdios(conf, stdios); err != nil {
-		return err
+		return false, err
 	}
 	s.fixPidns(spec)
 
@@ -848,12 +847,9 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 	}
 	var reply sentryapi.RestoreReply
 	if err := s.call(sentryapi.ContMgrRestoreSubcontainer, &args, &reply); err != nil {
-		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
+		return false, fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
 	}
-	if !reply.KernelStarted {
-		return nil
-	}
-	return s.applyAppCPULimit(cpuPhaseLifecycle)
+	return reply.KernelStarted, nil
 }
 
 // Processes retrieves the list of processes and associated metadata for a

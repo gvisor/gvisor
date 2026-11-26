@@ -942,8 +942,8 @@ func TestNoRootContainerCreationCPULimit(t *testing.T) {
 	// starts.
 	stale := loadRoot()
 
-	if err := sub.endSandboxCreation(); err != nil {
-		t.Fatalf("endSandboxCreation() failed: %v", err)
+	if err := sub.finishSubcontainerStart(false /* kernelStarted */); err != nil {
+		t.Fatalf("finishSubcontainerStart() failed: %v", err)
 	}
 	if got, want := readCPUMax(), "50000 100000"; got != want {
 		t.Errorf("cpu.max after the first container starts = %q, want %q", got, want)
@@ -954,8 +954,8 @@ func TestNoRootContainerCreationCPULimit(t *testing.T) {
 
 	// Later containers leave the CPU limit alone.
 	writeCPUMax("unchanged")
-	if err := sub.endSandboxCreation(); err != nil {
-		t.Fatalf("endSandboxCreation() failed: %v", err)
+	if err := sub.finishSubcontainerStart(false /* kernelStarted */); err != nil {
+		t.Fatalf("finishSubcontainerStart() failed: %v", err)
 	}
 	if got, want := readCPUMax(), "unchanged"; got != want {
 		t.Errorf("cpu.max after a second container starts = %q, want %q", got, want)

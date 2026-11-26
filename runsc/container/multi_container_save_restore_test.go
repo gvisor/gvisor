@@ -1690,13 +1690,16 @@ func TestMultiContainerCheckpointRestoreJoinCgroupNamespace(t *testing.T) {
 // on a sub-container of a restoring sandbox restores that sub-container.
 func TestMultiContainerCheckpointRestoreStartSubcontainer(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
-		t.Run(name, func(t *testing.T) {
-			testMultiContainerCheckpointRestoreStartSubcontainer(t, conf)
+		t.Run(name+"/start", func(t *testing.T) {
+			testMultiContainerCheckpointRestoreStartSubcontainer(t, conf, false /* explicitRestore */)
+		})
+		t.Run(name+"/restore", func(t *testing.T) {
+			testMultiContainerCheckpointRestoreStartSubcontainer(t, conf, true /* explicitRestore */)
 		})
 	}
 }
 
-func testMultiContainerCheckpointRestoreStartSubcontainer(t *testing.T, conf *config.Config) {
+func testMultiContainerCheckpointRestoreStartSubcontainer(t *testing.T, conf *config.Config, explicitRestore bool) {
 	setupTestRootDir(t, conf)
 
 	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
@@ -1745,10 +1748,22 @@ func testMultiContainerCheckpointRestoreStartSubcontainer(t *testing.T, conf *co
 		defer c.Destroy()
 		restored = append(restored, c)
 	}
+	if subtreeControlErr == nil {
+		// The subcontainer was created with a copy of the original limit.
+		res := &specs.LinuxResources{CPU: &specs.LinuxCPU{Quota: new(int64(50000)), Period: new(uint64(100000))}}
+		if err := restored[0].Update(conf, res); err != nil {
+			t.Fatalf("error updating the root container's CPU limit: %v", err)
+		}
+	}
 	if err := restored[0].Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring the root container: %v", err)
 	}
-	if err := restored[1].Start(conf); err != nil {
+	if explicitRestore {
+		err = restored[1].Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */)
+	} else {
+		err = restored[1].Start(conf)
+	}
+	if err != nil {
 		t.Fatalf("error starting the sub-container in a restoring sandbox: %v", err)
 	}
 	if err := restored[0].WaitRestore(); err != nil {
@@ -1765,7 +1780,7 @@ func testMultiContainerCheckpointRestoreStartSubcontainer(t *testing.T, conf *co
 	if err != nil {
 		t.Fatalf("error reading the sandbox CPU limit: %v", err)
 	}
-	if got, want := strings.TrimSpace(string(cpuMax)), "25000 100000"; got != want {
+	if got, want := strings.TrimSpace(string(cpuMax)), "50000 100000"; got != want {
 		t.Errorf("sandbox cpu.max is %q after the last container was restored, want %q", got, want)
 	}
 }

@@ -170,6 +170,12 @@ func (s *Sandbox) applyAppCPULimit(from cpuPhase) error {
 	return nil
 }
 
+// RestoreAppCPULimit switches from the lifecycle CPU limit to the application
+// limit after the restored kernel starts.
+func (s *Sandbox) RestoreAppCPULimit() error {
+	return s.switchCPULimit(cpuPhaseLifecycle, cpuPhaseApp)
+}
+
 // DestroyOverCPULimit stops the sandbox because `err` prevents runsc from
 // keeping its application within its OCI spec CPU limit.
 func (s *Sandbox) DestroyOverCPULimit(err error) error {

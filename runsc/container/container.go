@@ -538,21 +538,25 @@ func (c *Container) Start(conf *config.Config) error {
 	return c.startImpl(conf, "start", c.Sandbox.StartRoot, c.Sandbox.StartSubcontainer)
 }
 
-// endSandboxCreation marks the sandbox as having been created.
-// This sets CPU limits appropriate for running untrusted code,
-// as opposed to sandbox-creation-time CPU limits.
-func (c *Container) endSandboxCreation() error {
+// finishSubcontainerStart applies the application CPU limit under the root
+// state-file lock so that it uses the latest limit set by Update.
+func (c *Container) finishSubcontainerStart(kernelStarted bool) error {
 	root, err := Load(c.Saver.RootDir, FullID{SandboxID: c.Sandbox.ID, ContainerID: c.Sandbox.ID}, LoadOpts{Exact: true, SkipCheck: true})
 	if err == nil {
 		defer func() { _ = root.Saver.close() }()
-		err = root.modify(root.Sandbox.MarkCreated)
+		err = root.modify(func() error {
+			if kernelStarted {
+				return root.Sandbox.RestoreAppCPULimit()
+			}
+			return root.Sandbox.MarkCreated()
+		})
 	}
-	if errors.Is(err, os.ErrNotExist) {
-		// The sandbox was deleted.
+	if !kernelStarted && errors.Is(err, os.ErrNotExist) {
+		// The sandbox was deleted before creation finished.
 		return nil
 	}
 	if err != nil {
-		return c.Sandbox.DestroyOverCPULimit(fmt.Errorf("cannot end creation of sandbox %q: %w", c.Sandbox.ID, err))
+		return c.Sandbox.DestroyOverCPULimit(fmt.Errorf("cannot apply the application CPU limit for sandbox %q: %w", c.Sandbox.ID, err))
 	}
 	return nil
 }
@@ -568,7 +572,7 @@ func (c *Container) Restore(conf *config.Config, imagePath string, directIO sand
 	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
 }
 
-func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
+func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) (bool, error)) error {
 	if err := c.modify(func() error {
 		return c.startLocked(conf, action, startRoot, startSub)
 	}); err != nil {
@@ -589,7 +593,7 @@ func (c *Container) startImpl(conf *config.Config, action string, startRoot func
 // startLocked starts the container with startRoot or startSub.
 //
 // Preconditions: c.Saver is locked.
-func (c *Container) startLocked(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
+func (c *Container) startLocked(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) (bool, error)) error {
 	if err := c.requireStatus(action, Created); err != nil {
 		if c.Status == Stopped && c.IsSandboxRoot() {
 			if running, runErr := c.IsSandboxRunning(); runErr == nil && !running {
@@ -611,7 +615,7 @@ func (c *Container) startLocked(conf *config.Config, action string, startRoot fu
 	} else {
 		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
-		subStarted := false
+		var subStarted, kernelStarted bool
 		err = cgroup.RunInCgroup(c.Sandbox.CgroupJSON.Cgroup, func(cloneIntoCgroupFD *os.File) error {
 			// Create the gofer process.
 			specFile, err := specutils.CopySpec(c.Spec)
@@ -654,13 +658,14 @@ func (c *Container) startLocked(conf *config.Config, action string, startRoot fu
 			}
 
 			subStarted = true // Set to `true` even if `startSub` below fails.
-			return startSub(c.Spec, conf, c.ID, stdios, goferFiles, goferFilestores, devIOFile, c.GoferMountConfs)
+			kernelStarted, err = startSub(c.Spec, conf, c.ID, stdios, goferFiles, goferFilestores, devIOFile, c.GoferMountConfs)
+			return err
 		})
 		// In a sandbox with no root container, the first subcontainer starting
 		// marks the creation of the sandbox, even if it fails, as user code
 		// may have started running.
-		if subStarted && c.Sandbox.Creating {
-			err = errors.Join(err, c.endSandboxCreation())
+		if kernelStarted || (subStarted && c.Sandbox.Creating) {
+			err = errors.Join(err, c.finishSubcontainerStart(kernelStarted))
 		}
 	}
 	if err != nil {
