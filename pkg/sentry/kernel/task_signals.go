@@ -661,6 +661,8 @@ func (tg *ThreadGroup) applySignalSideEffectsLocked(sig linux.Signal) {
 		// below, not when the signal is delivered.)
 		tg.discardSpecificLocked(linux.SIGCONT)
 	case sig == linux.SIGCONT:
+		// Discard all previously-queued stop signals.
+		linux.ForEachSignal(StopSignals, tg.discardSpecificLocked)
 		// "The SIGCONT signal has a side effect of waking up (all threads of)
 		// a group-stopped process. This side effect happens before
 		// signal-delivery-stop. The tracer can't suppress this side effect (it
@@ -1051,14 +1053,12 @@ func (t *Task) initiateGroupStop(info *linux.SignalInfo) {
 	t.Debugf("Signal %d: stopping %d threads in thread group", info.Signo, t.tg.groupStopPendingCount)
 }
 
-// endGroupStopLocked ensures that all prior stop signals received by tg are
-// not stopping tg and will not stop tg in the future. If broadcast is true,
-// parent and tracer notification will be scheduled if appropriate.
+// endGroupStopLocked cancels any in-progress or completed group stop. If
+// broadcast is true, parent and tracer notification will be scheduled if
+// appropriate.
 //
 // +checklocks:tg.signalHandlers.mu
 func (tg *ThreadGroup) endGroupStopLocked(broadcast bool) {
-	// Discard all previously-queued stop signals.
-	linux.ForEachSignal(StopSignals, tg.discardSpecificLocked)
 	// Unsetting groupStopDequeued will cause racing calls to initiateGroupStop
 	// to recognize that the group stop has been cancelled.
 	tg.groupStopDequeued = false

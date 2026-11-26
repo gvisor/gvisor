@@ -109,6 +109,8 @@ constexpr char kExecWithThread[] = "--exec_exec_with_thread";
 constexpr char kExecFromThread[] = "--exec_exec_from_thread";
 constexpr char kExecInParent[] = "--exec_exec_in_parent";
 constexpr char kWriteAndWaitForPid[] = "--exec_write_and_wait_for_pid";
+constexpr char kCheckPendingStopSignals[] = "--exec_check_pending_stop_signals";
+constexpr int kPendingStopSignals[] = {SIGTSTP, SIGTTIN, SIGTTOU};
 
 // Runs file specified by dirfd and pathname with argv and checks that the exit
 // status is expect_status and that stderr contains expect_stderr.
@@ -523,6 +525,38 @@ TEST(ExecStateTest, SignalMask) {
   };
 
   CheckExec(RunfilePath(kStateWorkload), args, {}, W_EXITCODE(0, 0), "");
+}
+
+TEST(ExecStateTest, PendingStopSignalsPreserved) {
+  // The fork in ForkAndExec clears pending signals, so queue them in the child.
+  const auto queue_stop_signals = [] {
+    sigset_t blocked;
+    TEST_PCHECK(sigemptyset(&blocked) == 0);
+    for (int sig : kPendingStopSignals) {
+      TEST_PCHECK(sigaddset(&blocked, sig) == 0);
+    }
+    TEST_PCHECK(sigprocmask(SIG_BLOCK, &blocked, nullptr) == 0);
+    for (int sig : kPendingStopSignals) {
+      if (sig == SIGTSTP) {
+        TEST_PCHECK(syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), sig) ==
+                    0);
+      } else {
+        TEST_PCHECK(kill(getpid(), sig) == 0);
+      }
+    }
+  };
+
+  pid_t child;
+  int execve_errno;
+  auto kill = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      "/proc/self/exe", {"/proc/self/exe", kCheckPendingStopSignals}, {},
+      queue_stop_signals, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0), SyscallSucceeds());
+  kill.Release();
+  EXPECT_EQ(status, 0);
 }
 
 // itimers persist across execve.
@@ -2001,6 +2035,14 @@ int main(int argc, char** argv) {
 
     if (arg == gvisor::testing::kExit42) {
       return 42;
+    }
+    if (arg == gvisor::testing::kCheckPendingStopSignals) {
+      sigset_t pending;
+      TEST_PCHECK(sigpending(&pending) == 0);
+      for (int sig : gvisor::testing::kPendingStopSignals) {
+        TEST_CHECK(sigismember(&pending, sig) == 1);
+      }
+      return 0;
     }
     if (arg == gvisor::testing::kExecWithThread) {
       gvisor::testing::ExecWithThread();
