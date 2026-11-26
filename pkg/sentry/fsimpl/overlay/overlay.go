@@ -673,20 +673,22 @@ func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, e
 	return minor, nil
 }
 
-// tarDataSerializer is implemented by upper layers that can write regular file
-// data from elsewhere to a tar archive.
+// tarDataSerializer is implemented by upper layers that can customize regular
+// file header xattrs and write regular file data from elsewhere to a tar
+// archive.
 type tarDataSerializer interface {
-	TarUpperLayerWithData(ctx context.Context, outFD *os.File, writeData func(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error)) error
+	TarUpperLayerWithData(ctx context.Context, outFD *os.File, prepareData func(xattrs map[string]string) func(ctx context.Context, w io.Writer) error) error
 }
 
 // TarUpperLayer implements vfs.TarSerializer.TarUpperLayer. Metacopy files are
-// written with their data from the lower layer.
+// written with their data from the lower layer and without their metacopy
+// xattrs.
 func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 	upperFS := fs.opts.UpperRoot.Mount().Filesystem()
 	if ts, ok := upperFS.Impl().(tarDataSerializer); ok && fs.opts.Metacopy {
 		buf := make([]byte, 1<<20)
-		return ts.TarUpperLayerWithData(ctx, outFD, func(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error) {
-			return fs.writeMetacopyData(ctx, xattrs, w, buf)
+		return ts.TarUpperLayerWithData(ctx, outFD, func(xattrs map[string]string) func(ctx context.Context, w io.Writer) error {
+			return fs.prepareMetacopyTarData(xattrs, buf)
 		})
 	}
 	ts, ok := upperFS.Impl().(vfs.TarSerializer)
@@ -696,15 +698,25 @@ func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 	return ts.TarUpperLayer(ctx, outFD)
 }
 
-// writeMetacopyData writes the data of a metacopy file with the given upper
-// layer xattrs to w, reading it through buf, and returns false for other
-// files.
-func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]string, w io.Writer, buf []byte) (bool, error) {
+// prepareMetacopyTarData removes the metacopy xattrs from xattrs and returns a
+// writer that streams the file's data from the lower layer through buf, or
+// returns nil for non-metacopy files.
+func (fs *filesystem) prepareMetacopyTarData(xattrs map[string]string, buf []byte) func(ctx context.Context, w io.Writer) error {
 	_, isMetacopy := xattrs[fs.xattrMetacopy]
 	redirect, hasRedirect := xattrs[fs.xattrRedirect]
 	if !isMetacopy || !hasRedirect {
-		return false, nil
+		return nil
 	}
+	delete(xattrs, fs.xattrMetacopy)
+	delete(xattrs, fs.xattrRedirect)
+	return func(ctx context.Context, w io.Writer) error {
+		return fs.writeRedirectData(ctx, redirect, w, buf)
+	}
+}
+
+// writeRedirectData reads the lower layer file at redirect through buf and
+// writes its contents to w.
+func (fs *filesystem) writeRedirectData(ctx context.Context, redirect string, w io.Writer, buf []byte) error {
 	lowerRoot := fs.opts.LowerRoots[0]
 	fd, err := fs.vfsfs.VirtualFilesystem().OpenAt(ctx, fs.creds, &vfs.PathOperation{
 		Root:  lowerRoot,
@@ -714,19 +726,19 @@ func (fs *filesystem) writeMetacopyData(ctx context.Context, xattrs map[string]s
 		Flags: linux.O_RDONLY,
 	})
 	if err != nil {
-		return true, err
+		return err
 	}
 	defer fd.DecRef(ctx)
 	for {
 		n, err := fd.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 		if _, werr := w.Write(buf[:n]); werr != nil {
-			return true, werr
+			return werr
 		}
 		if err == io.EOF {
-			return true, nil
+			return nil
 		}
 		if err != nil {
-			return true, err
+			return err
 		}
 	}
 }

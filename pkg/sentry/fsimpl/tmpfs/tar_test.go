@@ -469,3 +469,111 @@ func TestSourceTarRestoreFailureSkipsTrailingData(t *testing.T) {
 		t.Errorf("SourceTar has %d unread bytes after the failed restore, want %d", n, tailLen)
 	}
 }
+
+func TestTarDataWriterCallbacks(t *testing.T) {
+	ctx := contexttest.Context(t)
+	inline := []byte("inline-content")
+	regular := []byte("regular-content")
+	src := tarWithEntries(t, []*tar.Header{
+		{
+			Name:     "./dir/",
+			Typeflag: tar.TypeDir,
+			Mode:     0755,
+			PAXRecords: map[string]string{
+				paxXattrPrefix + "user.drop": "dir-val",
+			},
+		},
+		{
+			Name:     "./custom",
+			Typeflag: tar.TypeReg,
+			Mode:     0644,
+			Size:     int64(len(inline)),
+			PAXRecords: map[string]string{
+				paxXattrPrefix + "user.drop": "1",
+				paxXattrPrefix + "user.keep": "yes",
+			},
+		},
+		{
+			Name:     "./custom_only",
+			Typeflag: tar.TypeReg,
+			Mode:     0644,
+			Size:     int64(len(inline)),
+			PAXRecords: map[string]string{
+				paxXattrPrefix + "user.drop": "1",
+			},
+		},
+		{
+			Name:     "./plain",
+			Typeflag: tar.TypeReg,
+			Mode:     0644,
+			Size:     int64(len(regular)),
+			PAXRecords: map[string]string{
+				paxXattrPrefix + "user.keep": "plain",
+			},
+		},
+	}, [][]byte{nil, make([]byte, len(inline)), make([]byte, len(inline)), regular})
+	fs := mountFromTarTestOnly(t, ctx, src)
+
+	var out bytes.Buffer
+	cb := &tarDataWriterCallbacks{
+		prepareData: func(xattrs map[string]string) func(ctx context.Context, w io.Writer) error {
+			if _, ok := xattrs["user.drop"]; !ok {
+				return nil
+			}
+			delete(xattrs, "user.drop")
+			return func(_ context.Context, w io.Writer) error {
+				_, err := w.Write(inline)
+				return err
+			}
+		},
+	}
+	if err := fs.tarWrite(ctx, &out, cb); err != nil {
+		t.Fatalf("tarWrite: %v", err)
+	}
+
+	gotData := make(map[string][]byte)
+	gotPAX := make(map[string]map[string]string)
+	tr := tar.NewReader(&out)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar.Reader.Next: %v", err)
+		}
+		gotPAX[hdr.Name] = hdr.PAXRecords
+		if hdr.Typeflag == tar.TypeReg {
+			b, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatalf("reading %s: %v", hdr.Name, err)
+			}
+			gotData[hdr.Name] = b
+		}
+	}
+
+	if !bytes.Equal(gotData["./custom"], inline) {
+		t.Errorf("./custom data = %q, want %q", gotData["./custom"], inline)
+	}
+	if _, ok := gotPAX["./custom"][paxXattrPrefix+"user.drop"]; ok {
+		t.Errorf("./custom kept deleted xattr: %v", gotPAX["./custom"])
+	}
+	if got := gotPAX["./custom"][paxXattrPrefix+"user.keep"]; got != "yes" {
+		t.Errorf("./custom user.keep = %q, want %q", got, "yes")
+	}
+	if !bytes.Equal(gotData["./custom_only"], inline) {
+		t.Errorf("./custom_only data = %q, want %q", gotData["./custom_only"], inline)
+	}
+	if len(gotPAX["./custom_only"]) != 0 {
+		t.Errorf("./custom_only PAXRecords = %v, want empty", gotPAX["./custom_only"])
+	}
+	if !bytes.Equal(gotData["./plain"], regular) {
+		t.Errorf("./plain data = %q, want %q", gotData["./plain"], regular)
+	}
+	if got := gotPAX["./plain"][paxXattrPrefix+"user.keep"]; got != "plain" {
+		t.Errorf("./plain user.keep = %q, want %q", got, "plain")
+	}
+	if got := gotPAX["./dir/"][paxXattrPrefix+"user.drop"]; got != "dir-val" {
+		t.Errorf("./dir/ user.drop = %q, want %q", got, "dir-val")
+	}
+}

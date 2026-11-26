@@ -354,11 +354,14 @@ func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 	return fs.tarWrite(ctx, outFD, tarDefaultWriterCallbacks{})
 }
 
-// TarUpperLayerWithData is like TarUpperLayer, except that writeData is called
-// first for each regular file with the file's xattrs. If it returns true, it
-// has written the file's data to w in place of the file's own data.
-func (fs *filesystem) TarUpperLayerWithData(ctx context.Context, outFD *os.File, writeData func(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error)) error {
-	return fs.tarWrite(ctx, outFD, tarDataWriterCallbacks{writeData: writeData})
+// TarUpperLayerWithData is like TarUpperLayer, except that prepareData is
+// called for each regular file that has xattrs, with a non-empty mutable copy
+// of its xattrs before its tar header is serialized. prepareData may delete
+// entries from xattrs to omit them from the tar header. If it returns a
+// non-nil function, that function writes the file's data to w in place of the
+// file's own data.
+func (fs *filesystem) TarUpperLayerWithData(ctx context.Context, outFD *os.File, prepareData func(xattrs map[string]string) func(ctx context.Context, w io.Writer) error) error {
+	return fs.tarWrite(ctx, outFD, &tarDataWriterCallbacks{prepareData: prepareData})
 }
 
 func (fs *filesystem) tarWrite(ctx context.Context, dst io.Writer, cb tarWriterCallbacks) error {
@@ -491,16 +494,21 @@ func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb ta
 
 	// Serialize xattrs to PAXRecords.
 	if xattrs := d.inode.xattrs.RawXattrs(); len(xattrs) > 0 {
-		header.PAXRecords = make(map[string]string, len(xattrs))
-		for k, v := range xattrs {
-			// archive/tar preserves arbitrary bytes, including empty values, in
-			// SCHILY.xattr PAX records, so only the name has to be
-			// representable.
-			if k == "" || strings.ContainsAny(k, "=\x00") {
-				log.Warningf("Skipping xattr (k=%q) for file %q while generating tar archive because the name cannot be represented in a PAX record", k, path)
-				continue
+		if header.Typeflag == tar.TypeReg {
+			cb.regularFileXattrs(xattrs)
+		}
+		if len(xattrs) > 0 {
+			header.PAXRecords = make(map[string]string, len(xattrs))
+			for k, v := range xattrs {
+				// archive/tar preserves arbitrary bytes, including empty values, in
+				// SCHILY.xattr PAX records, so only the name has to be
+				// representable.
+				if k == "" || strings.ContainsAny(k, "=\x00") {
+					log.Warningf("Skipping xattr (k=%q) for file %q while generating tar archive because the name cannot be represented in a PAX record", k, path)
+					continue
+				}
+				header.PAXRecords[paxXattrPrefix+k] = v
 			}
-			header.PAXRecords[paxXattrPrefix+k] = v
 		}
 	}
 
@@ -523,11 +531,15 @@ func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb ta
 }
 
 // tarWriterCallbacks customizes how regular files are written to the tar
-// archive. Callers hold rf.inode.mu across both calls for a given file.
+// archive. Callers hold rf.inode.mu across all calls for a given file.
 type tarWriterCallbacks interface {
 	// regularFileSize returns the size of the given regular file as written to
 	// the tar archive.
 	regularFileSize(rf *regularFile) int64
+
+	// regularFileXattrs adjusts a regular file's xattrs before they are
+	// written to the tar header.
+	regularFileXattrs(xattrs map[string]string)
 
 	// regularFileWrite writes the contents of the given regular file to tw.
 	regularFileWrite(ctx context.Context, rf *regularFile, tw *tar.Writer) error
@@ -542,6 +554,8 @@ func (tarDefaultWriterCallbacks) regularFileSize(rf *regularFile) int64 {
 	return int64(rf.size.Load())
 }
 
+func (tarDefaultWriterCallbacks) regularFileXattrs(map[string]string) {}
+
 // +checklocks:rf.inode.mu
 func (tarDefaultWriterCallbacks) regularFileWrite(ctx context.Context, rf *regularFile, tw *tar.Writer) error {
 	// regularFileReadWriter.ReadToBlocks() does not lock inode.mu, so it can
@@ -554,23 +568,29 @@ func (tarDefaultWriterCallbacks) regularFileWrite(ctx context.Context, rf *regul
 	return nil
 }
 
-// tarDataWriterCallbacks implements tarWriterCallbacks by writing regular file
-// contents from writeData if it handles the file.
+// tarDataWriterCallbacks implements tarWriterCallbacks by delegating regular
+// file xattr filtering and content writing to prepareData.
 type tarDataWriterCallbacks struct {
 	tarDefaultWriterCallbacks
-	writeData func(ctx context.Context, xattrs map[string]string, w io.Writer) (bool, error)
+	prepareData func(xattrs map[string]string) func(ctx context.Context, w io.Writer) error
+	writeData   func(ctx context.Context, w io.Writer) error
+}
+
+func (cb *tarDataWriterCallbacks) regularFileXattrs(xattrs map[string]string) {
+	cb.writeData = nil
+	if cb.prepareData != nil {
+		cb.writeData = cb.prepareData(xattrs)
+	}
 }
 
 // +checklocks:rf.inode.mu
-func (cb tarDataWriterCallbacks) regularFileWrite(ctx context.Context, rf *regularFile, tw *tar.Writer) error {
-	handled, err := cb.writeData(ctx, rf.inode.xattrs.RawXattrs(), tw)
-	if err != nil {
-		return err
+func (cb *tarDataWriterCallbacks) regularFileWrite(ctx context.Context, rf *regularFile, tw *tar.Writer) error {
+	writeData := cb.writeData
+	cb.writeData = nil
+	if writeData != nil {
+		return writeData(ctx, tw)
 	}
-	if !handled {
-		return cb.tarDefaultWriterCallbacks.regularFileWrite(ctx, rf, tw)
-	}
-	return nil
+	return cb.tarDefaultWriterCallbacks.regularFileWrite(ctx, rf, tw)
 }
 
 func aclToPAXRecord(acl *vfs.PosixACL) string {
