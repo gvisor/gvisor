@@ -388,6 +388,12 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	if linuxerr.Equals(linuxerr.EAGAIN, err) {
 		err = linuxerr.ErrWouldBlock
 	}
+	if err == nil && n < src.NumBytes() && d.inode.fileType() == linux.S_IFIFO {
+		// The host FD is non-blocking, so the host write stops when the pipe
+		// is full. Return ErrWouldBlock so that a blocking write waits and
+		// writes the rest, as Linux does.
+		err = linuxerr.ErrWouldBlock
+	}
 	// Update offset if the offset is valid.
 	if offset >= 0 {
 		offset += n

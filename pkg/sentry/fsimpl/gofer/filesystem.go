@@ -1301,8 +1301,9 @@ func (d *dentry) openSpecialFile(ctx context.Context, mnt *vfs.Mount, opts *vfs.
 	if opts.Flags&linux.O_DIRECT != 0 && !d.inode.isRegularFile() {
 		return nil, linuxerr.EINVAL
 	}
-	// We assume that the server silently inserts O_NONBLOCK in the open flags
-	// for all named pipes (because all existing gofers do this).
+	// This function emulates blocking opens of named pipes, so directfs
+	// (directfsInode.openHandle) and the gofer (controlFDLisa.Open) open host
+	// named pipes with O_NONBLOCK.
 	//
 	// NOTE(b/133875563): This makes named pipe opens racy, because the
 	// mechanisms for translating nonblocking to blocking opens can only detect

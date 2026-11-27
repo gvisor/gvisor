@@ -264,6 +264,11 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 }
 
 func (i *directfsInode) openHandle(flags uint32) (handle, error) {
+	if i.fileType() == linux.S_IFIFO {
+		// The host open of a named pipe must never wait for a peer:
+		// openSpecialFile emulates blocking opens of named pipes.
+		flags |= unix.O_NONBLOCK
+	}
 	openFD, err := reopenFD(i.controlFD, int(flags))
 	if err != nil {
 		return noHandle, err
