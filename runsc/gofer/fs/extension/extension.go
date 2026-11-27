@@ -17,6 +17,8 @@
 package extension
 
 import (
+	"maps"
+
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/seccomp"
@@ -60,15 +62,26 @@ type GoferPrepareContext struct {
 	BundleDir   string
 }
 
-// GoferPrepareResult contains state for gofer re-exec.
+// GoferPrepareResult contains state produced during initial gofer setup
+// (when --setup-root=true) and carried into gofer execution.
 type GoferPrepareResult struct {
-	// FlagOverrides are applied after setup. File descriptor values must refer
-	// to descriptors with FD_CLOEXEC cleared.
+	// FlagOverrides are applied to extension-registered gofer flags, either
+	// via re-exec arguments or in-process when the gofer does not re-exec.
 	FlagOverrides map[string]string
+
+	// PassFDs lists file descriptors that must remain open across gofer
+	// re-exec. Extensions should keep FD_CLOEXEC set on these descriptors; the
+	// gofer clears FD_CLOEXEC immediately before re-exec (after spawning any
+	// helper processes) and leaves FD_CLOEXEC set when not re-execing.
+	PassFDs []int
 }
 
 type prepareGofer interface {
 	PrepareGofer(ctx GoferPrepareContext) (GoferPrepareResult, error)
+}
+
+type prepareBeforeRootFS interface {
+	PrepareBeforeRootFS(ctx GoferPrepareContext) (GoferPrepareResult, error)
 }
 
 var registered []Extension
@@ -93,8 +106,31 @@ func SetFlags(f *flag.FlagSet) {
 	}
 }
 
-// PrepareGofer lets registered extensions prepare state and merges flag
-// overrides for gofer re-exec.
+// PrepareBeforeRootFS lets registered extensions prepare host-side state
+// once during initial setup before SetupRootFS pivots away from the host
+// filesystem, and merges their results.
+//
+// Security note: PrepareBeforeRootFS runs with host filesystem visibility and
+// pre-drop privileges. Extensions must not open or connect to unvalidated host
+// paths taken from untrusted OCI Spec annotations.
+func PrepareBeforeRootFS(ctx GoferPrepareContext) (GoferPrepareResult, error) {
+	var result GoferPrepareResult
+	for _, e := range registered {
+		prepare, ok := e.(prepareBeforeRootFS)
+		if !ok {
+			continue
+		}
+		extensionResult, err := prepare.PrepareBeforeRootFS(ctx)
+		if err != nil {
+			return GoferPrepareResult{}, err
+		}
+		mergePrepareResult(&result, extensionResult)
+	}
+	return result, nil
+}
+
+// PrepareGofer lets registered extensions prepare state once during initial
+// setup after root setup, and merges their results.
 func PrepareGofer(ctx GoferPrepareContext) (GoferPrepareResult, error) {
 	var result GoferPrepareResult
 	for _, e := range registered {
@@ -106,12 +142,19 @@ func PrepareGofer(ctx GoferPrepareContext) (GoferPrepareResult, error) {
 		if err != nil {
 			return GoferPrepareResult{}, err
 		}
-		for key, value := range extensionResult.FlagOverrides {
-			if result.FlagOverrides == nil {
-				result.FlagOverrides = make(map[string]string)
-			}
-			result.FlagOverrides[key] = value
-		}
+		mergePrepareResult(&result, extensionResult)
 	}
 	return result, nil
+}
+
+func mergePrepareResult(dst *GoferPrepareResult, src GoferPrepareResult) {
+	if len(src.FlagOverrides) > 0 {
+		if dst.FlagOverrides == nil {
+			dst.FlagOverrides = make(map[string]string, len(src.FlagOverrides))
+		}
+		maps.Copy(dst.FlagOverrides, src.FlagOverrides)
+	}
+	if len(src.PassFDs) > 0 {
+		dst.PassFDs = append(dst.PassFDs, src.PassFDs...)
+	}
 }

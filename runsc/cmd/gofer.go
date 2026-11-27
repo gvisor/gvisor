@@ -18,10 +18,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"syscall"
 
 	"github.com/google/subcommands"
@@ -122,6 +124,7 @@ type Gofer struct {
 	profileFDs       profile.FDArgs
 	syncFDs          goferSyncFDs
 	stopProfiling    func()
+	extensionFlags   map[string]struct{}
 }
 
 // Name implements subcommands.Command.
@@ -163,7 +166,24 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	// Profiling flags.
 	g.profileFDs.SetFromFlags(f)
 
-	extension.SetFlags(f)
+	if len(extension.Registered()) > 0 {
+		g.extensionFlags = registerExtensionFlags(f, extension.SetFlags)
+	}
+}
+
+func registerExtensionFlags(f *flag.FlagSet, setFlags func(*flag.FlagSet)) map[string]struct{} {
+	coreFlags := make(map[string]struct{})
+	f.VisitAll(func(fl *flag.Flag) {
+		coreFlags[fl.Name] = struct{}{}
+	})
+	setFlags(f)
+	extFlags := make(map[string]struct{})
+	f.VisitAll(func(fl *flag.Flag) {
+		if _, isCore := coreFlags[fl.Name]; !isCore {
+			extFlags[fl.Name] = struct{}{}
+		}
+	})
+	return extFlags
 }
 
 // Execute implements subcommands.Command.
@@ -218,6 +238,22 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		mountOpener = makeRPCMountOpener(goferToHostRPC)
 	}
 
+	prepareCtx := extension.GoferPrepareContext{
+		Spec:        spec,
+		ContainerID: containerID,
+		BundleDir:   g.bundleDir,
+	}
+	var extensionOverrides map[string]string
+	var extensionPassFDs []int
+	if g.setUpRoot {
+		beforeRootFS, err := extension.PrepareBeforeRootFS(prepareCtx)
+		if err != nil {
+			util.Fatalf("preparing gofer extensions before rootfs: %v", err)
+		}
+		extensionOverrides = mergeOverrides(extensionOverrides, beforeRootFS.FlagOverrides)
+		extensionPassFDs = append(extensionPassFDs, beforeRootFS.PassFDs...)
+	}
+
 	var umounter *os.File
 	spawnUnmounter := g.setUpRoot && willReexec && !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot
 	if g.setUpRoot {
@@ -243,13 +279,19 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		umounter.Close()
 		defer cleanupUnmounter()
 	}
-	extensionPrepare, err := extension.PrepareGofer(extension.GoferPrepareContext{
-		Spec:        spec,
-		ContainerID: containerID,
-		BundleDir:   g.bundleDir,
-	})
-	if err != nil {
-		util.Fatalf("preparing gofer extensions: %v", err)
+	if g.setUpRoot {
+		extensionPrepare, err := extension.PrepareGofer(prepareCtx)
+		if err != nil {
+			util.Fatalf("preparing gofer extensions: %v", err)
+		}
+		extensionOverrides = mergeOverrides(extensionOverrides, extensionPrepare.FlagOverrides)
+		extensionPassFDs = append(extensionPassFDs, extensionPrepare.PassFDs...)
+	}
+	if err := validateExtensionOverrides(g.extensionFlags, extensionOverrides); err != nil {
+		util.Fatalf("invalid gofer extension flag overrides: %v", err)
+	}
+	if err := validateExtensionPassFDs(extensionPassFDs); err != nil {
+		util.Fatalf("invalid gofer extension PassFDs: %v", err)
 	}
 	capsToApply := goferCaps
 	if conf.GetHostUDS().AllowOpen() {
@@ -261,11 +303,16 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		} else {
 			log.Infof("PERF: Re-execing. FYI, this step isn't necessary when running with root. gVisor will start up faster (and is just as secure) when started as root, as it has to do fewer hoops to get to its as-sandboxed-as-possible state.")
 		}
+		for _, fd := range extensionPassFDs {
+			if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, 0); err != nil {
+				util.Fatalf("clearing FD_CLOEXEC on extension FD %d: %v", fd, err)
+			}
+		}
 		overrides := g.syncFDs.flags()
 		overrides["apply-caps"] = "false"
 		overrides["setup-root"] = "false"
 		overrides["rpc-fd"] = "-1" // Skip the `goferToHostRPCFD >= 0` branch on re-exec.
-		for key, value := range extensionPrepare.FlagOverrides {
+		for key, value := range extensionOverrides {
 			overrides[key] = value
 		}
 		args := sandboxsetup.PrepareArgs(g.Name(), f, overrides)
@@ -273,6 +320,9 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		// Prevent the specFile finalizer from closing specFD before re-exec.
 		runtime.KeepAlive(specFile)
 		panic("unreachable")
+	}
+	if err := applyFlagOverrides(f, extensionOverrides); err != nil {
+		util.Fatalf("applying gofer extension flag overrides: %v", err)
 	}
 	// No re-exec from here on out. Close specFile so the spec memfd is not
 	// held open inside the chroot for the lifetime of the container.
@@ -714,4 +764,43 @@ func (g *goferSyncFDs) syncChroot() {
 		util.Fatalf("failed to sync on chroot FD: %v", err)
 	}
 	g.chrootFD = -1
+}
+
+func mergeOverrides(dst, src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]string, len(src))
+	}
+	maps.Copy(dst, src)
+	return dst
+}
+
+func validateExtensionOverrides(allowed map[string]struct{}, overrides map[string]string) error {
+	for _, key := range slices.Sorted(maps.Keys(overrides)) {
+		if _, ok := allowed[key]; !ok {
+			return fmt.Errorf("flag %q is not registered by a gofer extension", key)
+		}
+	}
+	return nil
+}
+
+func validateExtensionPassFDs(fds []int) error {
+	for _, fd := range fds {
+		if fd < 3 {
+			return fmt.Errorf("invalid extension PassFD %d: must be >= 3", fd)
+		}
+	}
+	return nil
+}
+
+func applyFlagOverrides(f *flag.FlagSet, overrides map[string]string) error {
+	for _, key := range slices.Sorted(maps.Keys(overrides)) {
+		value := overrides[key]
+		if err := f.Set(key, value); err != nil {
+			return fmt.Errorf("setting flag %q=%q: %w", key, value, err)
+		}
+	}
+	return nil
 }

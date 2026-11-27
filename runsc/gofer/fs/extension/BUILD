@@ -9,7 +9,7 @@ go_library(
     name = "extension",
     srcs = ["extension.go"],
     importpath = "gvisor.dev/gvisor/runsc/gofer/fs/extension",
-    visibility = ["//runsc:__subpackages__"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/lisafs",
         "//pkg/seccomp",
