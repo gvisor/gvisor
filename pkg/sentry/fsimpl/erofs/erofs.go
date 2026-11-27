@@ -85,6 +85,10 @@ type filesystem struct {
 	// image is the EROFS image. image is immutable.
 	image *erofs.Image
 
+	// superBlockChanged is true if the checkpoint was restored with a
+	// different image (e.g. due to injected files).
+	superBlockChanged bool `state:"nosave"`
+
 	// mf implements memmap.File for this image.
 	mf imageMemmapFile
 
@@ -348,11 +352,9 @@ type inode struct {
 	// +checklocks:dirMu
 	dirents []vfs.Dirent `state:"nosave"`
 
-	// TODO: Since EROFS is read-only, files can't be truncated or
-	// hole-punched, so mapsMu and mappings are only used by
-	// inode.InvalidateUnsavable. However, AFAIU inode.Translate will return
-	// the same File and offset after save/restore, so this is unnecessary, and
-	// we can use memmap.MappableNoTrackMappings instead.
+	// Since EROFS is read-only, files can't be truncated or hole-punched, so
+	// mapsMu and mappings are only used by inode.InvalidateUnsavable, which a
+	// restore needs: inode.Translate may return other offsets after it.
 
 	// mapsMu protects mappings.
 	mapsMu sync.Mutex `state:"nosave"`
@@ -695,8 +697,8 @@ func (fs *filesystem) evictCachedDentry(ctx context.Context) bool {
 	}
 }
 
-// evictAllCachedDentries drains the LRU. Used during filesystem release;
-// the fs.released flag ensures the cascade doesn't re-populate the LRU.
+// evictAllCachedDentries drains the LRU, including the dentries that the
+// cascade adds to it unless fs.released is set.
 func (fs *filesystem) evictAllCachedDentries(ctx context.Context) {
 	for fs.evictCachedDentry(ctx) {
 	}
