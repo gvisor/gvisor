@@ -1063,8 +1063,10 @@ type inode struct {
 	// If this inode represents a symbolic link, InteropModeShared is not in
 	// effect, and haveTarget is true, target is the symlink target. haveTarget
 	// and target are protected by dataMu.
+	// +checklocks:dataMu
 	haveTarget bool
-	target     string
+	// +checklocks:dataMu
+	target string
 
 	// If this inode represents a socket file, endpoint is the transport
 	// endpoint bound to this file.

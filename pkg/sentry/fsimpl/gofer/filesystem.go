@@ -1842,8 +1842,10 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 			// we are forced to make Readlink RPCs. Because in this mode, we use host
 			// timestamps, not timestamps based on our internal clock. And readlink
 			// updates the atime on the host.
+			child.inode.dataMu.Lock()
 			child.inode.haveTarget = true
 			child.inode.target = target
+			child.inode.dataMu.Unlock()
 		}
 		return child, nil
 	}, nil)
