@@ -158,6 +158,17 @@ go_test(
 )
 
 go_test(
+    name = "handlers_test",
+    size = "small",
+    srcs = ["handlers_test.go"],
+    embed = [":lisafs"],
+    deps = [
+        "//pkg/abi/linux",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.go"],

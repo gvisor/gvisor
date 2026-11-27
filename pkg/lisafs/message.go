@@ -1315,12 +1315,17 @@ type ConnectReq struct {
 	// case, SockType = 0 means that the socket type does not matter and the
 	// requester will accept any socket type.
 	SockType uint32
-	_        uint32 // Need to make struct packed.
+	// Flags holds socket(2) type flags for the host socket. Only
+	// SOCK_NONBLOCK is supported. The server fails the request with EINVAL if
+	// any other bit is set. With SOCK_NONBLOCK, the connect fails with EAGAIN
+	// instead of waiting for room in the peer's accept queue. A server that
+	// does not support Flags ignores it and connects in blocking mode.
+	Flags uint32
 }
 
 // String implements fmt.Stringer.String.
 func (c *ConnectReq) String() string {
-	return fmt.Sprintf("ConnectReq{FD: %d, SockType: %d}", c.FD, c.SockType)
+	return fmt.Sprintf("ConnectReq{FD: %d, SockType: %d, Flags: %#x}", c.FD, c.SockType, c.Flags)
 }
 
 // ConnectResp is an empty response to ConnectReq.
@@ -1343,7 +1348,7 @@ type ConnectWithCredsReq struct {
 
 // String implements fmt.Stringer.String.
 func (c *ConnectWithCredsReq) String() string {
-	return fmt.Sprintf("ConnectWithCredsReq{FD: %d, SockType: %d, UID: %d, GID: %d}", c.FD, c.SockType, c.UID, c.GID)
+	return fmt.Sprintf("ConnectWithCredsReq{FD: %d, SockType: %d, Flags: %#x, UID: %d, GID: %d}", c.FD, c.SockType, c.Flags, c.UID, c.GID)
 }
 
 // GIDArray represents an array of GIDs in memory. The marshalled array data is
@@ -1405,7 +1410,7 @@ type ConnectWithGroupsReq struct {
 
 // String implements fmt.Stringer.String.
 func (c *ConnectWithGroupsReq) String() string {
-	return fmt.Sprintf("ConnectWithGroupsReq{FD: %d, SockType: %d, UID: %d, GID: %d, Groups: %s}", c.FD, c.SockType, c.UID, c.GID, c.Groups.String())
+	return fmt.Sprintf("ConnectWithGroupsReq{FD: %d, SockType: %d, Flags: %#x, UID: %d, GID: %d, Groups: %s}", c.FD, c.SockType, c.Flags, c.UID, c.GID, c.Groups.String())
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.

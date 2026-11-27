@@ -215,8 +215,11 @@ type Endpoint interface {
 	// This should be called on the client endpoint, and the (bound)
 	// endpoint passed in as a parameter.
 	//
+	// If blocking is false, the connect must not wait for room in the
+	// server's accept queue.
+	//
 	// The error codes are the same as Connect.
-	Connect(ctx context.Context, server BoundEndpoint) *syserr.Error
+	Connect(ctx context.Context, server BoundEndpoint, blocking bool) *syserr.Error
 
 	// Shutdown closes the read and/or write end of the endpoint connection
 	// to its peer.
@@ -307,9 +310,12 @@ type BoundEndpoint interface {
 	// be unconnected and not listening and the BoundEndpoint whose
 	// BidirectionalConnect method is being called must be listening.
 	//
+	// If blocking is false, the connect must not wait for room in the
+	// accept queue of the BoundEndpoint.
+	//
 	// This method will return syserr.ErrConnectionRefused on endpoints with a
 	// type that isn't SockStream or SockSeqpacket.
-	BidirectionalConnect(ctx context.Context, ep ConnectingEndpoint, returnConnect func(Receiver, Sender)) *syserr.Error
+	BidirectionalConnect(ctx context.Context, ep ConnectingEndpoint, blocking bool, returnConnect func(Receiver, Sender)) *syserr.Error
 
 	// UnidirectionalConnect establishes a write-only connection to a unix
 	// endpoint.

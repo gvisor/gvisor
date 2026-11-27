@@ -1278,7 +1278,7 @@ func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptio
 	}
 	// Note that special value of linux.SockType = 0 is interpreted by lisafs
 	// as "do not care about the socket type". Analogous to p9.AnonymousSocket.
-	sockFD, err := d.connect(ctx, 0 /* sockType */)
+	sockFD, err := d.connect(ctx, 0 /* sockType */, true /* blocking */)
 	if err != nil {
 		return nil, err
 	}
