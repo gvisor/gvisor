@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/syserr"
@@ -54,7 +55,7 @@ type endpoint struct {
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
-func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.ConnectingEndpoint, returnConnect func(transport.Receiver, transport.Sender)) *syserr.Error {
+func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.ConnectingEndpoint, blocking bool, returnConnect func(transport.Receiver, transport.Sender)) *syserr.Error {
 	// No lock ordering required as only the ConnectingEndpoint has a mutex.
 	ce.Lock()
 
@@ -68,7 +69,7 @@ func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.Connec
 		return syserr.ErrInvalidEndpointState
 	}
 
-	c, err := e.newSender(ctx, ce.Type(), ce.WaiterQueue())
+	c, err := e.newSender(ctx, ce.Type(), blocking, ce.WaiterQueue())
 	if err != nil {
 		ce.Unlock()
 		return err
@@ -86,7 +87,7 @@ func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.Connec
 // UnidirectionalConnect implements
 // transport.BoundEndpoint.UnidirectionalConnect.
 func (e *endpoint) UnidirectionalConnect(ctx context.Context) (transport.Sender, *syserr.Error) {
-	c, err := e.newSender(ctx, linux.SOCK_DGRAM, &waiter.Queue{})
+	c, err := e.newSender(ctx, linux.SOCK_DGRAM, true /* blocking */, &waiter.Queue{})
 	if err != nil {
 		return nil, err
 	}
@@ -102,10 +103,13 @@ func (e *endpoint) UnidirectionalConnect(ctx context.Context) (transport.Sender,
 	return c, nil
 }
 
-func (e *endpoint) newSender(ctx context.Context, sockType linux.SockType, queue *waiter.Queue) (*transport.SCMSender, *syserr.Error) {
+func (e *endpoint) newSender(ctx context.Context, sockType linux.SockType, blocking bool, queue *waiter.Queue) (*transport.SCMSender, *syserr.Error) {
 	e.dentry.inode.fs.renameMu.RLock()
-	hostSockFD, err := e.dentry.connect(ctx, sockType)
+	hostSockFD, err := e.dentry.connect(ctx, sockType, blocking)
 	e.dentry.inode.fs.renameMu.RUnlock()
+	if linuxerr.Equals(linuxerr.EAGAIN, err) {
+		return nil, syserr.ErrTryAgain
+	}
 	if err != nil {
 		return nil, syserr.ErrConnectionRefused
 	}

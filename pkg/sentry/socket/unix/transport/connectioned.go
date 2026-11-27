@@ -308,7 +308,7 @@ func (e *connectionedEndpoint) swapPeerCredsLocked(ctx context.Context, cend Con
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
-func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, Sender)) *syserr.Error {
+func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, blocking bool, returnConnect func(Receiver, Sender)) *syserr.Error {
 	if ce.Type() != e.stype {
 		return syserr.ErrWrongProtocolForSocket
 	}
@@ -421,7 +421,7 @@ func (e *connectionedEndpoint) UnidirectionalConnect(ctx context.Context) (Sende
 
 // Connect attempts to directly connect to another Endpoint.
 // Implements Endpoint.Connect.
-func (e *connectionedEndpoint) Connect(ctx context.Context, server BoundEndpoint) *syserr.Error {
+func (e *connectionedEndpoint) Connect(ctx context.Context, server BoundEndpoint, blocking bool) *syserr.Error {
 	returnConnect := func(r Receiver, ce Sender) {
 		e.receiver = r
 		e.peer = ce
@@ -433,7 +433,7 @@ func (e *connectionedEndpoint) Connect(ctx context.Context, server BoundEndpoint
 		}
 	}
 
-	return server.BidirectionalConnect(ctx, e, returnConnect)
+	return server.BidirectionalConnect(ctx, e, blocking, returnConnect)
 }
 
 // Listen starts listening on the connection.

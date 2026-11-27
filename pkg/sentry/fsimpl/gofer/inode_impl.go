@@ -446,7 +446,7 @@ func (i *inode) allocate(ctx context.Context, mode, offset, length uint64) error
 // Preconditions:
 //   - !d.isSynthetic().
 //   - fs.renameMu is locked.
-func (d *dentry) connect(ctx context.Context, sockType linux.SockType) (int, error) {
+func (d *dentry) connect(ctx context.Context, sockType linux.SockType, blocking bool) (int, error) {
 	creds := auth.CredentialsOrNilFromContext(ctx)
 	// The host reports these IDs as the client's SO_PEERCRED, which Linux
 	// derives from the effective (not filesystem) IDs.
@@ -463,9 +463,9 @@ func (d *dentry) connect(ctx context.Context, sockType linux.SockType) (int, err
 	}
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
-		return it.controlFD.Connect(ctx, sockType, euid, egid, groups)
+		return it.controlFD.Connect(ctx, sockType, blocking, euid, egid, groups)
 	case *directfsInode:
-		return it.connect(ctx, sockType, euid, egid, groups, d)
+		return it.connect(ctx, sockType, blocking, euid, egid, groups, d)
 	default:
 		panic("unknown inode implementation")
 	}

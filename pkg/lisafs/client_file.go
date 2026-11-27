@@ -496,7 +496,7 @@ func (f *ClientFD) BindAt(ctx context.Context, sockType linux.SockType, name str
 }
 
 // Connect makes the Connect RPC.
-func (f *ClientFD) Connect(ctx context.Context, sockType linux.SockType, euid UID, egid GID, groups []GID) (int, error) {
+func (f *ClientFD) Connect(ctx context.Context, sockType linux.SockType, blocking bool, euid UID, egid GID, groups []GID) (int, error) {
 	credsAvailable := euid != NoUID && egid != NoGID
 	var (
 		err    error
@@ -507,6 +507,9 @@ func (f *ClientFD) Connect(ctx context.Context, sockType linux.SockType, euid UI
 			SockType: uint32(sockType),
 		}
 	)
+	if !blocking {
+		req.Flags = linux.SOCK_NONBLOCK
+	}
 	if credsAvailable && f.client.IsSupported(ConnectWithGroups) {
 		reqWithGroups := ConnectWithGroupsReq{
 			ConnectWithCredsReq: ConnectWithCredsReq{

@@ -665,6 +665,17 @@ paths.
 :     :                   :                      :                                                             : is created using         :
 :     :                   :                      :                                                             : socket(AF\_UNIX,         :
 :     :                   :                      :                                                             : ConnectReq.sockType, 0). :
+:     :                   :                      :                                                             : ConnectReq.flags may     :
+:     :                   :                      :                                                             : hold only                :
+:     :                   :                      :                                                             : SOCK\_NONBLOCK.          :
+:     :                   :                      :                                                             : With it, the connect     :
+:     :                   :                      :                                                             : fails with EAGAIN        :
+:     :                   :                      :                                                             : instead of waiting for   :
+:     :                   :                      :                                                             : room in the peer's       :
+:     :                   :                      :                                                             : accept queue. If any     :
+:     :                   :                      :                                                             : other bit is set,        :
+:     :                   :                      :                                                             : Connect fails with       :
+:     :                   :                      :                                                             : EINVAL.                  :
 :     :                   :                      :                                                             : ConnectReq.fd must be a  :
 :     :                   :                      :                                                             : Control FD on a socket   :
 :     :                   :                      :                                                             : file that is             :

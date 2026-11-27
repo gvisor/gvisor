@@ -504,23 +504,24 @@ type ControlFDImpl interface {
 	// lifecycle is independent of this ControlFD.
 	//
 	// sockType indicates the requested type of socket and can be passed as type
-	// argument to socket(2).
+	// argument to socket(2). If blocking is false, Connect fails with EAGAIN
+	// instead of waiting for room in the peer's accept queue.
 	//
 	// On the server, Connect has a read concurrency guarantee.
-	Connect(sockType uint32) (int, error)
+	Connect(sockType uint32, blocking bool) (int, error)
 
 	// ConnectWithCreds is a wrapper around Connect but first changes the gofer's
 	// euid and egid to the given uid and gid before calling Connect. It restores
 	// the euid and egid after Connect.
 	//
 	// On the server, ConnectWithCreds has a read concurrency guarantee.
-	ConnectWithCreds(sockType uint32, uid UID, gid GID) (int, error)
+	ConnectWithCreds(sockType uint32, blocking bool, uid UID, gid GID) (int, error)
 
 	// ConnectWithGroups is ConnectWithCreds with the given supplementary groups
 	// applied as well.
 	//
 	// On the server, ConnectWithGroups has a read concurrency guarantee.
-	ConnectWithGroups(sockType uint32, uid UID, gid GID, groups []GID) (int, error)
+	ConnectWithGroups(sockType uint32, blocking bool, uid UID, gid GID, groups []GID) (int, error)
 
 	// BindAt creates a host unix domain socket of type sockType, bound to
 	// the given namt of type sockType, bound to the given name. It returns

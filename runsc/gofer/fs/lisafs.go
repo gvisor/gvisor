@@ -913,7 +913,7 @@ func isSockTypeSupported(sockType uint32) bool {
 }
 
 // Connect implements lisafs.ControlFDImpl.Connect.
-func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
+func (fd *controlFDLisa) Connect(sockType uint32, blocking bool) (int, error) {
 	if !fd.Conn().Impl().(*connectionImpl).config.HostUDS.AllowOpen() {
 		logRejectedUdsConnectOnce.Do(func() {
 			log.Warningf("Rejecting attempt to connect to unix domain socket from host filesystem: %q. If you want to allow this, set flag --host-uds=open", fd.ControlFD.Node().FilePath())
@@ -938,6 +938,13 @@ func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	if !blocking {
+		// The seccomp filter rejects SOCK_NONBLOCK in socket(2) but allows F_SETFL.
+		if err := unix.SetNonblock(sock, true); err != nil {
+			_ = unix.Close(sock)
+			return -1, err
+		}
+	}
 
 	sa := unix.SockaddrUnix{Name: hostPath}
 	if err := unix.Connect(sock, &sa); err != nil {
@@ -948,7 +955,7 @@ func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 }
 
 // ConnectWithCreds implements lisafs.ControlFDImpl.ConnectWithCreds.
-func (fd *controlFDLisa) ConnectWithCreds(sockType uint32, uid lisafs.UID, gid lisafs.GID) (int, error) {
+func (fd *controlFDLisa) ConnectWithCreds(sockType uint32, blocking bool, uid lisafs.UID, gid lisafs.GID) (int, error) {
 	impl := fd.Conn().Impl().(*connectionImpl)
 	if !impl.config.HostUDS.AllowOpen() {
 		logRejectedUdsConnectOnce.Do(func() {
@@ -1005,11 +1012,11 @@ func (fd *controlFDLisa) ConnectWithCreds(sockType uint32, uid lisafs.UID, gid l
 		}
 	}()
 
-	return fd.Connect(sockType)
+	return fd.Connect(sockType, blocking)
 }
 
 // ConnectWithGroups implements lisafs.ControlFDImpl.ConnectWithGroups.
-func (fd *controlFDLisa) ConnectWithGroups(sockType uint32, uid lisafs.UID, gid lisafs.GID, groups []lisafs.GID) (int, error) {
+func (fd *controlFDLisa) ConnectWithGroups(sockType uint32, blocking bool, uid lisafs.UID, gid lisafs.GID, groups []lisafs.GID) (int, error) {
 	impl := fd.Conn().Impl().(*connectionImpl)
 	if !impl.config.HostUDS.AllowOpen() {
 		logRejectedUdsConnectOnce.Do(func() {
@@ -1021,15 +1028,16 @@ func (fd *controlFDLisa) ConnectWithGroups(sockType uint32, uid lisafs.UID, gid 
 	for i, group := range groups {
 		gids[i] = int(group)
 	}
+	connect := func() (int, error) {
+		return fd.ConnectWithCreds(sockType, blocking, uid, gid)
+	}
 	if groupsAlreadySet(gids, impl.config.Groups) {
-		return fd.ConnectWithCreds(sockType, uid, gid)
+		return connect()
 	}
 	// setgroups(2) needs CAP_SETGID in the effective set, which ConnectWithCreds
 	// clears while the euid is changed. So the supplementary groups are changed
 	// before it.
-	return connectWithGroups(gids, func() (int, error) {
-		return fd.ConnectWithCreds(sockType, uid, gid)
-	})
+	return connectWithGroups(gids, connect)
 }
 
 // connectWithGroups calls connect on a dedicated OS thread whose supplementary

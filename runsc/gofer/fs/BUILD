@@ -48,3 +48,18 @@ go_test(
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
+
+go_test(
+    name = "connect_test",
+    size = "small",
+    srcs = ["connect_test.go"],
+    deps = [
+        ":fs",
+        "//pkg/abi/linux",
+        "//pkg/context",
+        "//pkg/lisafs",
+        "//pkg/unet",
+        "//runsc/config",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)

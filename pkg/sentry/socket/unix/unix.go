@@ -629,7 +629,7 @@ func (s *Socket) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr
 	s.ep.SetPeerCreds(control.MakeCreds(t))
 
 	// Connect the server endpoint.
-	err = s.ep.Connect(t, ep)
+	err = s.ep.Connect(t, ep, blocking)
 
 	if err == syserr.ErrWrongProtocolForSocket {
 		// Linux for abstract sockets returns ErrConnectionRefused

@@ -1115,6 +1115,16 @@ func FlushHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	})
 }
 
+// connectBlocking returns whether a Connect RPC with the given
+// ConnectReq.Flags may wait for room in the peer's accept queue. It returns
+// EINVAL if flags has a bit other than SOCK_NONBLOCK.
+func connectBlocking(flags uint32) (bool, error) {
+	if flags&^linux.SOCK_NONBLOCK != 0 {
+		return false, unix.EINVAL
+	}
+	return flags&linux.SOCK_NONBLOCK == 0, nil
+}
+
 // ConnectHandler handles the Connect RPC.
 //
 // +checklocksexclude:c.fdsMu
@@ -1123,6 +1133,10 @@ func ConnectHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 	var req ConnectReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
 		return 0, unix.EIO
+	}
+	blocking, err := connectBlocking(req.Flags)
+	if err != nil {
+		return 0, err
 	}
 
 	fd, err := c.lookupControlFD(req.FD)
@@ -1138,7 +1152,7 @@ func ConnectHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		if fd.node.isDeleted() {
 			return unix.EINVAL
 		}
-		sock, err = fd.impl.Connect(req.SockType)
+		sock, err = fd.impl.Connect(req.SockType, blocking)
 		return err
 	}); err != nil {
 		return 0, err
@@ -1157,6 +1171,10 @@ func ConnectWithCredsHandler(c *Connection, comm Communicator, payloadLen uint32
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
 		return 0, unix.EIO
 	}
+	blocking, err := connectBlocking(req.Flags)
+	if err != nil {
+		return 0, err
+	}
 
 	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
@@ -1171,7 +1189,7 @@ func ConnectWithCredsHandler(c *Connection, comm Communicator, payloadLen uint32
 		if fd.node.isDeleted() {
 			return unix.EINVAL
 		}
-		sock, err = fd.impl.ConnectWithCreds(req.SockType, req.UID, req.GID)
+		sock, err = fd.impl.ConnectWithCreds(req.SockType, blocking, req.UID, req.GID)
 		return err
 	}); err != nil {
 		return 0, err
@@ -1187,6 +1205,10 @@ func ConnectWithGroupsHandler(c *Connection, comm Communicator, payloadLen uint3
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
 		return 0, unix.EIO
 	}
+	blocking, err := connectBlocking(req.Flags)
+	if err != nil {
+		return 0, err
+	}
 
 	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
@@ -1201,7 +1223,7 @@ func ConnectWithGroupsHandler(c *Connection, comm Communicator, payloadLen uint3
 		if fd.node.isDeleted() {
 			return unix.EINVAL
 		}
-		sock, err = fd.impl.ConnectWithGroups(req.SockType, req.UID, req.GID, req.Groups)
+		sock, err = fd.impl.ConnectWithGroups(req.SockType, blocking, req.UID, req.GID, req.Groups)
 		return err
 	}); err != nil {
 		return 0, err
