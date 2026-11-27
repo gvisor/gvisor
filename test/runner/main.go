@@ -906,7 +906,7 @@ func setupHostUDSTree(spec *specs.Spec) (cleanup func(), err error) {
 	// Individual attach points for each socket to test mounts that attach
 	// directly to the sockets.
 	for _, protocol := range []string{"stream", "seqpacket"} {
-		for _, name := range []string{"echo", "nonlistening"} {
+		for _, name := range []string{"echo", "nonlistening", "full", "busy"} {
 			spec.Mounts = append(spec.Mounts, specs.Mount{
 				Destination: filepath.Join("/tmp/sockets-attach", protocol, name),
 				Source:      filepath.Join(socketDir, protocol, name),

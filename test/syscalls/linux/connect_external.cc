@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <grp.h>
 #include <linux/capability.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -105,8 +106,70 @@ TEST_P(GoferStreamSeqpacketTest, Echo) {
   ASSERT_EQ(0, memcmp(send_buffer, recv_buffer, sizeof(send_buffer)));
 }
 
-// It is not possible to connect to a bound but non-listening socket.
+// It is not possible to connect to a bound but non-listening socket, with or
+// without SOCK_NONBLOCK.
 TEST_P(GoferStreamSeqpacketTest, NonListening) {
+  std::string env;
+  ProtocolSocket proto;
+  std::tie(env, proto) = GetParam();
+
+  char* val = getenv(env.c_str());
+  ASSERT_NE(val, nullptr);
+  std::string root(val);
+
+  std::string socket_path = JoinPath(root, proto.name, "nonlistening");
+
+  struct sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  memcpy(addr.sun_path, socket_path.c_str(), socket_path.length());
+
+  for (int flags : {0, static_cast<int>(SOCK_NONBLOCK)}) {
+    FileDescriptor sock =
+        ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, proto.protocol | flags, 0));
+    ASSERT_THAT(connect(sock.get(), reinterpret_cast<struct sockaddr*>(&addr),
+                        sizeof(addr)),
+                SyscallFailsWithErrno(ECONNREFUSED));
+  }
+}
+
+// A non-blocking connect to a socket whose accept queue is full fails at once,
+// and the socket can then connect to another socket.
+TEST_P(GoferStreamSeqpacketTest, NonBlockingFullBacklog) {
+  std::string env;
+  ProtocolSocket proto;
+  std::tie(env, proto) = GetParam();
+
+  char* val = getenv(env.c_str());
+  ASSERT_NE(val, nullptr);
+  std::string root(val);
+
+  FileDescriptor sock = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(AF_UNIX, proto.protocol | SOCK_NONBLOCK, 0));
+
+  std::string socket_path = JoinPath(root, proto.name, "full");
+
+  struct sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  memcpy(addr.sun_path, socket_path.c_str(), socket_path.length());
+
+  ASSERT_THAT(connect(sock.get(), reinterpret_cast<struct sockaddr*>(&addr),
+                      sizeof(addr)),
+              SyscallFailsWithErrno(EAGAIN));
+
+  std::string echo_path = JoinPath(root, proto.name, "echo");
+  struct sockaddr_un echo_addr = {};
+  echo_addr.sun_family = AF_UNIX;
+  memcpy(echo_addr.sun_path, echo_path.c_str(), echo_path.length());
+
+  ASSERT_THAT(
+      connect(sock.get(), reinterpret_cast<struct sockaddr*>(&echo_addr),
+              sizeof(echo_addr)),
+      SyscallSucceeds());
+}
+
+// A blocking connect to a socket whose accept queue is full succeeds once the
+// queue has room. The busy socket accepts a connection at intervals.
+TEST_P(GoferStreamSeqpacketTest, BlockingFullBacklogSucceeds) {
   std::string env;
   ProtocolSocket proto;
   std::tie(env, proto) = GetParam();
@@ -118,7 +181,7 @@ TEST_P(GoferStreamSeqpacketTest, NonListening) {
   FileDescriptor sock =
       ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, proto.protocol, 0));
 
-  std::string socket_path = JoinPath(root, proto.name, "nonlistening");
+  std::string socket_path = JoinPath(root, proto.name, "busy");
 
   struct sockaddr_un addr = {};
   addr.sun_family = AF_UNIX;
@@ -126,7 +189,49 @@ TEST_P(GoferStreamSeqpacketTest, NonListening) {
 
   ASSERT_THAT(connect(sock.get(), reinterpret_cast<struct sockaddr*>(&addr),
                       sizeof(addr)),
-              SyscallFailsWithErrno(ECONNREFUSED));
+              SyscallSucceeds());
+}
+
+// A non-blocking connect to a listening socket succeeds at once, and the
+// connection works.
+TEST_P(GoferStreamSeqpacketTest, NonBlockingEcho) {
+  std::string env;
+  ProtocolSocket proto;
+  std::tie(env, proto) = GetParam();
+
+  char* val = getenv(env.c_str());
+  ASSERT_NE(val, nullptr);
+  std::string root(val);
+
+  FileDescriptor sock = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(AF_UNIX, proto.protocol | SOCK_NONBLOCK, 0));
+
+  std::string socket_path = JoinPath(root, proto.name, "echo");
+
+  struct sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  memcpy(addr.sun_path, socket_path.c_str(), socket_path.length());
+
+  ASSERT_THAT(connect(sock.get(), reinterpret_cast<struct sockaddr*>(&addr),
+                      sizeof(addr)),
+              SyscallSucceeds());
+
+  constexpr int kBufferSize = 64;
+  char send_buffer[kBufferSize];
+  memset(send_buffer, 'a', sizeof(send_buffer));
+
+  ASSERT_THAT(WriteFd(sock.get(), send_buffer, sizeof(send_buffer)),
+              SyscallSucceedsWithValue(sizeof(send_buffer)));
+
+  struct pollfd pfd = {.fd = sock.get(), .events = POLLIN};
+  constexpr int kPollTimeoutMs = 10000;
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, kPollTimeoutMs),
+              SyscallSucceedsWithValue(1));
+
+  char recv_buffer[kBufferSize];
+  ASSERT_THAT(ReadFd(sock.get(), recv_buffer, sizeof(recv_buffer)),
+              SyscallSucceedsWithValue(sizeof(recv_buffer)));
+  ASSERT_EQ(0, memcmp(send_buffer, recv_buffer, sizeof(send_buffer)));
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -228,6 +333,50 @@ TEST(GoferStreamTest, ConnectWithSupplementaryGroup) {
                     EACCES);
               }),
               IsPosixErrorOkAndHolds(0));
+}
+
+// A non-blocking connect to a socket whose accept queue is full fails at once
+// when the caller holds supplementary groups, as a user in the docker group
+// does for docker.sock.
+TEST(GoferStreamTest, NonBlockingFullBacklogWithSupplementaryGroup) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETGID)));
+
+  char* val = getenv("TEST_UDS_TREE");
+  ASSERT_NE(val, nullptr);
+  std::string root(val);
+
+  // The test runner gives the echo-group socket its group only when running
+  // as root; only then can the gofer take on the application's groups.
+  struct stat st;
+  ASSERT_THAT(stat(JoinPath(root, "stream", "echo-group").c_str(), &st),
+              SyscallSucceeds());
+  SKIP_IF((st.st_mode & 0777) != 0660 || st.st_gid != kEchoGroupGid);
+
+  std::string full_path = JoinPath(root, "stream", "full");
+  struct sockaddr_un full_addr = {};
+  full_addr.sun_family = AF_UNIX;
+  memcpy(full_addr.sun_path, full_path.c_str(), full_path.length());
+
+  std::string echo_path = JoinPath(root, "stream", "echo");
+  struct sockaddr_un echo_addr = {};
+  echo_addr.sun_family = AF_UNIX;
+  memcpy(echo_addr.sun_path, echo_path.c_str(), echo_path.length());
+
+  EXPECT_THAT(
+      InForkedProcess([&] {
+        const gid_t group = kEchoGroupGid;
+        TEST_PCHECK(setgroups(1, &group) == 0);
+        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        TEST_PCHECK(sock >= 0);
+        TEST_CHECK_ERRNO(
+            connect(sock, reinterpret_cast<struct sockaddr*>(&full_addr),
+                    sizeof(full_addr)),
+            EAGAIN);
+        TEST_PCHECK(connect(sock,
+                            reinterpret_cast<struct sockaddr*>(&echo_addr),
+                            sizeof(echo_addr)) == 0);
+      }),
+      IsPosixErrorOkAndHolds(0));
 }
 
 }  // namespace

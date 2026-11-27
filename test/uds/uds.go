@@ -171,6 +171,124 @@ func createNonListeningSocket(path string, protocol int) (cleanup func(), err er
 	return cleanup, nil
 }
 
+// listenFull creates a socket listening at path and fills its accept queue.
+// It returns the listening socket and the sockets that fill the queue.
+func listenFull(path string, protocol int) (int, []int, error) {
+	fd, err := unix.Socket(unix.AF_UNIX, protocol, 0)
+	if err != nil {
+		return -1, nil, fmt.Errorf("error creating listener(%d) socket: %w", protocol, err)
+	}
+	var fillers []int
+	cu := cleanup.Make(func() {
+		closeAll(protocol, append(fillers, fd))
+	})
+	defer cu.Clean()
+
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: path}); err != nil {
+		return -1, nil, fmt.Errorf("error binding listener(%d) socket: %w", protocol, err)
+	}
+	if err := unix.Listen(fd, 0); err != nil {
+		return -1, nil, fmt.Errorf("error listening listener(%d) socket: %w", protocol, err)
+	}
+	for {
+		client, err := unix.Socket(unix.AF_UNIX, protocol|unix.SOCK_NONBLOCK, 0)
+		if err != nil {
+			return -1, nil, fmt.Errorf("error creating listener(%d) client socket: %w", protocol, err)
+		}
+		err = unix.Connect(client, &unix.SockaddrUnix{Name: path})
+		if err == unix.EAGAIN {
+			_ = unix.Close(client)
+			break
+		}
+		fillers = append(fillers, client)
+		if err != nil {
+			return -1, nil, fmt.Errorf("error filling listener(%d) socket: %w", protocol, err)
+		}
+	}
+	cu.Release()
+	return fd, fillers, nil
+}
+
+func closeAll(protocol int, fds []int) {
+	for _, fd := range fds {
+		if err := unix.Close(fd); err != nil {
+			log.Warningf("Failed to close socket(%d): %v", protocol, err)
+		}
+	}
+}
+
+// createFullListener creates a listening socket whose accept queue is full.
+// It never accepts, so a non-blocking connect to it fails with EAGAIN.
+//
+// Only relevant for stream, seqpacket sockets.
+func createFullListener(path string, protocol int) (cleanup func(), err error) {
+	fd, fillers, err := listenFull(path, protocol)
+	if err != nil {
+		return nil, err
+	}
+	return func() { closeAll(protocol, append(fillers, fd)) }, nil
+}
+
+// busyAcceptInterval is how long a busy listener waits before each accept.
+const busyAcceptInterval = 300 * time.Millisecond
+
+// busyRefillDelay is how long a busy listener leaves room in its accept queue
+// after it accepts a connection.
+const busyRefillDelay = 50 * time.Millisecond
+
+// createBusyListener creates a listening socket whose accept queue is full
+// except for busyRefillDelay after each accept. It accepts one connection after
+// each busyAcceptInterval. A blocking connect to it waits, then succeeds. A
+// non-blocking connect to it usually fails with EAGAIN.
+//
+// Only relevant for stream, seqpacket sockets.
+func createBusyListener(path string, protocol int) (func(), error) {
+	fd, fillers, err := listenFull(path, protocol)
+	if err != nil {
+		return nil, err
+	}
+	closeAll(protocol, fillers) // The queue keeps their connections.
+	if err := unix.SetNonblock(fd, true); err != nil {
+		closeAll(protocol, []int{fd})
+		return nil, fmt.Errorf("error setting busy(%d) socket non-blocking: %w", protocol, err)
+	}
+
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(busyAcceptInterval):
+			}
+			if nfd, _, err := unix.Accept4(fd, unix.SOCK_CLOEXEC); err == nil {
+				_ = unix.Close(nfd)
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(busyRefillDelay):
+			}
+			// Fill the queue again, unless a waiting connect already did.
+			client, err := unix.Socket(unix.AF_UNIX, protocol|unix.SOCK_NONBLOCK, 0)
+			if err != nil {
+				log.Warningf("Failed to create busy(%d) client socket: %v", protocol, err)
+				continue
+			}
+			_ = unix.Connect(client, &unix.SockaddrUnix{Name: path})
+			_ = unix.Close(client)
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-stopped
+		closeAll(protocol, []int{fd})
+	}, nil
+}
+
 // createNullSocket creates a socket that reads anything received.
 //
 // Only works for dgram sockets.
@@ -357,8 +475,12 @@ func createSocketTree(baseDir string, specs []socketCreatorSpec) (string, func()
 //   - /stream/echo
 //   - /stream/echo-group
 //   - /stream/nonlistening
+//   - /stream/full
+//   - /stream/busy
 //   - /seqpacket/echo
 //   - /seqpacket/nonlistening
+//   - /seqpacket/full
+//   - /seqpacket/busy
 //   - /dgram/null
 func CreateBoundUDSTree(baseDir string) (string, func(), error) {
 	return createSocketTree(baseDir, []socketCreatorSpec{
@@ -369,6 +491,8 @@ func CreateBoundUDSTree(baseDir string) (string, func(), error) {
 				"echo":         createEchoServer,
 				"echo-group":   createGroupEchoServer,
 				"nonlistening": createNonListeningSocket,
+				"full":         createFullListener,
+				"busy":         createBusyListener,
 			},
 		},
 		{
@@ -377,6 +501,8 @@ func CreateBoundUDSTree(baseDir string) (string, func(), error) {
 			sockets: map[string]socketCreator{
 				"echo":         createEchoServer,
 				"nonlistening": createNonListeningSocket,
+				"full":         createFullListener,
+				"busy":         createBusyListener,
 			},
 		},
 		{
