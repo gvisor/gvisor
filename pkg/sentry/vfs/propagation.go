@@ -119,14 +119,30 @@ func (vfs *VirtualFilesystem) SetMountPropagationAt(ctx context.Context, creds *
 		return err
 	}
 	defer vd.DecRef(ctx)
-	vfs.SetMountPropagation(vd.mount, propFlag, recursive)
-	return nil
+	vfs.lockMounts()
+	defer vfs.unlockMounts(ctx)
+	mnt := vd.mount
+	if !vfs.validInMountNS(ctx, mnt) {
+		if mnt.umounted {
+			return linuxerr.EINVAL
+		}
+		// The mount belongs to another mount namespace.
+		return linuxerr.EPERM
+	}
+	return vfs.setMountPropagationLocked(mnt, propFlag, recursive)
 }
 
 // SetMountPropagation changes the propagation type of the mount.
 func (vfs *VirtualFilesystem) SetMountPropagation(mnt *Mount, propFlag uint32, recursive bool) error {
 	vfs.lockMounts()
 	defer vfs.unlockMounts(context.Background())
+	return vfs.setMountPropagationLocked(mnt, propFlag, recursive)
+}
+
+// setMountPropagationLocked changes the propagation type of the mount.
+//
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) setMountPropagationLocked(mnt *Mount, propFlag uint32, recursive bool) error {
 	if propFlag == linux.MS_SHARED {
 		if err := vfs.allocMountGroupIDs(mnt, recursive); err != nil {
 			return err

@@ -253,6 +253,37 @@ func (s *mountTestSystem) mountState(mnt *Mount) (bool, *Mount) {
 	return mnt.umounted, mnt.parent()
 }
 
+// TestSetMountPropagationAtForeignMountNamespace tests that the propagation
+// type of a mount in another mount namespace cannot be changed by a task in a
+// different mount namespace.
+func TestSetMountPropagationAtForeignMountNamespace(t *testing.T) {
+	s := newMountTestSystem(t)
+	defer s.destroy()
+
+	pmp := newMountTestDentry()
+	mnt := s.mount(s.root.Mount(), pmp, false /* locked */)
+
+	otherCtx := contexttest.Context(t)
+	otherNS, err := s.vfs.NewMountNamespace(otherCtx, s.creds, "" /* source */, "mounttest", &MountOptions{}, nil /* nsfs */)
+	if err != nil {
+		t.Fatalf("failed to create mount namespace: %v", err)
+	}
+	otherCtx = WithMountNamespace(otherCtx, otherNS)
+	defer otherNS.DecRef(otherCtx)
+
+	err = s.vfs.SetMountPropagationAt(otherCtx, s.creds, s.popAt(s.root.Mount(), pmp), linux.MS_SHARED)
+	if err != linuxerr.EPERM {
+		t.Fatalf("SetMountPropagationAt() = %v, want %v", err, linuxerr.EPERM)
+	}
+
+	s.vfs.lockMounts()
+	shared := mnt.isShared
+	s.vfs.unlockMounts(s.ctx)
+	if shared {
+		t.Errorf("mount in foreign mount namespace was made shared")
+	}
+}
+
 // TestPartlyUmountedMountKeepsMountpointRef tests that VFS holds a reference
 // on a mount point for as long as a mount is connected to it, even after that
 // mount has been marked as umounted.
