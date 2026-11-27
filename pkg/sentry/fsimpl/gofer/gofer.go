@@ -296,15 +296,16 @@ type filesystem struct {
 // A cached inode with a different fileType is treated as a miss (for example,
 // when the host filesystem unlinks a file and recycles its inode number for a
 // new file of a different type while the old gofer.inode is still referenced
-// in the sentry). Sharing here is best-effort under concurrent walks across an
-// inode-number reuse race (last writer takes the slot, degrading a later walk
-// to another miss rather than panicking).
+// in the sentry), as is newInode (when the caller just created a brand-new
+// file on the host). Sharing here is best-effort under concurrent walks across
+// an inode-number reuse race (last writer takes the slot, degrading a later
+// walk to another miss rather than panicking).
 //
 // If a miss, `createInode` is called and the result is cached. If a hit,
 // `onCacheHit` is called. This path locks fs.inodeMu.
 //
 // The caller is responsible for decrementing the inode's reference count when done.
-func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache bool, onCacheHit func(), createInode func() *inode) *inode {
+func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache bool, newInode bool, onCacheHit func(), createInode func() *inode) *inode {
 	if dontCache {
 		// Create a new inode and return it bypassing the cache. This is used for
 		// creating inodes that are not meant to be shared across dentries.
@@ -312,10 +313,12 @@ func (fs *filesystem) getOrCreateInode(inoKey inoKey, fileType uint32, dontCache
 	}
 	fs.inodeMu.Lock()
 	defer fs.inodeMu.Unlock()
-	if cachedInode, ok := fs.inodeByKey[inoKey]; ok && cachedInode.fileType() == fileType {
-		onCacheHit()
-		cachedInode.incRef()
-		return cachedInode
+	if !newInode {
+		if cachedInode, ok := fs.inodeByKey[inoKey]; ok && cachedInode.fileType() == fileType {
+			onCacheHit()
+			cachedInode.incRef()
+			return cachedInode
+		}
 	}
 	inode := createInode()
 	fs.inodeByKey[inoKey] = inode
@@ -1067,7 +1070,7 @@ type inode struct {
 	target     string
 
 	// If this inode represents a socket file, endpoint is the transport
-	// endpoint bound to this file.
+	// endpoint bound to this file. endpoint is immutable after inode creation.
 	//
 	// endpoint often originates from vfs.MknodOptions.Endpoint, in which case
 	// it can't be recovered if the inode is evicted from the inode cache.

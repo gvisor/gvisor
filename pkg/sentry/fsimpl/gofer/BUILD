@@ -152,6 +152,7 @@ go_test(
         "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/unet",
