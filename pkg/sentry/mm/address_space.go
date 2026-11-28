@@ -76,6 +76,19 @@ const asyncLoadMapUnit = 32 << 20
 //
 // +checklocksread:mm.activeMu
 func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
+	return mm.mapASOptLocked(ctx, pseg, ar, maxMapAR, platformEffect)
+}
+
+// maxMapAR is the largest range that mapASOptLocked can map.
+var maxMapAR = hostarch.AddrRange{0, ^hostarch.Addr(hostarch.PageSize - 1)}
+
+// mapASOptLocked is equivalent to mapASLocked, but may also map addresses in
+// optAR outside of ar.
+//
+// Preconditions: Same as mapASLocked, plus optAR.IsSupersetOf(ar).
+//
+// +checklocksread:mm.activeMu
+func (mm *MemoryManager) mapASOptLocked(ctx context.Context, pseg pmaIterator, ar, optAR hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
 	if platformEffect == memmap.PlatformEffectCommit && ar.Length() > (1<<30) {
 		// FIXME(b/445932215, b/445939339): Don't precommit very large ranges
 		// via platform.AddressSpace.MapFile() for now, since holding locks
@@ -84,7 +97,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	}
 	// By default, map entire pmas at a time, under the assumption that there
 	// is no cost to mapping more of a pma than necessary.
-	mapAR := hostarch.AddrRange{0, ^hostarch.Addr(hostarch.PageSize - 1)}
+	mapAR := maxMapAR
 	setMapUnit := func(mapUnit uint64) {
 		mapMask := hostarch.Addr(mapUnit - 1)
 		mapAR.Start = ar.Start &^ mapMask
@@ -105,6 +118,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
 		setMapUnit(asyncLoadMapUnit)
 	}
+	mapAR = mapAR.Intersect(optAR)
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {
 			panic(fmt.Sprintf("mapAR %#v is not a superset of ar %#v", mapAR, ar))
