@@ -137,6 +137,13 @@ DOCKER_RUN_OPTIONS  += --rm
 DOCKER_RUN_OPTIONS  += --user $(UID):$(GID)
 DOCKER_RUN_OPTIONS  += --entrypoint ""
 DOCKER_RUN_OPTIONS  += --init
+# A linked worktree's .git is a file that points into the main checkout's .git
+# directory. Mount that directory read-only too, so git commands that read the
+# repository work in the container.
+GIT_COMMON_DIR := $(shell git -C $(CURDIR) rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+ifneq ($(GIT_COMMON_DIR),$(CURDIR)/.git)
+DOCKER_RUN_OPTIONS += -v "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro"
+endif
 DOCKER_EXEC_OPTIONS := --user $(UID):$(GID)
 ifneq (,$(UNSANDBOXED_RUNTIME))
 DOCKER_RUN_OPTIONS += --runtime=$(UNSANDBOXED_RUNTIME)
