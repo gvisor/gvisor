@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -47,6 +48,13 @@ const (
 	// cuda-checkpoint sequentially.
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
 )
+
+// cudaNeedsSigsegvLock returns true if a CUDA call racing cuda-checkpoint can
+// fault on a placeholder mapping, as on drivers before 620.70.06.
+func cudaNeedsSigsegvLock(v nvconf.DriverVersion) bool {
+	cutoff := nvconf.NewDriverVersion(620, 70, 6)
+	return !v.Equals(cutoff) && !v.IsGreaterThan(cutoff)
+}
 
 func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	if o.CudaCheckpointPath == "" {
@@ -70,8 +78,11 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	sctx := k.SupervisorContext()
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
 	// FIXME: b/456299722
-	for _, tg := range cudaProcs {
-		tg.SigsegvLock()
+	sigsegvLock := cudaNeedsSigsegvLock(k.NvidiaDriverVersion)
+	if sigsegvLock {
+		for _, tg := range cudaProcs {
+			tg.SigsegvLock()
+		}
 	}
 	err := toggleCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, nil, o.CudaCheckpointSequential)
 	if wasPaused {
@@ -79,8 +90,10 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	}
 	if err != nil {
 		// FIXME: b/456299722
-		for _, tg := range cudaProcs {
-			tg.SigsegvUnlock()
+		if sigsegvLock {
+			for _, tg := range cudaProcs {
+				tg.SigsegvUnlock()
+			}
 		}
 		return err
 	}
@@ -160,8 +173,10 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	// FIXME: b/460451448 - pass --device-map to cuda-checkpoint if accepted
 	err := toggleCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential)
 	// FIXME: b/456299722
-	for _, tg := range cudaProcs {
-		tg.SigsegvUnlock()
+	if cudaNeedsSigsegvLock(k.NvidiaDriverVersion) {
+		for _, tg := range cudaProcs {
+			tg.SigsegvUnlock()
+		}
 	}
 	return err
 }
