@@ -42,29 +42,23 @@ func startLocked(m ProcessMonitor, cmd *exec.Cmd) (chan runc.Exit, error) {
 	started := make(chan result, 1)
 	go func() {
 		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 		ec, err := m.Start(cmd)
-		pid := 0
-		if err == nil {
-			pid = cmd.Process.Pid
+		if err != nil {
+			started <- result{ec: ec, err: err}
+			return
 		}
-		started <- result{ec: ec, err: err}
-		if err == nil {
-			waitExited(pid)
+		pid := cmd.Process.Pid
+		started <- result{ec: ec}
+		// Wait for the child to exit without reaping it. waitid also returns
+		// if pid is not a child, for example because it was already reaped.
+		for {
+			var info unix.Siginfo
+			if err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT, nil); err != unix.EINTR {
+				return
+			}
 		}
-		runtime.UnlockOSThread()
 	}()
 	r := <-started
 	return r.ec, r.err
-}
-
-// waitExited blocks until the child process pid exits, without reaping it. It
-// also returns if pid is not a child, for example because it was already
-// reaped.
-func waitExited(pid int) {
-	for {
-		var info unix.Siginfo
-		if err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT, nil); err != unix.EINTR {
-			return
-		}
-	}
 }
