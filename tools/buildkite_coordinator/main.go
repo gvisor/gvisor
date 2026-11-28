@@ -212,8 +212,7 @@ func (s *server) handleAgentRequestJob(w http.ResponseWriter, r *http.Request) {
 		// No job currently available for this agent.
 
 		// Set an idle timeout so it doesn't sit there doing nothing when the build finishes.
-		_, err = s.tc.RegisterTimeout(r.Context(), id, idleTimeout, ShortenTimeout)
-		if err != nil {
+		if _, err := s.tc.RegisterTimeout(r.Context(), id, idleTimeout, ShortenTimeout, nil); err != nil {
 			log.Printf("Failed to register idle timeout for %v: %v", id, err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
@@ -260,6 +259,7 @@ func (s *server) handleAgentRequestJob(w http.ResponseWriter, r *http.Request) {
 	timeout = min(timeout, jobTimeout)
 
 	var unaccountCleanup *cleanup.Cleanup
+	var refundUnused func(context.Context, time.Duration) error
 	if !s.pool.trusted(jobAssignment.metadata) {
 		// Account for the job for this author.
 		author := jobAssignment.metadata.author
@@ -297,6 +297,9 @@ func (s *server) handleAgentRequestJob(w http.ResponseWriter, r *http.Request) {
 		})
 		defer c.Clean()
 		unaccountCleanup = &c
+		refundUnused = func(ctx context.Context, unused time.Duration) error {
+			return s.rc.UnaccountForTime(ctx, author, now, unused)
+		}
 	}
 
 	// Get a token for the agent to upload artifacts with.
@@ -318,24 +321,18 @@ func (s *server) handleAgentRequestJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Before assigning the job: register a job timeout to kill the agent if it's
-	// not done.
-	_, err = s.tc.RegisterTimeout(r.Context(), id, timeout, ReplaceTimeout)
-	if err != nil {
+	// Once metadata installation starts, an error may be ambiguous: the VM
+	// could already have received its new lifetime. Keep its full charge.
+	if unaccountCleanup != nil {
+		unaccountCleanup.Release()
+	}
+
+	// Register the paid capability before handing out the job. Refund unused
+	// minutes only when this grant is superseded or the VM is confirmed gone.
+	if _, err := s.tc.RegisterTimeout(r.Context(), id, timeout, ReplaceTimeout, refundUnused); err != nil {
 		log.Printf("Failed to register timeout for %v: %v", id, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
-	}
-
-	// Ideally, if any of the below steps fail, we would undo the per-author job
-	// accounting we did since the job didn't run successfully.
-	//
-	// Unfortunately, we can't because once the timeout is reset, the author gets
-	// access to another timeout worth of compute time regardless of the failure.
-	//
-	// So we account for a job even when the below steps fail. Oh well.
-	if unaccountCleanup != nil {
-		unaccountCleanup.Release()
 	}
 
 	// Assign the job to the agent
