@@ -25,10 +25,19 @@ doc(
 )
 
 doc(
+    name = "kind",
+    src = "kind.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/quick_start/kind/",
+    subcategory = "Quick Start",
+    weight = "13",
+)
+
+doc(
     name = "oci",
     src = "oci.md",
     category = "User Guide",
     permalink = "/docs/user_guide/quick_start/oci/",
     subcategory = "Quick Start",
-    weight = "13",
+    weight = "14",
 )
