@@ -1,0 +1,17 @@
+Backport the test-only change from Node 8e51a61229. Leave the second
+request incomplete across multiple periodic header-timeout checks.
+
+https://github.com/nodejs/node/commit/8e51a61229b158bd8fd635892cc01268bba9b330
+
+diff --git a/test/parallel/test-http-server-headers-timeout-keepalive.js b/test/parallel/test-http-server-headers-timeout-keepalive.js
+--- a/test/parallel/test-http-server-headers-timeout-keepalive.js
++++ b/test/parallel/test-http-server-headers-timeout-keepalive.js
+@@ -70,7 +70,7 @@ server.listen(0, common.mustCall(() => {
+         performRequestWithDelay(
+           client,
+           headersTimeout / 5,
+-          headersTimeout,
++          headersTimeout * 2,
+           true
+         );
+       }, defer).unref();
