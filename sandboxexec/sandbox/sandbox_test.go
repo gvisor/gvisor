@@ -125,6 +125,25 @@ func TestInvalidNetworkMode(t *testing.T) {
 	}
 }
 
+func TestInvalidCgroupPolicy(t *testing.T) {
+	for _, policy := range []sandbox.CgroupPolicy{
+		sandbox.CgroupPolicyEnforce, sandbox.CgroupPolicyEnforce,
+		sandbox.CgroupPolicyEnforceIfRootful,
+	} {
+		_, err := sandbox.New(context.Background(), sandbox.WithCgroupPolicy(policy))
+		if err != nil {
+			t.Fatalf("sandbox.New error = %v with policy = %s; want nil", err, policy)
+		}
+	}
+
+	invalidPolicy := sandbox.CgroupPolicy("?")
+	_, err := sandbox.New(context.Background(), sandbox.WithCgroupPolicy(invalidPolicy))
+
+	if err == nil || !strings.Contains(err.Error(), "invalid cgroup policy") {
+		t.Errorf("sandbox.New error = %v; want %q", err, "invalid cgroup policy")
+	}
+}
+
 func TestCustomBindMount(t *testing.T) {
 	ctx := context.Background()
 	tempHostDir := t.TempDir()

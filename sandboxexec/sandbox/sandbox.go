@@ -56,6 +56,23 @@ const (
 	NetworkModeSandbox NetworkMode = "sandbox"
 )
 
+// CgroupPolicy controls when runsc gets the --ignore-cgroups flag.
+type CgroupPolicy string
+
+const (
+	// CgroupPolicyIgnore always passes --ignore-cgroups to runsc.
+	CgroupPolicyIgnore CgroupPolicy = "ignore"
+
+	// CgroupPolicyEnforce never passes --ignore-cgroups to runsc. If the
+	// effective UID is not 0, runsc must have write access to a delegated
+	// cgroup, or sandbox creation fails.
+	CgroupPolicyEnforce CgroupPolicy = "enforce"
+
+	// CgroupPolicyEnforceIfRootful passes --ignore-cgroups to runsc only if
+	// the effective UID is not 0. This is the default.
+	CgroupPolicyEnforceIfRootful CgroupPolicy = "enforce-if-rootful"
+)
+
 // Options holds the configuration for a Sandbox.
 type Options struct {
 	runtimeDir string
@@ -70,6 +87,7 @@ type Options struct {
 	err        error
 	workingDir string
 	hostname   string
+	cgroup     CgroupPolicy
 
 	// Process and filesystem layout.
 	rootPath     string
@@ -153,6 +171,18 @@ func WithRuntimeDir(runtimeDir string) Option {
 func WithID(id string) Option {
 	return func(o *Options) {
 		o.id = id
+	}
+}
+
+// WithCgroupPolicy sets the cgroup policy for runsc.
+func WithCgroupPolicy(policy CgroupPolicy) Option {
+	return func(o *Options) {
+		switch policy {
+		case CgroupPolicyEnforce, CgroupPolicyIgnore, CgroupPolicyEnforceIfRootful:
+			o.cgroup = policy
+		default:
+			o.err = fmt.Errorf("invalid cgroup policy %q: must be one of ignore, enforce, enforce-if-rootful", policy)
+		}
 	}
 }
 
@@ -360,6 +390,7 @@ func newOptions(opts ...Option) (*Options, error) {
 	options := &Options{
 		network:    NetworkModeNone,
 		workingDir: "/",
+		cgroup:     CgroupPolicyEnforceIfRootful,
 	}
 	for _, o := range opts {
 		o(options)
@@ -407,8 +438,15 @@ func (o *Options) runscGlobalArgs() []string {
 	if o.stateDir != "" {
 		args = append(args, "--root", o.stateDir)
 	}
-	if os.Geteuid() != 0 {
+	switch o.cgroup {
+	case CgroupPolicyIgnore:
 		args = append(args, "--ignore-cgroups")
+	case CgroupPolicyEnforce:
+		// runsc configures cgroups by default.
+	case CgroupPolicyEnforceIfRootful:
+		if os.Geteuid() != 0 {
+			args = append(args, "--ignore-cgroups")
+		}
 	}
 	switch o.network {
 	case NetworkModeHost:
