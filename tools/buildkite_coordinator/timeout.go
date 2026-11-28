@@ -77,11 +77,23 @@ type pendingTimer struct {
 	// refs is the number of currently running operations on this timer slot.
 	// refs is protected by TimeoutController.mu.
 	refs uint64
+
+	// The latest paid grant owns the remaining refundable minutes. Credits are
+	// intentionally not restored after a restart.
+	// +checklocks:mu
+	refundUnused func(context.Context, time.Duration) error
+	// +checklocks:mu
+	chargedAt time.Time
+	// +checklocks:mu
+	chargedMinutes int64
 }
 
 // TimeoutController deletes instances whose jobs exceed the specified timeout.
 // Each instance's expiry is recorded in its metadata, so timers survive a
 // coordinator restart.
+//
+// Refunds are best-effort within one coordinator lifetime. Restarted timers
+// retain the original full charge.
 //
 // Safe for concurrent use.
 type TimeoutController struct {
@@ -141,11 +153,13 @@ const (
 // RegisterTimeout schedules the instance to be deleted after the specified
 // job timeout. If the instance already has a timeout, policy determines whether
 // RegisterTimeout replaces it. RegisterTimeout returns whether it applied the
-// new timeout.
+// new timeout. refundUnused belongs to a paid replacement grant; it is called
+// at most once for whole unused minutes after replacement or confirmed deletion.
+// ShortenTimeout keeps the existing credit until deletion is confirmed.
 //
 // If RegisterTimeout returns an error, it is guaranteed that the previous timeout
 // was NOT cleared.
-func (tc *TimeoutController) RegisterTimeout(ctx context.Context, id instanceIdentity, timeout time.Duration, policy TimeoutPolicy) (bool, error) {
+func (tc *TimeoutController) RegisterTimeout(ctx context.Context, id instanceIdentity, timeout time.Duration, policy TimeoutPolicy, refundUnused func(context.Context, time.Duration) error) (bool, error) {
 	tc.mu.Lock()
 	pt := tc.pendingTimers[id]
 	if pt == nil {
@@ -179,7 +193,8 @@ func (tc *TimeoutController) RegisterTimeout(ctx context.Context, id instanceIde
 		return false, fmt.Errorf("%v was deleted by timeout expiry", id)
 	}
 
-	expiry := time.Now().Add(timeout)
+	now := time.Now()
+	expiry := now.Add(timeout)
 
 	if pt.timer != nil {
 		switch policy {
@@ -198,6 +213,15 @@ func (tc *TimeoutController) RegisterTimeout(ctx context.Context, id instanceIde
 	if err := id.setExpiryTime(ctx, tc.svc, expiry); err != nil {
 		return false, fmt.Errorf("failed to record expiry for %v: %w", id, err)
 	}
+	if policy == ReplaceTimeout {
+		// The replacement capability supersedes the old grant. Trusted grants
+		// have no refund credit. Keep only the latest grant.
+		pt.refundTime(context.WithoutCancel(ctx), now)
+		pt.refundUnused = refundUnused
+		pt.chargedAt = now
+		pt.chargedMinutes = toMinutes(timeout)
+	}
+
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if pt.timer != nil {
@@ -233,7 +257,7 @@ func (tc *TimeoutController) DeleteUntimedInstances(ctx context.Context, project
 			continue
 		}
 		// Delete the instance right away (unless it got a timeout since we last looked).
-		scheduled, err := tc.RegisterTimeout(ctx, id, 0, IfNoTimeout)
+		scheduled, err := tc.RegisterTimeout(ctx, id, 0, IfNoTimeout, nil)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -271,6 +295,11 @@ func (tc *TimeoutController) registerTimeoutLocked(id instanceIdentity, expiry t
 		defer cancel()
 		err := id.forceDelete(ctx, tc.svc)
 
+		if err == nil {
+			// forceDelete waits for the exact instance to disappear, not merely
+			// for the managed group's deletion request to be accepted.
+			pt.refundTime(ctx, time.Now())
+		}
 		tc.mu.Lock()
 		defer tc.mu.Unlock()
 		if err != nil {
@@ -283,4 +312,21 @@ func (tc *TimeoutController) registerTimeoutLocked(id instanceIdentity, expiry t
 	})
 	tc.pendingTimers[id].timer = timer
 	tc.pendingTimers[id].expiry = expiry
+}
+
+// refundTime consumes the credit before attempting the non-idempotent refund.
+// An error may follow a committed refund, so do not retry it.
+// +checklocks:pt.mu
+func (pt *pendingTimer) refundTime(ctx context.Context, end time.Time) {
+	refund := pt.refundUnused
+	if refund == nil {
+		return
+	}
+	pt.refundUnused = nil
+	unused := max(int64(0), pt.chargedMinutes-toMinutes(end.Sub(pt.chargedAt)))
+	if unused > 0 {
+		if err := refund(ctx, time.Duration(unused)*time.Minute); err != nil {
+			log.Printf("Warning: failed to refund %d unused compute-minutes: %v", unused, err)
+		}
+	}
 }
