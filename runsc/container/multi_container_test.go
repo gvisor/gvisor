@@ -23,6 +23,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1843,6 +1844,234 @@ func TestMultiContainerMount(t *testing.T) {
 	}
 	if !ws.Exited() || ws.ExitStatus() != 0 {
 		t.Error("container failed, waitStatus:", ws)
+	}
+}
+
+// TestMultiContainerHostFSAccess verifies subcontainer admission against the
+// sandbox's host filesystem seccomp level.
+func TestMultiContainerHostFSAccess(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		overlay         string
+		podSandbox      bool
+		rootBindDir     bool
+		rootBindFile    bool
+		subBindFile     bool
+		subBindDir      bool
+		suppressSubDir  bool
+		wantNeedErr     string
+		wantStartSubErr string
+	}{
+		{
+			name: "same access readonly",
+		},
+		{
+			name:            "readonly root rejects file",
+			subBindFile:     true,
+			wantNeedErr:     "needs readwriteexistingfiles access",
+			wantStartSubErr: "only allow readonly",
+		},
+		{
+			name:            "readonly root rejects directory",
+			subBindDir:      true,
+			wantNeedErr:     "needs readwrite access",
+			wantStartSubErr: "only allow readonly",
+		},
+		{
+			name:            "all overlays root rejects unoverlaid subcontainer directory",
+			overlay:         "all:memory",
+			rootBindDir:     true,
+			subBindDir:      true,
+			wantNeedErr:     "needs readwrite access",
+			wantStartSubErr: "only allow readonly",
+		},
+		{
+			name:         "file root allows file",
+			rootBindFile: true,
+			subBindFile:  true,
+		},
+		{
+			name:            "file root rejects directory",
+			rootBindFile:    true,
+			subBindDir:      true,
+			wantNeedErr:     "needs readwrite access",
+			wantStartSubErr: "only allow readwriteexistingfiles",
+		},
+		{
+			name:       "pod sandbox keeps readwrite",
+			podSandbox: true,
+			subBindDir: true,
+		},
+		{
+			name:           "suppressed directfs directory allowed",
+			subBindDir:     true,
+			suppressSubDir: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootDir, cleanupRoot, err := testutil.SetupRootDir()
+			if err != nil {
+				t.Fatalf("error creating root dir: %v", err)
+			}
+			defer cleanupRoot()
+
+			overlay := tc.overlay
+			if overlay == "" {
+				overlay = "root:memory"
+			}
+			conf := testutil.TestConfig(t)
+			conf.RootDir = rootDir
+			conf.DirectFS = true
+			if err := conf.Overlay2.Set(overlay); err != nil {
+				t.Fatalf("Overlay2.Set(%q) failed: %v", overlay, err)
+			}
+
+			tmpDir, err := os.MkdirTemp(testutil.TmpDir(), "host-fs-access")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp() failed: %v", err)
+			}
+			defer os.RemoveAll(tmpDir)
+			hostDir := filepath.Join(tmpDir, "dir")
+			if err := os.Mkdir(hostDir, 0755); err != nil {
+				t.Fatalf("os.Mkdir(%q) failed: %v", hostDir, err)
+			}
+			hostFile := filepath.Join(tmpDir, "file")
+			if err := os.WriteFile(hostFile, []byte("host\n"), 0644); err != nil {
+				t.Fatalf("os.WriteFile(%q) failed: %v", hostFile, err)
+			}
+
+			sps, ids := createSpecs(sleepCmd, sleepCmd)
+			if !tc.podSandbox {
+				delete(sps[0].Annotations, specutils.ContainerdContainerTypeAnnotation)
+			}
+			for _, spec := range sps {
+				spec.Root.Readonly = false
+				spec.Mounts = slices.DeleteFunc(spec.Mounts, func(m specs.Mount) bool {
+					return m.Type == "bind"
+				})
+			}
+			if tc.rootBindDir {
+				sps[0].Mounts = append(sps[0].Mounts, specs.Mount{
+					Type:        "bind",
+					Source:      hostDir,
+					Destination: hostDir,
+				})
+			}
+			if tc.rootBindFile {
+				sps[0].Mounts = append(sps[0].Mounts, specs.Mount{
+					Type:        "bind",
+					Source:      hostFile,
+					Destination: hostFile,
+				})
+			}
+			if tc.subBindFile {
+				sps[1].Mounts = append(sps[1].Mounts, specs.Mount{
+					Type:        "bind",
+					Source:      hostFile,
+					Destination: hostFile,
+				})
+			}
+			if tc.subBindDir {
+				sps[1].Mounts = append(sps[1].Mounts, specs.Mount{
+					Type:        "bind",
+					Source:      hostDir,
+					Destination: hostDir,
+				})
+			}
+			if tc.suppressSubDir {
+				for _, spec := range sps {
+					spec.Annotations[sentryapi.MountPrefix+"m1.source"] = hostDir
+					spec.Annotations[sentryapi.MountPrefix+"m1.type"] = "bind"
+					spec.Annotations[sentryapi.MountPrefix+"m1.share"] = "shared"
+					spec.Annotations[sentryapi.MountPrefix+"m1.directfs"] = "off"
+				}
+			}
+
+			// Start the root container first so a root startup failure cannot
+			// be confused with a subcontainer admission rejection.
+			containers, cleanupRootCont, err := startContainers(conf, sps[:1], ids[:1])
+			if err != nil {
+				t.Fatalf("error starting root container: %v", err)
+			}
+			defer cleanupRootCont()
+
+			// Exercise overlay mutations under the installed filter.
+			if out, err := executeCombinedOutput(conf, containers[0], nil, "/bin/sh", "-c",
+				"set -e; mkdir -p /overlay-test; echo ok > /overlay-test/f; chmod 0600 /overlay-test/f; rm -rf /overlay-test"); err != nil {
+				t.Fatalf("overlay mutations in root container failed: %v (output: %q)", err, out)
+			}
+			if tc.rootBindFile {
+				// Exercise directfs file operations under HostFSReadWriteExistingFiles.
+				if out, err := executeCombinedOutput(conf, containers[0], nil, "/bin/sh", "-c",
+					`set -e; [ "$(cat "$1")" = "host" ]; echo updated > "$1"; chmod 0600 "$1"; touch "$1"`, "--", hostFile); err != nil {
+					t.Fatalf("file mutations in root container failed: %v (output: %q)", err, out)
+				}
+				got, err := os.ReadFile(hostFile)
+				if err != nil {
+					t.Fatalf("os.ReadFile(%q) failed: %v", hostFile, err)
+				}
+				if string(got) != "updated\n" {
+					t.Errorf("hostFile content = %q, want %q", got, "updated\n")
+				}
+				info, err := os.Stat(hostFile)
+				if err != nil {
+					t.Fatalf("os.Stat(%q) failed: %v", hostFile, err)
+				}
+				if info.Mode().Perm() != 0600 {
+					t.Errorf("hostFile mode = %#o, want %#o", info.Mode().Perm(), 0600)
+				}
+			}
+
+			// For the all-overlay case, use a root-only overlay config for the
+			// subcontainer so its bind mount is un-overlaid while the root
+			// container's mounts were all overlaid.
+			subConf := *conf
+			if tc.overlay == "all:memory" {
+				if err := subConf.Overlay2.Set("root:memory"); err != nil {
+					t.Fatalf("Overlay2.Set(root:memory) failed: %v", err)
+				}
+			}
+			subBundle, cleanupSubBundle, err := testutil.SetupBundleDir(sps[1])
+			if err != nil {
+				t.Fatalf("error setting up subcontainer bundle: %v", err)
+			}
+			defer cleanupSubBundle()
+			sub, err := New(&subConf, Args{
+				ID:        ids[1],
+				Spec:      sps[1],
+				BundleDir: subBundle,
+			})
+			if err != nil {
+				t.Fatalf("error creating subcontainer: %v", err)
+			}
+			defer sub.Destroy()
+			err = sub.Start(&subConf)
+			if tc.wantStartSubErr == "" {
+				if err != nil {
+					t.Fatalf("error starting subcontainer: %v", err)
+				}
+				if tc.subBindFile {
+					if out, err := executeCombinedOutput(&subConf, sub, nil, "/bin/sh", "-c",
+						`set -e; [ "$(cat "$1")" = "updated" ]; echo sub > "$1"`, "--", hostFile); err != nil {
+						t.Fatalf("file mutations in subcontainer failed: %v (output: %q)", err, out)
+					}
+					got, err := os.ReadFile(hostFile)
+					if err != nil {
+						t.Fatalf("os.ReadFile(%q) failed: %v", hostFile, err)
+					}
+					if string(got) != "sub\n" {
+						t.Errorf("hostFile content after subcontainer write = %q, want %q", got, "sub\n")
+					}
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("the second container started, want an error containing %q", tc.wantStartSubErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantNeedErr) || !strings.Contains(err.Error(), tc.wantStartSubErr) {
+				t.Errorf("error starting subcontainer: got %v, want an error containing %q and %q", err, tc.wantNeedErr, tc.wantStartSubErr)
+			}
+		})
 	}
 }
 

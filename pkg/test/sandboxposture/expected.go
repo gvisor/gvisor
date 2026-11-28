@@ -200,7 +200,15 @@ type ExpectedOpts struct {
 
 	// Sandbox config options follow.
 
-	DirectFS             bool
+	DirectFS bool
+
+	// NoDirectFSMounts is true when DirectFS is enabled at the sandbox level
+	// but no mount uses directfs (for example, directfs is suppressed via
+	// annotations on every mount, or all mounts are EROFS). The sandbox still
+	// starts with directfs credentials, capabilities, and umask, but closes
+	// /proc/self/fd and holds no host directory FDs.
+	NoDirectFSMounts bool
+
 	NetworkMode          string
 	EnableRaw            bool
 	RequiresCapSysPtrace bool
@@ -358,7 +366,7 @@ func expectedFDs(opts ExpectedOpts) FDTable {
 		)
 	}
 	hasDirs := false
-	if opts.DirectFS {
+	if opts.DirectFS && !opts.NoDirectFSMounts {
 		// A directfs sandbox holds directory descriptors to open files
 		// without gofer roundtrip.
 		classes = append(classes, FDDirectory, FDSymlink)

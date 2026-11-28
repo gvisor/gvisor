@@ -1032,17 +1032,53 @@ func (c *containerMounter) prepareMounts(conf *config.Config) ([]mountInfo, erro
 	return mounts, nil
 }
 
+func (c *containerMounter) isDirectFSBindMount(conf *config.Config, submount *mountInfo) bool {
+	return conf.DirectFS && (submount.hint == nil || !submount.hint.SuppressDirectFS) && !c.l.root.conf.DisableSeccomp && submount.mount.Type == sentryapi.Bind
+}
+
+// checkDirectFSMountAllowed verifies before mounting that the sandbox's host
+// filesystem seccomp level is sufficient for the mount configuration.
 func (c *containerMounter) checkDirectFSMountAllowed(conf *config.Config, submount *mountInfo, overlaid bool) error {
-	directFS := conf.DirectFS && (submount.hint == nil || !submount.hint.SuppressDirectFS)
-	if !directFS || c.l.root.conf.DisableSeccomp || submount.mount.Type != sentryapi.Bind {
+	if !c.isDirectFSBindMount(conf, submount) {
 		return nil
 	}
 	need := filter.HostFSReadWrite
 	if overlaid {
 		need = filter.HostFSReadOnly
+	} else if submount.goferMountConf.NonDir {
+		need = filter.HostFSReadWriteExistingFiles
 	}
 	if c.hostFS < need {
 		return fmt.Errorf("mount %q (dest: %q) needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", submount.mount.Source, submount.mount.Destination, need, c.hostFS)
+	}
+	return nil
+}
+
+// checkMountRootMode verifies after mounting that the mounted root's actual
+// file type is compatible with the sandbox's host filesystem seccomp level.
+// Directories and symlinks require HostFSReadWrite (directfs uses path-based
+// utimensat on /proc/self/fd for symlinks).
+func (c *containerMounter) checkMountRootMode(conf *config.Config, submount *mountInfo, rootMode linux.FileMode, overlaid bool) error {
+	if !c.isDirectFSBindMount(conf, submount) {
+		return nil
+	}
+	if overlaid {
+		if c.hostFS < filter.HostFSReadOnly {
+			return fmt.Errorf("mount %q (dest: %q) needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", submount.mount.Source, submount.mount.Destination, filter.HostFSReadOnly, c.hostFS)
+		}
+		return nil
+	}
+	if c.hostFS >= filter.HostFSReadWrite {
+		return nil
+	}
+	if rootMode.IsDir() {
+		return fmt.Errorf("mount %q (dest: %q) is a directory and needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", submount.mount.Source, submount.mount.Destination, filter.HostFSReadWrite, c.hostFS)
+	}
+	if rootMode.FileType() == linux.S_IFLNK {
+		return fmt.Errorf("mount %q (dest: %q) is a symlink and needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", submount.mount.Source, submount.mount.Destination, filter.HostFSReadWrite, c.hostFS)
+	}
+	if c.hostFS < filter.HostFSReadWriteExistingFiles {
+		return fmt.Errorf("mount %q (dest: %q) needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", submount.mount.Source, submount.mount.Destination, filter.HostFSReadWriteExistingFiles, c.hostFS)
 	}
 	return nil
 }
@@ -1109,6 +1145,9 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 	rootMode, err := c.getPathMode(ctx, creds, rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("stat mount %q (dest: %q): %w", mount.Source, mount.Destination, err)
+	}
+	if err := c.checkMountRootMode(conf, submount, rootMode, submount.goferMountConf.ShouldUseOverlayfs()); err != nil {
+		return nil, err
 	}
 	if err := c.makeMountPoint(ctx, creds, mns, mount.Destination, rootMode); err != nil {
 		return nil, fmt.Errorf("creating mount point %q: %w", mount.Destination, err)
@@ -1742,7 +1781,31 @@ func (c *containerMounter) mountSharedMaster(ctx context.Context, spec *specs.Sp
 	if len(fsName) == 0 {
 		return nil, fmt.Errorf("mount type not supported %q", mntInfo.hint.Mount.Type)
 	}
-	return c.l.k.VFS().MountDisconnected(ctx, creds, "", fsName, opts)
+	mnt, err := c.l.k.VFS().MountDisconnected(ctx, creds, "", fsName, opts)
+	if err != nil {
+		return nil, err
+	}
+	if c.isDirectFSBindMount(conf, mntInfo) && c.hostFS < filter.HostFSReadWrite {
+		cu := cleanup.Make(func() {
+			mnt.DecRef(ctx)
+		})
+		defer cu.Clean()
+
+		vd := vfs.MakeVirtualDentry(mnt, mnt.Root())
+		rootPath := &vfs.PathOperation{
+			Root:  vd,
+			Start: vd,
+		}
+		rootMode, err := c.getPathMode(ctx, creds, rootPath)
+		if err != nil {
+			return nil, fmt.Errorf("stat shared mount %q (dest: %q): %w", mntInfo.mount.Source, mntInfo.mount.Destination, err)
+		}
+		if err := c.checkMountRootMode(conf, mntInfo, rootMode, false /* overlaid */); err != nil {
+			return nil, err
+		}
+		cu.Release()
+	}
+	return mnt, nil
 }
 
 // mountSharedSubmount binds mount to a previously mounted volume that is shared

@@ -1355,7 +1355,26 @@ func (l *Loader) rootHostFSAccess() filter.HostFSAccess {
 	if !l.root.conf.DirectFS {
 		return filter.HostFSNone
 	}
-	return filter.HostFSReadWrite
+	// The seccomp filters cannot change after the sandbox starts, and the
+	// mounts of the containers that start later are not known yet.
+	if l.noRootContainer.enabled || specutils.SpecContainerType(l.root.spec) != specutils.ContainerTypeUnspecified {
+		return filter.HostFSReadWrite
+	}
+	need, err := containerHostFSAccess(l.root.conf, l.root.spec, l.root.goferMountConfs, l.mountHints, l.root.devGoferFD != nil)
+	if err != nil {
+		return filter.HostFSReadWrite
+	}
+	if need > filter.HostFSNone && need < filter.HostFSReadWrite {
+		// Precompiled seccomp programs only exist for HostFSNone and
+		// HostFSReadWrite when a device proxy is enabled.
+		hasDeviceProxy := specutils.NVProxyEnabled(l.root.spec, l.root.conf) ||
+			specutils.TPUProxyEnabled(l.root.spec, l.root.conf) ||
+			specutils.RDMAEnabled(l.root.spec, l.root.conf)
+		if hasDeviceProxy {
+			return filter.HostFSReadWrite
+		}
+	}
+	return need
 }
 
 func (l *Loader) restoreHostFSAccess() filter.HostFSAccess {
@@ -1377,7 +1396,9 @@ func (l *Loader) checkDirectFSMount() error {
 	return nil
 }
 
-func subcontainerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []specutils.GoferMountConf, mountHints *sentryapi.PodMountHints, hasDevGofer bool) (filter.HostFSAccess, error) {
+// containerHostFSAccess returns the access to the host filesystem that the
+// Sentry needs for the gofer mounts and the device gofer of a container.
+func containerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []specutils.GoferMountConf, mountHints *sentryapi.PodMountHints, hasDevGofer bool) (filter.HostFSAccess, error) {
 	if !conf.DirectFS {
 		return filter.HostFSNone, nil
 	}
@@ -1435,6 +1456,8 @@ func subcontainerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs 
 			}
 			if mc.ShouldUseOverlayfs() && (hint == nil || !hint.ShouldShareMount()) {
 				need = max(need, filter.HostFSReadOnly)
+			} else if mc.NonDir {
+				need = max(need, filter.HostFSReadWriteExistingFiles)
 			} else {
 				return filter.HostFSReadWrite, nil
 			}
@@ -1444,6 +1467,8 @@ func subcontainerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs 
 		if mountConfs[mountIdx].ShouldUseLisafs() {
 			if mountConfs[mountIdx].ShouldUseOverlayfs() {
 				need = max(need, filter.HostFSReadOnly)
+			} else if mountConfs[mountIdx].NonDir {
+				need = max(need, filter.HostFSReadWriteExistingFiles)
 			} else {
 				return filter.HostFSReadWrite, nil
 			}
@@ -1457,7 +1482,7 @@ func (l *Loader) checkSubcontainerHostFSAccess(conf *config.Config, spec *specs.
 	if l.root.conf.DisableSeccomp {
 		return nil
 	}
-	need, err := subcontainerHostFSAccess(conf, spec, mountConfs, l.mountHints, hasDevGofer)
+	need, err := containerHostFSAccess(conf, spec, mountConfs, l.mountHints, hasDevGofer)
 	if err != nil {
 		return err
 	}
