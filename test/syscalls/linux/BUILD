@@ -1784,6 +1784,7 @@ cc_binary(
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
+        "//test/util:cleanup",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
         "//test/util:posix_error",
@@ -1793,6 +1794,7 @@ cc_binary(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "//test/util:time_util",
         "//test/util:timer_util",
         "@com_google_absl//absl/time",
     ],
