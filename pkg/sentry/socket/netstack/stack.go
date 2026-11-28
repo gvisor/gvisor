@@ -1393,9 +1393,6 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 			}
 			route.DstAddr = value
 		case linux.RTA_SRC:
-			if len(value) < 1 {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
 			route.SrcAddr = value
 		case linux.RTA_OIF:
 			oif := nlmsg.BytesView(value)
@@ -1422,8 +1419,17 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 	switch route.Family {
 	case linux.AF_INET:
 		zero = tcpip.IPv4Zero
+		if route.SrcAddr != nil && len(route.SrcAddr) < header.IPv4AddressSize {
+			return tcpip.Route{}, syserr.ErrRange
+		}
 	case linux.AF_INET6:
 		zero = tcpip.IPv6Zero
+		if route.SrcAddr != nil && len(route.SrcAddr)*8 < int(route.SrcLen) {
+			return tcpip.Route{}, syserr.ErrInvalidArgument
+		}
+		if route.SrcLen != 0 && msg.Header().Type == linux.RTM_NEWROUTE {
+			return tcpip.Route{}, syserr.ErrInvalidArgument
+		}
 	default:
 		return tcpip.Route{}, syserr.ErrNotSupported
 	}
@@ -1475,10 +1481,6 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 		Destination: dest,
 		Gateway:     tcpip.AddrFromSlice(route.GatewayAddr),
 		NIC:         tcpip.NICID(route.OutputInterface),
-	}
-
-	if len(route.SrcAddr) != 0 {
-		localRoute.SourceHint = tcpip.AddrFromSlice(route.SrcAddr)
 	}
 
 	return localRoute, nil
