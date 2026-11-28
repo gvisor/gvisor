@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -48,9 +49,9 @@ const (
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
 )
 
-func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
+func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) (SaveStage, error) {
 	if o.CudaCheckpointPath == "" {
-		return nil
+		return SaveUnprepared, nil
 	}
 
 	wasPaused := k.IsPaused()
@@ -64,30 +65,42 @@ func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 		if k.IsPaused() {
 			// If the kernel is still paused, we don't understand/expect this state.
 			k.Pause() // Revert the unpause from above.
-			return fmt.Errorf("kernel is double paused before checkpoint")
+			return SaveUnprepared, fmt.Errorf("kernel is double paused before checkpoint")
 		}
 	}
 	sctx := k.SupervisorContext()
 	cudaProcs := cudaProcs(sctx, k, o.CudaCheckpointPath, k.NvidiaDriverVersion.Major())
+	if len(cudaProcs) == 0 {
+		if wasPaused {
+			k.Pause()
+		}
+		return SaveUnprepared, nil
+	}
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvLock()
 	}
-	err := toggleCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, nil, o.CudaCheckpointSequential)
+	preparedProcs, err := toggleCudaProcs(sctx, k, o.CudaCheckpointPath, cudaProcs, nil, o.CudaCheckpointSequential)
 	if wasPaused {
 		k.Pause()
 	}
-	if err != nil {
-		// FIXME: b/456299722
-		for _, tg := range cudaProcs {
-			tg.SigsegvUnlock()
+	// Only prepared processes retain their SIGSEGV locks until resume. The
+	// successful subset is in input order, including on partial failure.
+	preparedIndex := 0
+	for _, tg := range cudaProcs {
+		if preparedIndex < len(preparedProcs) && tg == preparedProcs[preparedIndex] {
+			preparedIndex++
+			continue
 		}
-		return err
+		tg.SigsegvUnlock()
+	}
+	if len(preparedProcs) == 0 {
+		return SaveUnprepared, err
 	}
 	k.AddStateToCheckpoint(cudaCheckpointPathKey, o.CudaCheckpointPath)
 	k.AddStateToCheckpoint(cudaCheckpointSequentialKey, o.CudaCheckpointSequential)
-	k.AddStateToCheckpoint(cudaProcsKey, cudaProcs)
-	return nil
+	k.AddStateToCheckpoint(cudaProcsKey, preparedProcs)
+	return SaveCUDAPrepared, err
 }
 
 // cudaProcs returns a list of all CUDA processes in the sandbox. It selects
@@ -158,7 +171,7 @@ func postResumeCuda(k *kernel.Kernel, timeline *timing.Timeline) error {
 	cudaProcs := k.PopCheckpointState(cudaProcsKey).([]*kernel.ThreadGroup)
 	timeline.Reached("starting cuda-ckpt")
 	// FIXME: b/460451448 - pass --device-map to cuda-checkpoint if accepted
-	err := toggleCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential)
+	_, err := toggleCudaProcs(k.SupervisorContext(), k, cudaCheckpointPath, cudaProcs, timeline, cudaCheckpointSequential)
 	// FIXME: b/456299722
 	for _, tg := range cudaProcs {
 		tg.SigsegvUnlock()
@@ -323,7 +336,7 @@ func filterCudaProcsUsingGetState(sctx context.Context, k *kernel.Kernel, cudaCh
 	return res
 }
 
-func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeline *timing.Timeline, sequential bool) error {
+func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath string, cudaProcs []*kernel.ThreadGroup, timeline *timing.Timeline, sequential bool) ([]*kernel.ThreadGroup, error) {
 	start := time.Now()
 
 	// Open /dev/null once for the stdin of all cuda-checkpoint processes.
@@ -402,53 +415,41 @@ func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath 
 			ckptProc.tg.WaitExited()
 		}
 		if status := ckptProc.tg.ExitStatus(); status != 0 {
+			var output string
 			if ckptProc.out != nil {
-				errs = append(errs, fmt.Errorf("%q failed with exit status %d; output: %q", ckptProc.desc, status, ckptProc.out.String()))
-			} else {
-				errs = append(errs, fmt.Errorf("%q failed with exit status %d", ckptProc.desc, status))
+				output = ckptProc.out.String()
 			}
+			errs = append(errs, cudaCheckpointFailure(ckptProc.desc, status, output))
 			delete(ckptProcs, cudaProc)
 		} else if log.IsLogging(log.Debug) && ckptProc.out != nil {
 			log.Debugf("%s succeeded; output: %q", ckptProc.desc, ckptProc.out.String())
 		}
 	}
 	timeline.Reached("cuda-ckpts waited")
-	if len(errs) > 0 {
-		// If any cuda-checkpoint process failed, we need to undo the --toggle
-		// operation for all the successful ones to restore the original state.
-		// This is best-effort.
-		undoCkptProcs := make(map[string]checkpointProc)
-		for cudaProc, ckptProc := range ckptProcs {
-			undoCkptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, "--toggle", nullFD)
-			if err != nil {
-				log.Warningf("Failed to invoke cuda-checkpoint to undo %q: %v", ckptProc.desc, err)
-				continue
-			}
-			if undoCkptProc.tg == nil {
-				continue
-			}
-			if sequential {
-				undoCkptProc.tg.WaitExited()
-			}
-			undoCkptProcs[ckptProc.desc] = undoCkptProc
-			defer cleanup()
+	preparedProcs := make([]*kernel.ThreadGroup, 0, len(ckptProcs))
+	for _, cudaProc := range cudaProcs {
+		if _, ok := ckptProcs[cudaProc]; ok {
+			preparedProcs = append(preparedProcs, cudaProc)
 		}
-		for ckptProcDesc, undoCkptProc := range undoCkptProcs {
-			if !sequential {
-				undoCkptProc.tg.WaitExited()
-			}
-			if status := undoCkptProc.tg.ExitStatus(); status != 0 {
-				if undoCkptProc.out != nil {
-					log.Warningf("Undoing %q failed with exit status %d; output: %q", ckptProcDesc, status, undoCkptProc.out.String())
-				} else {
-					log.Warningf("Undoing %q failed with exit status %d", ckptProcDesc, status)
-				}
-			}
-		}
-		// Combine all errors and return.
-		return errors.Join(errs...)
 	}
-	log.Infof("cuda-checkpoint on %d processes took [%s]", len(ckptProcs), time.Since(start))
-	timeline.Reached("cuda-ckpts done")
-	return nil
+	if len(errs) == 0 {
+		log.Infof("cuda-checkpoint on %d processes took [%s]", len(preparedProcs), time.Since(start))
+		timeline.Reached("cuda-ckpts done")
+	}
+	return preparedProcs, errors.Join(errs...)
+}
+
+func cudaCheckpointFailure(desc string, status linux.WaitStatus, output string) error {
+	var err error
+	if output != "" {
+		err = fmt.Errorf("%q failed with exit status %d; output: %q", desc, status, output)
+	} else {
+		err = fmt.Errorf("%q failed with exit status %d", desc, status)
+	}
+	// cuda-checkpoint reports CUDA_ERROR_NOT_READY in its output and exposes no
+	// structured error to the caller.
+	if strings.Contains(output, "device not ready") {
+		return fmt.Errorf("%w: %w", err, controlapi.ErrCudaNotReady)
+	}
+	return err
 }
