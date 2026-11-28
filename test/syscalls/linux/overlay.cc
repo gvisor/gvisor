@@ -31,6 +31,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -44,6 +45,7 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/flags/flag.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
@@ -59,6 +61,8 @@
 #include "test/util/socket_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+
+ABSL_FLAG(int32_t, scratch_uid, 65534, "scratch UID");
 
 namespace gvisor {
 namespace testing {
@@ -571,6 +575,332 @@ TEST(OverlayTest, DirectoryRenameInUserNamespace) {
     TEST_CHECK(S_ISREG(st.st_mode));
   };
 
+  EXPECT_THAT(InForkedUserMountNamespace(parent, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// Mounts a tmpfs at base and an overlay at base/merged, with its layers inside
+// the tmpfs, and returns the overlay's root. An empty directory is created in
+// the lower layer for each of lower_dirs. Unlike
+// OverlayOnTmpfs::MountOverlay(), this never adds userxattr, so inside a user
+// namespace the overlay falls back to noxattr mode. Called from the child of
+// InForkedUserMountNamespace(); the mounts go away when the child exits.
+std::string MountOverlayOnTmpfs(const std::string& base,
+                                std::initializer_list<const char*> lower_dirs) {
+  TEST_CHECK_SUCCESS(
+      mount(kTmpfs, base.c_str(), kTmpfs, 0, "mode=1777,size=10m"));
+  auto lower = JoinPath(base, "lower");
+  auto upper = JoinPath(base, "upper");
+  auto work = JoinPath(base, "work");
+  auto merged = JoinPath(base, "merged");
+  for (const std::string& dir : {lower, upper, work, merged}) {
+    TEST_CHECK_SUCCESS(mkdir(dir.c_str(), 0755));
+  }
+  for (const char* name : lower_dirs) {
+    TEST_CHECK_SUCCESS(mkdir(JoinPath(lower, name).c_str(), 0755));
+  }
+  std::string opts =
+      absl::StrCat("lowerdir=", lower, ",upperdir=", upper, ",workdir=", work);
+  TEST_CHECK_SUCCESS(
+      mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
+  return merged;
+}
+
+// Returns true if an overlay mounted by MountOverlayOnTmpfs() inside a new
+// user namespace is in noxattr mode: it can't set the xattrs it uses to mark
+// directories opaque. gVisor always behaves this way, but some distro kernels
+// don't: Ubuntu's, for example, default to userxattr when overlayfs is mounted
+// in a user namespace.
+PosixErrorOr<bool> OverlayIsNoxattrInUserNamespace() {
+  ASSIGN_OR_RETURN_ERRNO(TempPath base_dir, TempPath::CreateDir());
+  const std::function<void()> parent = [] {};
+  const std::function<void()> child = [&base_dir] {
+    std::string merged = MountOverlayOnTmpfs(base_dir.path(), {});
+    // Renaming a pure upper directory within a merge directory requires
+    // marking it opaque, which fails with EXDEV only in noxattr mode.
+    auto dir = JoinPath(merged, "dir");
+    TEST_CHECK_SUCCESS(mkdir(dir.c_str(), 0755));
+    if (rename(dir.c_str(), JoinPath(merged, "renamed").c_str()) == 0) {
+      _exit(1);
+    }
+    TEST_PCHECK(errno == EXDEV);
+  };
+  ASSIGN_OR_RETURN_ERRNO(int status, InForkedUserMountNamespace(parent, child));
+  if (!WIFEXITED(status) || WEXITSTATUS(status) > 1) {
+    return PosixError(ECHILD, absl::StrCat("probe child failed: ", status));
+  }
+  return WEXITSTATUS(status) == 0;
+}
+
+// Renaming a directory on an overlay mounted without userxattr inside a user
+// namespace triggers noxattr mode (trusted.overlay.* xattrs are not available).
+// Renaming a merged directory, or a pure upper directory within a merged
+// directory, returns EXDEV.
+TEST(OverlayTest, DirectoryRenameInUserNamespaceNoxattrFallback) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  SKIP_IF(!IsRunningOnGvisor() &&
+          !ASSERT_NO_ERRNO_AND_VALUE(OverlayIsNoxattrInUserNamespace()));
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  const std::function<void()> parent = [] {};
+  const std::function<void()> child = [&base_dir] {
+    std::string merged =
+        MountOverlayOnTmpfs(base_dir.path(), {"mydir", "renamed"});
+    auto mydir = JoinPath(merged, "mydir");
+    auto renamed = JoinPath(merged, "renamed");
+    TEST_CHECK_ERRNO(rename(mydir.c_str(), renamed.c_str()), EXDEV);
+
+    // Linux decides it can't move a merge or lower directory before checking
+    // that the directory it replaces is empty, so this is still EXDEV once
+    // renamed has a file in it.
+    TEST_CHECK_SUCCESS(
+        mknod(JoinPath(renamed, "file").c_str(), S_IFREG | 0644, 0));
+    TEST_CHECK_ERRNO(rename(mydir.c_str(), renamed.c_str()), EXDEV);
+
+    // A pure upper directory moving within a merged directory would need an
+    // opaque marker, so it gets EXDEV too, and stays where it was.
+    auto upper_dir = JoinPath(merged, "upper_dir");
+    TEST_CHECK_SUCCESS(mkdir(upper_dir.c_str(), 0755));
+    TEST_CHECK_SUCCESS(
+        mknod(JoinPath(upper_dir, "file").c_str(), S_IFREG | 0644, 0));
+    TEST_CHECK_ERRNO(
+        rename(upper_dir.c_str(), JoinPath(merged, "upper_dir2").c_str()),
+        EXDEV);
+    struct stat st;
+    TEST_CHECK_SUCCESS(stat(JoinPath(upper_dir, "file").c_str(), &st));
+
+    // But Linux checks that a replaced directory with lower layers is empty
+    // before marking the moved one opaque, so this gets ENOTEMPTY instead.
+    TEST_CHECK_ERRNO(rename(upper_dir.c_str(), renamed.c_str()), ENOTEMPTY);
+  };
+  EXPECT_THAT(InForkedUserMountNamespace(parent, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// Same setup as above, but either end of the rename is a mount point. Linux
+// checks for mount points in vfs_rename() before overlayfs gets a say, so this
+// returns EBUSY rather than the noxattr EXDEV.
+TEST(OverlayTest, MountpointRenameInUserNamespaceNoxattrReturnsEBUSY) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  SKIP_IF(!IsRunningOnGvisor() &&
+          !ASSERT_NO_ERRNO_AND_VALUE(OverlayIsNoxattrInUserNamespace()));
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  const std::function<void()> parent = [] {};
+  const std::function<void()> child = [&base_dir] {
+    std::string merged =
+        MountOverlayOnTmpfs(base_dir.path(), {"mydir", "renamed"});
+    auto mydir = JoinPath(merged, "mydir");
+    auto renamed = JoinPath(merged, "renamed");
+
+    // The source is a mount point.
+    TEST_CHECK_SUCCESS(mount(kTmpfs, mydir.c_str(), kTmpfs, 0, nullptr));
+    TEST_CHECK_ERRNO(rename(mydir.c_str(), JoinPath(merged, "fresh").c_str()),
+                     EBUSY);
+    TEST_CHECK_SUCCESS(umount(mydir.c_str()));
+
+    // The target is a mount point.
+    TEST_CHECK_SUCCESS(mount(kTmpfs, renamed.c_str(), kTmpfs, 0, nullptr));
+    TEST_CHECK_ERRNO(rename(mydir.c_str(), renamed.c_str()), EBUSY);
+    TEST_CHECK_SUCCESS(umount(renamed.c_str()));
+
+    // The target is a mount point over a non-empty directory, e.g. a mount
+    // over an image directory. Linux checks for mount points before
+    // emptiness, so this is EBUSY rather than ENOTEMPTY.
+    TEST_CHECK_SUCCESS(
+        mknod(JoinPath(renamed, "file").c_str(), S_IFREG | 0644, 0));
+    TEST_CHECK_SUCCESS(mount(kTmpfs, renamed.c_str(), kTmpfs, 0, nullptr));
+    TEST_CHECK_ERRNO(rename(mydir.c_str(), renamed.c_str()), EBUSY);
+    TEST_CHECK_SUCCESS(umount(renamed.c_str()));
+  };
+  EXPECT_THAT(InForkedUserMountNamespace(parent, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// Same setup as above, but for RENAME_EXCHANGE. Exchanging directories that
+// would need to be marked opaque returns EXDEV in noxattr mode, while
+// exchanging directories whose parent has no lower layers still succeeds.
+TEST(OverlayTest, DirectoryExchangeInUserNamespaceNoxattrFallback) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  // gVisor only supports RENAME_EXCHANGE when running under runsc.
+  SKIP_IF(IsRunningOnGvisor() && !IsRunningOnRunsc());
+  SKIP_IF(!IsRunningOnGvisor() &&
+          !ASSERT_NO_ERRNO_AND_VALUE(OverlayIsNoxattrInUserNamespace()));
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  const std::function<void()> parent = [] {};
+  const std::function<void()> child = [&base_dir] {
+    std::string merged = MountOverlayOnTmpfs(base_dir.path(), {"mydir"});
+
+    // Two pure upper directories whose parent has a lower layer: each would
+    // need to be marked opaque at its new location, which noxattr can't do.
+    auto a = JoinPath(merged, "a");
+    auto b = JoinPath(merged, "b");
+    TEST_CHECK_SUCCESS(mkdir(a.c_str(), 0755));
+    TEST_CHECK_SUCCESS(mkdir(b.c_str(), 0755));
+    int fd = open(JoinPath(a, "file").c_str(), O_WRONLY | O_CREAT, 0644);
+    TEST_CHECK_SUCCESS(fd);
+    TEST_CHECK_SUCCESS(close(fd));
+    TEST_CHECK_ERRNO(
+        renameat2(AT_FDCWD, a.c_str(), AT_FDCWD, b.c_str(), RENAME_EXCHANGE),
+        EXDEV);
+
+    // A merge directory can't be moved without redirect_dir, whichever side
+    // of the exchange it's on. Its counterpart is a regular file, which can
+    // always be moved, so only the merge directory can cause the EXDEV.
+    auto mydir = JoinPath(merged, "mydir");
+    auto file = JoinPath(a, "file");
+    TEST_CHECK_ERRNO(renameat2(AT_FDCWD, file.c_str(), AT_FDCWD, mydir.c_str(),
+                               RENAME_EXCHANGE),
+                     EXDEV);
+    TEST_CHECK_ERRNO(renameat2(AT_FDCWD, mydir.c_str(), AT_FDCWD, file.c_str(),
+                               RENAME_EXCHANGE),
+                     EXDEV);
+
+    // None of the failed exchanges moved anything.
+    struct stat st;
+    TEST_CHECK_SUCCESS(stat(JoinPath(a, "file").c_str(), &st));
+
+    // Inside a pure upper parent nothing needs to be marked opaque, so the
+    // exchange goes ahead.
+    auto sub = JoinPath(merged, "sub");
+    auto p = JoinPath(sub, "p");
+    auto q = JoinPath(sub, "q");
+    TEST_CHECK_SUCCESS(mkdir(sub.c_str(), 0755));
+    TEST_CHECK_SUCCESS(mkdir(p.c_str(), 0755));
+    TEST_CHECK_SUCCESS(mkdir(q.c_str(), 0755));
+    fd = open(JoinPath(p, "file").c_str(), O_WRONLY | O_CREAT, 0644);
+    TEST_CHECK_SUCCESS(fd);
+    TEST_CHECK_SUCCESS(close(fd));
+    TEST_CHECK_SUCCESS(
+        renameat2(AT_FDCWD, p.c_str(), AT_FDCWD, q.c_str(), RENAME_EXCHANGE));
+    TEST_CHECK_SUCCESS(stat(JoinPath(q, "file").c_str(), &st));
+    TEST_CHECK_ERRNO(stat(JoinPath(p, "file").c_str(), &st), ENOENT);
+  };
+  EXPECT_THAT(InForkedUserMountNamespace(parent, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// With userxattr, permission to set user.* xattrs depends on the inode: only
+// the owner may set them on a sticky directory. If the upper layer root is
+// sticky and owned by another user, the mount-time probe on it fails, but the
+// mounter can still mark its own directories opaque, so renaming one within
+// the root succeeds, as on Linux.
+TEST(OverlayTest, UserxattrRenameInStickyUpperRootOwnedByAnotherUser) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_CHOWN)));
+  // Before Linux 6.6, tmpfs doesn't support the user.* xattrs needed.
+  if (!IsRunningOnGvisor()) {
+    KernelVersion version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 6 || (version.major == 6 && version.minor < 6));
+  }
+
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(kTmpfs, base_dir.path(), kTmpfs, 0, "mode=0755", MNT_DETACH));
+  const std::string lower = JoinPath(base_dir.path(), "lower");
+  const std::string upper = JoinPath(base_dir.path(), "upper");
+  const std::string work = JoinPath(base_dir.path(), "work");
+  const std::string merged = JoinPath(base_dir.path(), "merged");
+  for (const std::string& dir : {lower, upper, work, merged}) {
+    ASSERT_THAT(mkdir(dir.c_str(), 0755), SyscallSucceeds());
+  }
+  ASSERT_THAT(mkdir(JoinPath(lower, "mydir").c_str(), 0755), SyscallSucceeds());
+  // InForkedUserMountNamespace() only maps our own UID, so inside the user
+  // namespace a directory owned by scratch_uid belongs to another user. The
+  // native test runner also maps only our own UID, so scratch_uid doesn't
+  // exist there and chown fails with EINVAL. To check this test against
+  // Linux, run the test binary directly as root.
+  const int chown_ret =
+      chown(upper.c_str(), absl::GetFlag(FLAGS_scratch_uid), -1);
+  SKIP_IF(chown_ret < 0 && errno == EINVAL);
+  ASSERT_THAT(chown_ret, SyscallSucceeds());
+  ASSERT_THAT(chmod(upper.c_str(), 01777), SyscallSucceeds());
+
+  const std::function<void()> parent = [] {};
+  const std::function<void()> child = [&] {
+    std::string opts = absl::StrCat("lowerdir=", lower, ",upperdir=", upper,
+                                    ",workdir=", work, ",userxattr");
+    TEST_CHECK_SUCCESS(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
+    // A pure upper directory moving within the merged root needs an opaque
+    // marker, which the mounter can set on a directory it owns.
+    auto dir = JoinPath(merged, "dir");
+    TEST_CHECK_SUCCESS(mkdir(dir.c_str(), 0755));
+    TEST_CHECK_SUCCESS(
+        rename(dir.c_str(), JoinPath(merged, "renamed").c_str()));
+
+    // Merge and lower directories still return EXDEV, since gVisor writes
+    // their marker after the rename and can't let that write decide. Linux
+    // returns EXDEV here too unless redirect_dir is enabled, so only check
+    // this on gVisor.
+    if (IsRunningOnGvisor()) {
+      TEST_CHECK_ERRNO(rename(JoinPath(merged, "mydir").c_str(),
+                              JoinPath(merged, "mydir2").c_str()),
+                       EXDEV);
+    }
+  };
+  EXPECT_THAT(InForkedUserMountNamespace(parent, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// A pure upper directory moving within a merged directory needs an opaque
+// marker. If the mounter may not write it, e.g. because the directory is
+// sticky and owned by another user, a marker that's already set still lets
+// the rename go ahead, as on Linux, which skips the write for a directory
+// that's already opaque. Without one, the rename fails with EPERM.
+TEST(OverlayTest, UserxattrRenameAcceptsExistingOpaqueMarker) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_CHOWN)));
+  // Before Linux 6.6, tmpfs doesn't support the user.* xattrs needed.
+  if (!IsRunningOnGvisor()) {
+    KernelVersion version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 6 || (version.major == 6 && version.minor < 6));
+  }
+
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(kTmpfs, base_dir.path(), kTmpfs, 0, "mode=0755", MNT_DETACH));
+  const std::string lower = JoinPath(base_dir.path(), "lower");
+  const std::string upper = JoinPath(base_dir.path(), "upper");
+  const std::string work = JoinPath(base_dir.path(), "work");
+  const std::string merged = JoinPath(base_dir.path(), "merged");
+  for (const std::string& dir : {lower, upper, work, merged}) {
+    ASSERT_THAT(mkdir(dir.c_str(), 0755), SyscallSucceeds());
+  }
+  // Two pure upper directories owned by scratch_uid, which inside the user
+  // namespace is another user (see
+  // UserxattrRenameInStickyUpperRootOwnedByAnotherUser). Only one of them is
+  // already opaque.
+  const std::string marked = JoinPath(upper, "marked");
+  const std::string unmarked = JoinPath(upper, "unmarked");
+  for (const std::string& dir : {marked, unmarked}) {
+    ASSERT_THAT(mkdir(dir.c_str(), 0755), SyscallSucceeds());
+  }
+  ASSERT_THAT(setxattr(marked.c_str(), "user.overlay.opaque", "y", 1, 0),
+              SyscallSucceeds());
+  for (const std::string& dir : {marked, unmarked}) {
+    const int chown_ret =
+        chown(dir.c_str(), absl::GetFlag(FLAGS_scratch_uid), -1);
+    SKIP_IF(chown_ret < 0 && errno == EINVAL);
+    ASSERT_THAT(chown_ret, SyscallSucceeds());
+    ASSERT_THAT(chmod(dir.c_str(), 01777), SyscallSucceeds());
+  }
+
+  const std::function<void()> parent = [] {};
+  const std::function<void()> child = [&] {
+    std::string opts = absl::StrCat("lowerdir=", lower, ",upperdir=", upper,
+                                    ",workdir=", work, ",userxattr");
+    TEST_CHECK_SUCCESS(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
+    TEST_CHECK_SUCCESS(rename(JoinPath(merged, "marked").c_str(),
+                              JoinPath(merged, "marked2").c_str()));
+    TEST_CHECK_ERRNO(rename(JoinPath(merged, "unmarked").c_str(),
+                            JoinPath(merged, "unmarked2").c_str()),
+                     EPERM);
+  };
   EXPECT_THAT(InForkedUserMountNamespace(parent, child),
               IsPosixErrorOkAndHolds(0));
 }
