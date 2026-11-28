@@ -243,7 +243,7 @@ printf '{"exitStatus":%d}'
 	// Like the shim's reaper, do not block a thread in wait4(2): a blocked
 	// thread is never ended, which would keep the forking thread alive.
 	oldMonitor := Monitor
-	Monitor = pollingMonitor{}
+	Monitor = &LogMonitor{Next: pollingMonitor{}}
 	t.Cleanup(func() { Monitor = oldMonitor })
 
 	r := &Runsc{
@@ -252,7 +252,7 @@ printf '{"exitStatus":%d}'
 		PdeathSignal: unix.SIGKILL,
 	}
 	// Start the waits from many goroutines, so that without a dedicated
-	// start thread they fork from many OS threads.
+	// locked thread they fork from many OS threads.
 	const numWaits = 32
 	var wg sync.WaitGroup
 	errs := make([]error, numWaits)
@@ -361,20 +361,23 @@ func (m *tidMonitor) Wait(cmd *exec.Cmd, _ chan runc.Exit) (int, error) {
 	return cmd.ProcessState.ExitCode(), nil
 }
 
-// TestCommandsStartOnStartThread verifies that each Runsc start path (direct,
-// runOrError, cmdOutput, with and without IO) starts a command with a
-// parent-death signal from the same OS thread, which is not the thread of the
+// TestPdeathsigCommandsStartOffCallerThread verifies that each Runsc start
+// path (direct, runOrError, cmdOutput, with and without IO) starts a command
+// with a parent-death signal from an OS thread that is not the thread of the
 // caller, and starts a command without a parent-death signal from the thread
-// of the caller.
-func TestCommandsStartOnStartThread(t *testing.T) {
+// of the caller. It checks only which thread starts each command;
+// TestWaitSurvivesLockedThreadExit checks that the thread stays alive.
+func TestPdeathsigCommandsStartOffCallerThread(t *testing.T) {
 	dir := t.TempDir()
+	// Exec creates a temporary file in XDG_RUNTIME_DIR.
+	t.Setenv("XDG_RUNTIME_DIR", dir)
 	script := filepath.Join(dir, "fake-runsc")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	m := &tidMonitor{}
 	oldMonitor := Monitor
-	Monitor = m
+	Monitor = &LogMonitor{Next: m}
 	t.Cleanup(func() { Monitor = oldMonitor })
 
 	r := &Runsc{
@@ -418,14 +421,16 @@ func TestCommandsStartOnStartThread(t *testing.T) {
 		"Kill": func(ctx context.Context) { r.Kill(ctx, "cid", 9, nil) },
 	}
 
-	// Run each call on its own locked thread, and keep all of these threads
-	// alive until every call returns, so that no two calls share a thread.
+	// Run each call on its own locked thread. Lock all of these threads
+	// before any call starts, and keep them until every call returns, so that
+	// no call runs on the thread of another call or of a started command.
 	var (
 		done, release sync.WaitGroup
 		mu            sync.Mutex
 		callerTIDs    = map[int]bool{}
 		noPdeathTID   int
 	)
+	begin := make(chan struct{})
 	release.Add(1)
 	run := func(call func(ctx context.Context)) int {
 		done.Add(1)
@@ -438,6 +443,7 @@ func TestCommandsStartOnStartThread(t *testing.T) {
 			callerTIDs[tid] = true
 			mu.Unlock()
 			tidCh <- tid
+			<-begin
 			call(t.Context())
 			done.Done()
 			release.Wait()
@@ -448,6 +454,7 @@ func TestCommandsStartOnStartThread(t *testing.T) {
 		run(call)
 	}
 	noPdeathTID = run(func(ctx context.Context) { noPdeathsig.Kill(ctx, "cid", 9, nil) })
+	close(begin)
 	done.Wait()
 	release.Done()
 	// Let the Wait calls that run after their Runsc method returned (Events)
@@ -460,13 +467,9 @@ func TestCommandsStartOnStartThread(t *testing.T) {
 		t.Fatalf("got %d starts with a parent-death signal, want %d", len(m.pdeathsigTIDs), len(calls))
 	}
 	for _, tid := range m.pdeathsigTIDs {
-		if tid != m.pdeathsigTIDs[0] {
-			t.Errorf("commands with a parent-death signal started from threads %v, want one thread", m.pdeathsigTIDs)
-			break
+		if callerTIDs[tid] {
+			t.Errorf("command with a parent-death signal started from caller thread %d", tid)
 		}
-	}
-	if callerTIDs[m.pdeathsigTIDs[0]] {
-		t.Errorf("command with a parent-death signal started from caller thread %d", m.pdeathsigTIDs[0])
 	}
 	if len(m.otherTIDs) != 1 || m.otherTIDs[0] != noPdeathTID {
 		t.Errorf("commands without a parent-death signal started from threads %v, want caller thread %d", m.otherTIDs, noPdeathTID)

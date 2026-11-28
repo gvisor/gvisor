@@ -17,55 +17,54 @@ package runsccmd
 import (
 	"os/exec"
 	"runtime"
-	"sync"
 
 	runc "github.com/containerd/go-runc"
+	"golang.org/x/sys/unix"
 )
 
-// startThread returns a channel that carries functions to run on the thread
-// that forks commands with a parent-death signal. The first call starts the
-// goroutine that serves it.
-var startThread = sync.OnceValue(func() chan<- func() {
-	ch := make(chan func())
-	go func() {
-		// Do not unlock: the thread must stay alive for the lifetime of the
-		// process, and no other goroutine may run on it.
-		runtime.LockOSThread()
-		// If this goroutine exits (for example, if f calls runtime.Goexit),
-		// Go ends the thread, the children it forked get their parent-death
-		// signal, and later starts block forever. Crash instead.
-		defer panic("runsccmd: start thread exited")
-		for f := range ch {
-			f()
-		}
-	}()
-	return ch
-})
-
-// startMonitored starts cmd with Monitor. If cmd has a parent-death signal,
-// it starts cmd on an OS thread that is locked to one goroutine and never
-// exits. These starts run one at a time.
+// startLocked starts cmd with m on a new goroutine, which stays locked to its
+// OS thread until the child process exits.
 //
 // Linux sends the parent-death signal of a child (PR_SET_PDEATHSIG) when the
 // thread that forked the child exits, not when the process exits. Go ends an
 // OS thread when a goroutine exits while it is locked to that thread, which
 // some libraries do on purpose (for example, containerd's mount.Mount for
-// overlay mounts with long options). Without a dedicated thread, such a
-// goroutine can end the thread that forked a running child, and the child
-// then gets its parent-death signal.
-func startMonitored(cmd *exec.Cmd) (chan runc.Exit, error) {
-	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Pdeathsig == 0 {
-		return Monitor.Start(cmd)
-	}
-	var (
+// overlay mounts with long options). A thread that is locked to a goroutine
+// runs no other goroutine, so no such library call can end it.
+//
+// The goroutine waits for the child to exit with WNOWAIT, so the child is
+// still reaped by m (for example, by containerd's reaper).
+func startLocked(m ProcessMonitor, cmd *exec.Cmd) (chan runc.Exit, error) {
+	type result struct {
 		ec  chan runc.Exit
 		err error
-	)
-	done := make(chan struct{})
-	startThread() <- func() {
-		defer close(done)
-		ec, err = Monitor.Start(cmd)
 	}
-	<-done
-	return ec, err
+	started := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		ec, err := m.Start(cmd)
+		pid := 0
+		if err == nil {
+			pid = cmd.Process.Pid
+		}
+		started <- result{ec: ec, err: err}
+		if err == nil {
+			waitExited(pid)
+		}
+		runtime.UnlockOSThread()
+	}()
+	r := <-started
+	return r.ec, r.err
+}
+
+// waitExited blocks until the child process pid exits, without reaping it. It
+// also returns if pid is not a child, for example because it was already
+// reaped.
+func waitExited(pid int) {
+	for {
+		var info unix.Siginfo
+		if err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT, nil); err != unix.EINTR {
+			return
+		}
+	}
 }

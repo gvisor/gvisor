@@ -46,14 +46,13 @@ type ProcessMonitor interface {
 	Wait(cmd *exec.Cmd, ch chan runc.Exit) (int, error)
 }
 
-// Monitor is the default process monitor to be used by runsc. Start commands
-// with startMonitored, not Monitor.Start, so that commands with a
-// parent-death signal start on a thread that never exits.
+// Monitor is the default process monitor to be used by runsc.
 var Monitor ProcessMonitor = &LogMonitor{Next: runc.Monitor}
 
 // LogMonitor implements the runc.ProcessMonitor interface, logging the command
 // that is getting executed, and then forwarding the call to another
-// implementation.
+// implementation. It starts a command that has a parent-death signal on an OS
+// thread that does not exit before the command; see startLocked.
 type LogMonitor struct {
 	Next ProcessMonitor
 }
@@ -61,6 +60,9 @@ type LogMonitor struct {
 // Start implements runc.ProcessMonitor.
 func (l *LogMonitor) Start(cmd *exec.Cmd) (chan runc.Exit, error) {
 	log.L.Debugf("Executing: %s", cmd.Args)
+	if cmd.SysProcAttr != nil && cmd.SysProcAttr.Pdeathsig != 0 {
+		return startLocked(l.Next, cmd)
+	}
 	return l.Next.Start(cmd)
 }
 
@@ -175,7 +177,7 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 		}
 		return nil
 	}
-	ec, err := startMonitored(cmd)
+	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		return err
 	}
@@ -243,7 +245,7 @@ func (r *Runsc) start(context context.Context, cio runc.IO, cmd *exec.Cmd) error
 		return nil
 	}
 
-	ec, err := startMonitored(cmd)
+	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		return err
 	}
@@ -525,7 +527,7 @@ func (r *Runsc) Exec(context context.Context, id string, spec specs.Process, opt
 		}
 		return nil
 	}
-	ec, err := startMonitored(cmd)
+	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		return err
 	}
@@ -558,7 +560,7 @@ func (r *Runsc) Run(context context.Context, id, bundle string, opts *CreateOpts
 	if opts != nil && opts.IO != nil {
 		opts.Set(cmd)
 	}
-	ec, err := startMonitored(cmd)
+	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		return -1, err
 	}
@@ -642,7 +644,7 @@ func (r *Runsc) Events(context context.Context, id string, interval time.Duratio
 	if err != nil {
 		return nil, err
 	}
-	ec, err := startMonitored(cmd)
+	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		rd.Close()
 		return nil, err
@@ -736,7 +738,7 @@ func (r *Runsc) args() []string {
 // will be returned in the format of <error>: <stderr>.
 func (r *Runsc) runOrError(cmd *exec.Cmd) error {
 	if cmd.Stdout != nil || cmd.Stderr != nil {
-		ec, err := startMonitored(cmd)
+		ec, err := Monitor.Start(cmd)
 		if err != nil {
 			return err
 		}
@@ -786,7 +788,7 @@ func cmdOutput(cmd *exec.Cmd, combined bool) ([]byte, []byte, error) {
 		defer putBuf(stderr)
 		cmd.Stderr = stderr
 	}
-	ec, err := startMonitored(cmd)
+	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		return nil, nil, err
 	}
