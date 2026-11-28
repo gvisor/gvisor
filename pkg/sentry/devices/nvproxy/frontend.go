@@ -1750,6 +1750,9 @@ func rmAllocIMEXSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 		fi.ctx.Warningf("nvproxy: rmAllocIMEXSession got capDescriptor file of incompatible type %T", capsFileGeneric.Impl())
 		return 0, linuxerr.EINVAL
 	}
+	if capsFile.hostFD < 0 {
+		return 0, linuxerr.EINVAL
+	}
 	allocParams.CapDescriptor = uint64(capsFile.hostFD)
 
 	origEventFD := allocParams.POsEvent
@@ -1794,6 +1797,9 @@ func rmAllocMNCCSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 	capsFile, ok := capsFileGeneric.Impl().(*openOnlyFD)
 	if !ok {
 		fi.ctx.Warningf("nvproxy: rmAllocMNCCSession got capDescriptor file of incompatible type %T", capsFileGeneric.Impl())
+		return 0, linuxerr.EINVAL
+	}
+	if capsFile.hostFD < 0 {
 		return 0, linuxerr.EINVAL
 	}
 	allocParams.CapDescriptor = uint64(capsFile.hostFD)
