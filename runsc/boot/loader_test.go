@@ -240,6 +240,61 @@ func TestRun(t *testing.T) {
 	}
 }
 
+// exitTaskWork is a kernel.TaskWorker that requeues itself until it runs after
+// the task has released its MemoryManager, which happens only on exit.
+type exitTaskWork struct {
+	ranOnExit chan struct{}
+}
+
+// TaskWork implements kernel.TaskWorker.TaskWork.
+func (w *exitTaskWork) TaskWork(t *kernel.Task) {
+	if t.MemoryManager() != nil {
+		t.RegisterWork(w)
+		return
+	}
+	close(w.ranOnExit)
+}
+
+// TestExitRunsPendingTaskWork checks that a task killed while it has task work
+// pending runs that work on exit, as Linux's do_exit() calls exit_task_work()
+// after exit_mm().
+func TestExitRunsPendingTaskWork(t *testing.T) {
+	spec := testSpec()
+	spec.Process.Args = []string{"/bin/sleep", "1000"}
+	l, cleanup, err := createLoader(testConfig(), spec)
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer l.Destroy()
+	defer cleanup()
+
+	go func() {
+		if err := <-l.ctrl.manager.startResultChan; err != nil {
+			t.Errorf("error on startResultChan: %v", err)
+		}
+	}()
+	if err := l.Run(); err != nil {
+		t.Fatalf("error running container: %v", err)
+	}
+
+	work := &exitTaskWork{ranOnExit: make(chan struct{})}
+	init := l.k.GlobalInit()
+	if !init.Leader().RegisterWork(work) {
+		t.Fatal("RegisterWork failed before the task exited")
+	}
+	if err := l.k.SendExternalSignalThreadGroup(init, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
+		t.Fatalf("error sending SIGKILL: %v", err)
+	}
+	if status := l.WaitExit(); !status.Signaled() || status.TerminationSignal() != linux.SIGKILL {
+		t.Errorf("application exited with %s, want SIGKILL", status)
+	}
+	select {
+	case <-work.ranOnExit:
+	default:
+		t.Error("pending task work did not run on exit")
+	}
+}
+
 // TestStartSignal tests that the controller Start message will cause
 // WaitForStartSignal to return.
 func TestStartSignal(t *testing.T) {
