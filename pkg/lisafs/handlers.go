@@ -85,6 +85,7 @@ var handlers = [...]RPCHandler{
 	ConnectWithCreds:  ConnectWithCredsHandler,
 	RenameAt2:         RenameAt2Handler,
 	ConnectWithGroups: ConnectWithGroupsHandler,
+	SyncFS:            SyncFSHandler,
 }
 
 // ErrorHandler handles Error message.
@@ -166,7 +167,7 @@ func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 			ControlFD: c.publishFD(mountPointFD),
 			Stat:      mountPointStat,
 		},
-		SupportedMs:    c.impl.SupportedMessages(),
+		SupportedMs:    c.supportedMessages(),
 		MaxMessageSize: primitive.Uint32(c.maxMessageSize),
 	}
 	respPayloadLen := uint32(resp.SizeBytes())
@@ -655,6 +656,29 @@ func CloseHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 
 	// There is no response message for this.
 	return 0, nil
+}
+
+// SyncFSHandler syncs the configured volume selected by its backing st_dev.
+func SyncFSHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
+	var device primitive.Uint64
+	if payloadLen != uint32(device.SizeBytes()) {
+		return 0, unix.EIO
+	}
+	device.UnmarshalBytes(comm.PayloadBuf(payloadLen))
+	if c.opts.SyncFS == nil || uint64(device) != c.opts.SyncFSDevice {
+		return 0, unix.EOPNOTSUPP
+	}
+	var wbErr primitive.Uint32
+	if err := c.opts.SyncFS(); err != nil {
+		errno := ExtractErrno(err)
+		if errno == unix.EINTR || errno == unix.EAGAIN {
+			return 0, errno
+		}
+		wbErr = primitive.Uint32(errno)
+	}
+	size := uint32(wbErr.SizeBytes())
+	wbErr.MarshalBytes(comm.PayloadBuf(size))
+	return size, nil
 }
 
 // FSyncHandler handles the FSync RPC.

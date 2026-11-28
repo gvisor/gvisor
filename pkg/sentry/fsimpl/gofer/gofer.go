@@ -248,6 +248,21 @@ type filesystem struct {
 	syncableDentries dentryList
 	specialFileFDs   specialFDList
 
+	// Eviction can flush a file after its last description is closed.
+	lostWriteback    atomicbitops.Uint32
+	pendingWriteback atomicbitops.Uint32 // Errors on the granted root device.
+
+	exportSyncMu sync.Mutex `state:"nosave"`
+	// +checklocks:exportSyncMu
+	writebackSequence uint32
+	// +checklocks:exportSyncMu
+	writebackErrno uint32
+	// New descriptions start at the last error reported to a syncfs caller.
+	acknowledgedWriteback atomicbitops.Uint32
+
+	// volumeSync is set after the root is initialized and must survive restore.
+	volumeSync atomicbitops.Bool
+
 	// devMinorByHostDev maps host device numbers, as encoded by unix.Mkdev,
 	// to minor device numbers assigned to files on those devices. It is only
 	// used if !opts.virtualInodeNumbers. Host device numbers may change
@@ -264,6 +279,11 @@ type filesystem struct {
 	// files across checkpoint/restore. inoByKey is protected by inoMu.
 	inoMu    sync.Mutex        `state:"nosave"`
 	inoByKey map[inoKey]uint64 `state:"nosave"`
+
+	// virtualSyncDevices tracks devices observed on a volume with virtual
+	// inode numbers. It is rebuilt with inoByKey on restore.
+	// +checklocks:inoMu
+	virtualSyncDevices map[uint64]struct{} `state:"nosave"`
 	// inodeByKey maps inoKey to non-directory inodes. inodeByKey is protected by
 	// inodeMu. inodeByKey is similar to inoByKey, except that it is not an
 	// ever-growing map. This is to allow for the sharing of inodes across
@@ -715,6 +735,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// caller, and the other is held by fs to prevent the root from being "cached"
 	// and subsequently evicted.
 	fs.root.refs = atomicbitops.FromInt64(2)
+	fs.volumeSync.Store(fs.clientSupportsVolumeSync())
 	return &fs.vfsfs, &fs.root.vfsd, nil
 }
 
@@ -736,6 +757,11 @@ func (fs *filesystem) initClientAndGetRoot(ctx context.Context) (lisafs.Inode, i
 	fs.client, rootInode, rootHostFD, err = lisafs.NewClient(sock)
 	if err != nil {
 		return lisafs.Inode{}, -1, err
+	}
+	if fs.opts.virtualInodeNumbers && fs.clientSupportsVolumeSync() {
+		fs.inoMu.Lock()
+		fs.virtualSyncDevices = make(map[uint64]struct{})
+		fs.inoMu.Unlock()
 	}
 
 	cu := cleanup.Make(func() {
@@ -907,6 +933,10 @@ type inoKey struct {
 	ino      uint64
 	devMinor uint32
 	devMajor uint32
+}
+
+func (k inoKey) device() uint64 {
+	return unix.Mkdev(k.devMajor, k.devMinor)
 }
 
 func inoKeyFromStatx(stat *lisafs.Statx) inoKey {
@@ -1134,6 +1164,16 @@ func (i *inode) cachedMetadataAuthoritative() bool {
 	return i.fs.opts.interop != InteropModeShared || i.isSynthetic()
 }
 
+func (i *inode) recordLostWriteback(err error) {
+	fs := i.fs
+	errno := uint32(lisafs.ExtractErrno(err))
+	if fs.volumeSync.Load() && i.inoKey.device() == fs.root.inode.inoKey.device() {
+		fs.pendingWriteback.CompareAndSwap(0, errno)
+	} else {
+		fs.lostWriteback.CompareAndSwap(0, errno)
+	}
+}
+
 func (i *inode) destroy(ctx context.Context, d *dentry) {
 	i.handleMu.Lock()
 	defer i.handleMu.Unlock()
@@ -1144,6 +1184,7 @@ func (i *inode) destroy(ctx context.Context, d *dentry) {
 		// Write dirty pages back to the remote filesystem.
 		h := i.writeHandle()
 		if err := fsutil.SyncDirtyAll(ctx, &i.cache, &i.dirty, i.size.Load(), mf, h.writeFromBlocksAt); err != nil {
+			i.recordLostWriteback(err)
 			log.Warningf("gofer.dentry.destroyLocked: failed to write dirty data back: %v", err)
 		}
 	}
@@ -1316,8 +1357,16 @@ func (fs *filesystem) inoFromKey(key inoKey) uint64 {
 		return ino
 	}
 	ino := fs.nextIno()
-	fs.inoByKey[key] = ino
+	fs.recordIno(key, ino)
 	return ino
+}
+
+// +checklocks:fs.inoMu
+func (fs *filesystem) recordIno(key inoKey, ino uint64) {
+	fs.inoByKey[key] = ino
+	if fs.virtualSyncDevices != nil {
+		fs.virtualSyncDevices[key.device()] = struct{}{}
+	}
 }
 
 // devMinorFromKey returns the minor device number of the file identified by
@@ -1406,7 +1455,7 @@ func (i *inode) restoreInoKey(key inoKey) error {
 	i.inoKey = key
 	if i.fs.opts.virtualInodeNumbers {
 		i.fs.inoMu.Lock()
-		i.fs.inoByKey[key] = i.ino
+		i.fs.recordIno(key, i.ino)
 		i.fs.inoMu.Unlock()
 	} else {
 		i.ino = key.ino

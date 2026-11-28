@@ -85,6 +85,10 @@ type Options struct {
 	// Grouping indicates if shim grouping should be enabled.
 	Grouping bool `toml:"grouping" json:"grouping"`
 
+	// DedicatedSyncFSVolume matches the host source of one writable bind mount
+	// whose entire filesystem the operator authorizes the container to sync.
+	DedicatedSyncFSVolume string `toml:"dedicated_syncfs_volume" json:"dedicatedSyncFSVolume,omitempty"`
+
 	// EnableHibernateServer indicates if the hibernate server should be started.
 	EnableHibernateServer bool `toml:"enable_hibernate_server" json:"enableHibernateServer"`
 

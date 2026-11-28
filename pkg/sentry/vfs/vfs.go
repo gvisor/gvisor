@@ -1114,7 +1114,7 @@ func (vfs *VirtualFilesystem) DrainDentryCache(ctx context.Context, creds *auth.
 func (vfs *VirtualFilesystem) SyncAllFilesystems(ctx context.Context) error {
 	var retErr error
 	for _, fs := range vfs.GetFilesystems() {
-		if err := fs.impl.Sync(ctx); err != nil && retErr == nil {
+		if err := fs.impl.Sync(ctx, FilesystemSyncOptions{ForGlobalSync: true}); err != nil && retErr == nil {
 			retErr = err
 		}
 		fs.DecRef(ctx)

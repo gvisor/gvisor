@@ -62,6 +62,13 @@ type ConnectionOpts struct {
 	// OpenOnDeleted is set to true if it's safe to call ControlFDImpl.Open for
 	// deleted files.
 	OpenOnDeleted bool
+
+	// SyncFS flushes the entire exported root filesystem, including closed
+	// files, and returns outstanding writeback errors. A nil callback disables it.
+	SyncFS func() error
+
+	// SyncFSDevice is the host st_dev of the root when SyncFS is configured.
+	SyncFSDevice uint64
 }
 
 // NewServer creates a new Server.

@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
@@ -51,48 +52,236 @@ func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
 }
 
 // Sync implements vfs.FilesystemImpl.Sync.
-func (fs *filesystem) Sync(ctx context.Context) error {
-	// Snapshot current syncable dentries and special file FDs.
+func (fs *filesystem) Sync(ctx context.Context, opts vfs.FilesystemSyncOptions) error {
+	if !fs.volumeSync.Load() {
+		handles := fs.activeHandles()
+		return fs.finishWriteback(handles.sync(ctx), opts)
+	}
+	fs.exportSyncMu.Lock()
+	defer fs.exportSyncMu.Unlock()
+	device := fs.root.inode.inoKey.device()
+	var others activeSyncHandles
+	active := fs.activeHandlesForDevice(device, &others)
+	firstErr := fs.syncVolume(ctx, active.sync(ctx), nil)
+	otherErr := others.sync(ctx)
+	if firstErr != nil {
+		fs.retainWriteback(otherErr)
+		return firstErr
+	}
+	if err := fs.finishWriteback(otherErr, opts); err != nil {
+		return err
+	}
+	// Checkpoint and stacked filesystems synchronize the whole export without a target dentry.
+	if !opts.ForGlobalSync && !fs.coversObservedDevices(device) {
+		return unix.EOPNOTSUPP
+	}
+	return nil
+}
+
+func (fs *filesystem) retainWriteback(err error) {
+	if errno := fileWritebackErrno(err); errno != 0 {
+		fs.lostWriteback.CompareAndSwap(0, uint32(errno))
+	}
+}
+
+func (fs *filesystem) finishWriteback(err error, opts vfs.FilesystemSyncOptions) error {
+	if opts.ForGlobalSync {
+		fs.retainWriteback(err)
+	} else if err == nil {
+		if errno := fs.lostWriteback.Swap(0); errno != 0 {
+			return unix.Errno(errno)
+		}
+	}
+	return err
+}
+
+func (fs *filesystem) clientSupportsVolumeSync() bool {
+	return fs.opts.aname == "/" && fs.client.IsSupported(lisafs.SyncFS)
+}
+
+func (d *dentry) syncDevice() uint64 {
+	if !d.inode.isSynthetic() {
+		return d.inode.inoKey.device()
+	}
+	fs := d.inode.fs
+	fs.renameMu.RLock()
+	defer fs.renameMu.RUnlock()
+	return d.syncDeviceLocked()
+}
+
+// Precondition: d.inode.fs.renameMu must be held for reading.
+func (d *dentry) syncDeviceLocked() uint64 {
+	for d.inode.isSynthetic() {
+		parent := d.parent.Load()
+		if parent == nil {
+			break
+		}
+		d = parent
+	}
+	return d.inode.inoKey.device()
+}
+
+// SampleSyncFSError implements vfs.FilesystemImplSyncFSExtension.
+func (fs *filesystem) SampleSyncFSError() uint32 {
+	return fs.acknowledgedWriteback.Load()
+}
+
+// SyncFilesystem implements vfs.FilesystemImplSyncFSExtension.
+func (fs *filesystem) SyncFilesystem(ctx context.Context, vd *vfs.Dentry, cursor *uint32) error {
+	if !fs.volumeSync.Load() {
+		return fs.Sync(ctx, vfs.FilesystemSyncOptions{})
+	}
+	device := vd.Impl().(*dentry).syncDevice()
+	if device != fs.root.inode.inoKey.device() {
+		return unix.EOPNOTSUPP
+	}
+	fs.exportSyncMu.Lock()
+	defer fs.exportSyncMu.Unlock()
+	active := fs.activeHandlesForDevice(device, nil)
+	return fs.syncVolume(ctx, active.sync(ctx), cursor)
+}
+
+func (fs *filesystem) coversObservedDevices(rootDevice uint64) bool {
+	if fs.opts.virtualInodeNumbers {
+		fs.inoMu.Lock()
+		defer fs.inoMu.Unlock()
+		for device := range fs.virtualSyncDevices {
+			if device != rootDevice {
+				return false
+			}
+		}
+		return true
+	}
+	fs.devMu.RLock()
+	defer fs.devMu.RUnlock()
+	for device := range fs.devMinorByHostDev {
+		if device != rootDevice {
+			return false
+		}
+	}
+	return true
+}
+
+type activeSyncHandles struct {
+	dentries []*dentry
+	special  []*specialFileFD
+}
+
+func (fs *filesystem) activeHandles() activeSyncHandles {
 	fs.syncMu.Lock()
-	ds := make([]*dentry, 0, fs.syncableDentries.Len())
+	defer fs.syncMu.Unlock()
+	handles := activeSyncHandles{
+		dentries: make([]*dentry, 0, fs.syncableDentries.Len()),
+		special:  make([]*specialFileFD, 0, fs.specialFileFDs.Len()),
+	}
 	for elem := fs.syncableDentries.Front(); elem != nil; elem = elem.Next() {
-		ds = append(ds, elem.d)
+		handles.dentries = append(handles.dentries, elem.d)
 	}
-	sffds := make([]*specialFileFD, 0, fs.specialFileFDs.Len())
-	for sffd := fs.specialFileFDs.Front(); sffd != nil; sffd = sffd.Next() {
-		sffds = append(sffds, sffd)
+	for fd := fs.specialFileFDs.Front(); fd != nil; fd = fd.Next() {
+		handles.special = append(handles.special, fd)
 	}
-	fs.syncMu.Unlock()
+	return handles
+}
 
-	// Return the first error we encounter, but sync everything we can
-	// regardless.
-	var retErr error
+// activeHandlesForDevice optionally collects handles on other devices in others.
+func (fs *filesystem) activeHandlesForDevice(device uint64, others *activeSyncHandles) activeSyncHandles {
+	fs.syncMu.Lock()
+	defer fs.syncMu.Unlock()
+	var active activeSyncHandles
+	group := func(d *dentry) *activeSyncHandles {
+		if d.inode.inoKey.device() == device {
+			return &active
+		}
+		return others
+	}
+	for elem := fs.syncableDentries.Front(); elem != nil; elem = elem.Next() {
+		if g := group(elem.d); g != nil {
+			g.dentries = append(g.dentries, elem.d)
+		}
+	}
+	for fd := fs.specialFileFDs.Front(); fd != nil; fd = fd.Next() {
+		if g := group(fd.dentry()); g != nil {
+			g.special = append(g.special, fd)
+		}
+	}
+	return active
+}
 
+// Per-file flushes can also fail before reaching storage.
+func fileWritebackErrno(err error) unix.Errno {
+	if err != nil {
+		if errno, ok := lisafs.TryExtractErrno(err); ok {
+			switch errno {
+			case unix.EIO, unix.ENOSPC, unix.EDQUOT, unix.EREMOTEIO:
+				return errno
+			}
+		}
+	}
+	return 0
+}
+
+// +checklocks:fs.exportSyncMu
+func (fs *filesystem) syncVolume(ctx context.Context, activeErr error, cursor *uint32) error {
+	errno, err := fs.client.SyncFilesystem(ctx, fs.root.inode.inoKey.device())
+	if errno == 0 {
+		switch {
+		case activeErr != nil:
+			errno = fileWritebackErrno(activeErr)
+			if errno == 0 {
+				return activeErr
+			}
+		case err != nil:
+			return err
+		default:
+			errno = unix.Errno(fs.pendingWriteback.Swap(0))
+		}
+	}
+	if errno != 0 {
+		fs.writebackSequence++
+		if fs.writebackSequence == 0 {
+			fs.writebackSequence = 1
+		}
+		fs.writebackErrno = uint32(errno)
+	}
+	if cursor != nil && *cursor != fs.writebackSequence {
+		*cursor = fs.writebackSequence
+		fs.acknowledgedWriteback.Store(*cursor)
+		return unix.Errno(fs.writebackErrno)
+	}
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (handles *activeSyncHandles) sync(ctx context.Context) (retErr error) {
 	// Note that lisafs is capable of batching FSync RPCs. However, we can not
-	// batch all the FDIDs to be synced from ds and sffds. Because the error
-	// handling varies based on file type. FSync errors are only considered for
+	// batch all the dentries and special file FDIDs because error handling
+	// varies based on file type. FSync errors are only considered for
 	// regular file FDIDs that were opened for writing. We could do individual
 	// RPCs for such FDIDs and batch the rest, but it increases code complexity
 	// substantially. We could implement it in the future if need be.
 
+	recordError := func(err error) {
+		if retErr == nil || (fileWritebackErrno(retErr) == 0 && fileWritebackErrno(err) != 0) {
+			retErr = err
+		}
+	}
+
 	// Sync syncable dentries.
-	for _, d := range ds {
+	for _, d := range handles.dentries {
 		if err := d.syncCachedFile(ctx, true /* forFilesystemSync */, false /* dataOnly */); err != nil {
 			ctx.Infof("gofer.filesystem.Sync: dentry.syncCachedFile failed: %v", err)
-			if retErr == nil {
-				retErr = err
-			}
+			recordError(err)
 		}
 	}
 
 	// Sync special files, which may be writable but do not use dentry shared
 	// handles (so they won't be synced by the above).
-	for _, sffd := range sffds {
+	for _, sffd := range handles.special {
 		if err := sffd.sync(ctx, true /* forFilesystemSync */, false /* dataOnly */); err != nil {
 			ctx.Infof("gofer.filesystem.Sync: specialFileFD.sync failed: %v", err)
-			if retErr == nil {
-				retErr = err
-			}
+			recordError(err)
 		}
 	}
 
@@ -1606,6 +1795,11 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 
 	if oldParent == newParent && oldName == newName {
 		return nil
+	}
+	// A synthetic inode has no host rename to enforce the device boundary.
+	if oldParent != newParent && (renamed.inode.isSynthetic() || (exchange && replaced.inode.isSynthetic())) &&
+		fs.volumeSync.Load() && oldParent.syncDeviceLocked() != newParent.syncDeviceLocked() {
+		return linuxerr.EXDEV
 	}
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)

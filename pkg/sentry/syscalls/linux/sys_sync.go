@@ -23,7 +23,9 @@ import (
 
 // Sync implements Linux syscall sync(2).
 func Sync(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	return 0, nil, t.Kernel().VFS().SyncAllFilesystems(t)
+	// sync(2) has no error return. syncfs(2) reports writeback errors.
+	t.Kernel().VFS().SyncAllFilesystems(t)
+	return 0, nil, nil
 }
 
 // Syncfs implements Linux syscall syncfs(2).

@@ -23,6 +23,24 @@ Values under `[runsc_config]` can be used to set arbitrary flags to runsc.
 `flag = "value"` is converted to `--flag="value"` when runsc is invoked. Run
 `runsc flags` so see which flags are available
 
+To let a container synchronize a dedicated filesystem, set the top-level shim
+option `dedicated_syncfs_volume` to the host source of its writable bind mount.
+The operator must control that path and dedicate the entire filesystem to the
+sandbox. A process in another container in the same sandbox can also trigger
+writeback on the volume by calling `sync(2)`.
+
+For a particular Kubernetes PV, a pattern such as
+`/var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/pvc-EXAMPLE/mount` can match
+the pod-specific publish path. A `*` matches within a single path component.
+An unmatched container starts normally. At most one writable mount may match.
+The runtime checks that the selected mount exposes the root of a separate
+filesystem. This option requires a writable stock gofer mount without a
+runtime overlay. Configure it in the node's shim TOML before `[runsc_config]`.
+
+If the bind includes a nested filesystem on another device, `syncfs(2)` on
+that device returns `EOPNOTSUPP`. After the sandbox accesses that device,
+checkpointing the sandbox can also fail with this error.
+
 Next, containerd needs to be configured to send the configuration file to the
 shim.
 

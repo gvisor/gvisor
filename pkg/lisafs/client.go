@@ -21,8 +21,10 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
 )
@@ -354,6 +356,32 @@ func (c *Client) SyncFDs(ctx context.Context, fds []FDID) error {
 	err := c.SndRcvMessage(FSync, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String)
 	ctx.UninterruptibleSleepFinish()
 	return err
+}
+
+// SyncFilesystem returns the backing filesystem's writeback errno separately
+// from errors issuing the request.
+func (c *Client) SyncFilesystem(ctx context.Context, id uint64) (unix.Errno, error) {
+	device := primitive.Uint64(id)
+	var wbErr primitive.Uint32
+	ctx.UninterruptibleSleepStart()
+	defer ctx.UninterruptibleSleepFinish()
+	decode := func(src []byte) ([]byte, bool) {
+		rest, ok := wbErr.CheckedUnmarshal(src)
+		if !ok || len(rest) != 0 || wbErr > 4095 {
+			return nil, false
+		}
+		if wbErr != 0 {
+			if _, restart := linuxerr.SyscallRestartErrorFromReturn(-uintptr(wbErr)); restart || unix.Errno(wbErr) == unix.EINTR || unix.Errno(wbErr) == unix.EAGAIN {
+				return nil, false
+			}
+		}
+		return rest, true
+	}
+	err := c.SndRcvMessage(SyncFS, uint32(device.SizeBytes()), device.MarshalBytes, decode, nil, func() string { return fmt.Sprintf("device=%d", id) }, func() string { return fmt.Sprintf("writeback errno=%d", wbErr) })
+	if err != nil {
+		return 0, err
+	}
+	return unix.Errno(wbErr), nil
 }
 
 // SndRcvMessage invokes reqMarshal to marshal the request onto the payload

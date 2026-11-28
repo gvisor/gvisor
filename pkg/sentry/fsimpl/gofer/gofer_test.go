@@ -19,16 +19,20 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/overlay"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -212,6 +216,8 @@ func TestXattrCacheList(t *testing.T) {
 }
 
 type recycledInoConnImpl struct {
+	write      func([]byte, uint64) (uint64, error)
+	targetSync func() error
 	mu         sync.Mutex
 	rootStat   lisafs.Statx
 	targetStat lisafs.Statx
@@ -249,9 +255,13 @@ func (s *recycledInoConnImpl) SupportedMessages() []lisafs.MID {
 		lisafs.FStat,
 		lisafs.Walk,
 		lisafs.WalkStat,
+		lisafs.MknodAt,
 		lisafs.OpenAt,
 		lisafs.Close,
 		lisafs.Flush,
+		lisafs.FSync,
+		lisafs.PRead,
+		lisafs.PWrite,
 	}
 }
 
@@ -271,6 +281,10 @@ func (fd *recycledInoControlFD) Stat() (lisafs.Statx, error) {
 		return fd.connImpl.rootStat, nil
 	}
 	return fd.stat, nil
+}
+
+func (*recycledInoControlFD) Mknod(linux.FileMode, lisafs.UID, lisafs.GID, string, uint32, uint32) (*lisafs.ControlFD, lisafs.Statx, error) {
+	return nil, lisafs.Statx{}, unix.EPERM
 }
 
 // +checklocksread:fd.ControlFD.conn.server.renameMu
@@ -319,12 +333,17 @@ func (fd *recycledInoControlFD) WalkStat(path lisafs.StringArray, recordStat fun
 }
 
 func (fd *recycledInoControlFD) Open(flags uint32) (*lisafs.OpenFD, int, error) {
-	ofd := &recycledInoOpenFD{stat: fd.stat}
+	ofd := &recycledInoOpenFD{stat: fd.stat, write: fd.connImpl.write}
+	if !fd.isRoot {
+		ofd.onSync = fd.connImpl.targetSync
+	}
 	ofd.Init(fd.FD(), flags, ofd)
 	return &ofd.OpenFD, -1, nil
 }
 
 type recycledInoOpenFD struct {
+	write  func([]byte, uint64) (uint64, error)
+	onSync func() error
 	lisafs.OpenFD
 	lisafs.OpenFDImpl
 	stat lisafs.Statx
@@ -334,12 +353,51 @@ func (fd *recycledInoOpenFD) FD() *lisafs.OpenFD          { return &fd.OpenFD }
 func (fd *recycledInoOpenFD) Close()                      {}
 func (fd *recycledInoOpenFD) Stat() (lisafs.Statx, error) { return fd.stat, nil }
 
+func (fd *recycledInoOpenFD) Sync() error {
+	if fd.onSync != nil {
+		return fd.onSync()
+	}
+	return nil
+}
+func (fd *recycledInoOpenFD) Read(buf []byte, off uint64) (uint64, error) {
+	clear(buf)
+	return uint64(len(buf)), nil
+}
+func (fd *recycledInoOpenFD) Write(buf []byte, off uint64) (uint64, error) {
+	return fd.write(buf, off)
+}
+
 func mountTestLisafsFS(t *testing.T, targetStat lisafs.Statx) (context.Context, *auth.Credentials, *recycledInoConnImpl, *vfs.VirtualFilesystem, vfs.VirtualDentry) {
 	t.Helper()
 	return mountTestLisafsFSWithOpts(t, targetStat, "")
 }
 
 func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts string) (context.Context, *auth.Credentials, *recycledInoConnImpl, *vfs.VirtualFilesystem, vfs.VirtualDentry) {
+	t.Helper()
+	options := "cache=remote_revalidating"
+	if extraOpts != "" {
+		options += "," + extraOpts
+	}
+	return mountTestVolumeFS(t, targetStat, options, nil)
+}
+
+func mountTestVolumeFS(t *testing.T, targetStat lisafs.Statx, options string, syncFS func() error) (context.Context, *auth.Credentials, *recycledInoConnImpl, *vfs.VirtualFilesystem, vfs.VirtualDentry) {
+	t.Helper()
+	connImpl := &recycledInoConnImpl{
+		rootStat: lisafs.Statx{
+			Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO,
+			Mode:     linux.S_IFDIR | 0755,
+			DevMajor: 0,
+			DevMinor: 1,
+			Ino:      1,
+		},
+		targetStat: targetStat,
+	}
+	ctx, creds, vfsObj, root := mountTestConnection(t, connImpl, "/", options, lisafs.ConnectionOpts{SyncFSDevice: 1, SyncFS: syncFS})
+	return ctx, creds, connImpl, vfsObj, root
+}
+
+func mountTestConnection(t *testing.T, impl lisafs.ConnectionImpl, path, options string, opts lisafs.ConnectionOpts) (context.Context, *auth.Credentials, *vfs.VirtualFilesystem, vfs.VirtualDentry) {
 	t.Helper()
 	ctx := contexttest.Context(t)
 	creds := auth.CredentialsFromContext(ctx)
@@ -352,17 +410,8 @@ func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts 
 	srv := lisafs.NewServer()
 	t.Cleanup(func() { srv.Destroy() })
 
-	connImpl := &recycledInoConnImpl{
-		rootStat: lisafs.Statx{
-			Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO,
-			Mode:     linux.S_IFDIR | 0755,
-			DevMajor: 0,
-			DevMinor: 1,
-			Ino:      1,
-		},
-		targetStat: targetStat,
-	}
-	conn, err := srv.CreateConnection(serverSock, "/", lisafs.ConnectionOpts{WalkStatSupported: true}, connImpl)
+	opts.WalkStatSupported = true
+	conn, err := srv.CreateConnection(serverSock, path, opts, impl)
 	if err != nil {
 		clientSock.Close()
 		serverSock.Close()
@@ -385,13 +434,9 @@ func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts 
 	if err != nil {
 		t.Fatalf("clientSock.Release: %v", err)
 	}
-	data := fmt.Sprintf("trans=fd,rfdno=%d,wfdno=%d,cache=remote_revalidating", sockFD, sockFD)
-	if extraOpts != "" {
-		data += "," + extraOpts
-	}
 	mntns, err := vfsObj.NewMountNamespace(ctx, creds, "", Name, &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
-			Data: data,
+			Data: fmt.Sprintf("trans=fd,rfdno=%d,wfdno=%d,%s", sockFD, sockFD, options),
 		},
 	}, nil)
 	if err != nil {
@@ -402,7 +447,7 @@ func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts 
 
 	root := mntns.Root(ctx)
 	t.Cleanup(func() { root.DecRef(ctx) })
-	return ctx, creds, connImpl, vfsObj, root
+	return ctx, creds, vfsObj, root
 }
 
 // TestOpenAtRecycledInoTypeChange reproduces host inode number recycling across
@@ -495,6 +540,342 @@ func TestOpenAtRecycledInoTypeChange(t *testing.T) {
 	}
 	if got := regInode.size.Load(); got != 256 {
 		t.Fatalf("regInode.size = %d, want 256", got)
+	}
+}
+
+func TestFilesystemSyncUsesExportBarrier(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result error
+	}{
+		{"success", nil},
+		{"storage error", unix.EIO},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := make(chan struct{}, 1)
+			ctx, _, _, _, root := mountTestVolumeFS(t, lisafs.Statx{}, "cache=remote_revalidating", func() error {
+				called <- struct{}{}
+				return tc.result
+			})
+			if err := root.Mount().Filesystem().Impl().Sync(ctx, vfs.FilesystemSyncOptions{}); err != tc.result {
+				t.Fatalf("Sync returned %v, want %v", err, tc.result)
+			}
+			select {
+			case <-called:
+			default:
+				t.Fatal("Sync returned without calling the export barrier")
+			}
+		})
+	}
+}
+
+func TestSyncBeforeMountRootIsReady(t *testing.T) {
+	ctx, _, _, _, root := mountTestVolumeFS(t, lisafs.Statx{}, "cache=remote_revalidating", func() error {
+		t.Error("synced the volume before its root was ready")
+		return nil
+	})
+	fs := root.Mount().Filesystem().Impl().(*filesystem)
+	// VFS can call Sync after the mount RPC returns but before GetFilesystem publishes the root.
+	mounting := &filesystem{opts: fs.opts, client: fs.client}
+	if err := mounting.Sync(ctx, vfs.FilesystemSyncOptions{}); err != nil {
+		t.Fatalf("Sync during mount: %v", err)
+	}
+}
+
+func TestSyncFSReportsExportErrorPerOpenDescription(t *testing.T) {
+	fail := make(chan error, 1)
+	impl := &recycledInoConnImpl{
+		rootStat:   lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFDIR | 0777, Ino: 1, DevMinor: 1},
+		targetStat: lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFDIR | 0777, Ino: 2, DevMinor: 2},
+	}
+	ctx, creds, vfsObj, root := mountTestConnection(t, impl, "/", "cache=remote_revalidating", lisafs.ConnectionOpts{SyncFSDevice: 1, SyncFS: func() error {
+		select {
+		case err := <-fail:
+			return err
+		default:
+			return nil
+		}
+	}})
+	open := func() *vfs.FileDescription {
+		t.Helper()
+		fd, err := vfsObj.OpenAt(ctx, creds, &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse(".")}, &vfs.OpenOptions{Flags: linux.O_RDONLY})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { fd.DecRef(ctx) })
+		return fd
+	}
+	check := func(fd *vfs.FileDescription, want error) {
+		t.Helper()
+		if got := fd.SyncFS(ctx); got != want {
+			t.Fatalf("SyncFS = %v, want %v", got, want)
+		}
+	}
+	first, second := open(), open()
+	fifoPath := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse("fifo")}
+	if err := vfsObj.MknodAt(ctx, creds, fifoPath, &vfs.MknodOptions{Mode: linux.S_IFIFO | 0600}); err != nil {
+		t.Fatal(err)
+	}
+	fifo, err := vfsObj.OpenAt(ctx, creds, fifoPath, &vfs.OpenOptions{Flags: linux.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fifo.DecRef(ctx)
+	crossDevice := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse("target/fifo")}
+	if err := vfsObj.RenameAt(ctx, creds, fifoPath, crossDevice, &vfs.RenameOptions{}); !linuxerr.Equals(linuxerr.EXDEV, err) {
+		t.Fatalf("renaming open FIFO across backing devices: got %v, want EXDEV", err)
+	}
+	fail <- unix.EIO
+	check(first, unix.EIO)
+	check(fifo, unix.EIO)
+	check(fifo, nil)
+	late := open()
+	check(late, nil)
+	check(second, unix.EIO)
+	check(first, nil)
+	check(second, nil)
+
+	fail <- unix.ENOSPC
+	if err := root.Mount().Filesystem().Impl().Sync(ctx, vfs.FilesystemSyncOptions{}); err != unix.ENOSPC {
+		t.Fatalf("filesystem Sync = %v, want ENOSPC", err)
+	}
+	afterSync := open()
+	check(afterSync, unix.ENOSPC)
+	check(open(), nil)
+	fail <- unix.EAGAIN
+	check(first, unix.EAGAIN)
+	check(first, unix.ENOSPC)
+	check(second, unix.ENOSPC)
+	check(late, unix.ENOSPC)
+	check(late, nil)
+
+	fail <- unix.EREMOTEIO
+	check(first, unix.EREMOTEIO)
+	check(second, unix.EREMOTEIO)
+	check(first, nil)
+	check(second, nil)
+
+	fs := root.Mount().Filesystem().Impl().(*filesystem)
+	// The same errno from a rejected request and from the disk have distinct origins.
+	if wb, err := fs.client.SyncFilesystem(ctx, 2); wb != 0 || err != unix.EOPNOTSUPP {
+		t.Fatalf("ungranted barrier = (%v, %v), want (0, EOPNOTSUPP)", wb, err)
+	}
+	check(first, nil)
+	fail <- unix.EOPNOTSUPP
+	check(first, unix.EOPNOTSUPP)
+	check(second, unix.EOPNOTSUPP)
+	check(first, nil)
+	fail <- unix.EIO
+	fs.exportSyncMu.Lock()
+	got := fs.syncVolume(ctx, unix.EAGAIN, nil)
+	fs.exportSyncMu.Unlock()
+	if got != unix.EIO {
+		t.Fatalf("simultaneous active file EAGAIN and host EIO: got %v, want EIO", got)
+	}
+	check(first, unix.EIO)
+	check(second, unix.EIO)
+	check(first, nil)
+}
+
+func TestSyncAfterEvictedWritebackError(t *testing.T) {
+	pageSize := uint64(hostarch.PageSize)
+	for _, tc := range []struct {
+		name            string
+		barrier         func() error
+		pageEviction    bool
+		failBarrierOnce bool
+	}{
+		{name: "inode/per-handle"},
+		{name: "inode/export", barrier: func() error { return nil }},
+		{name: "inode/export-retry", failBarrierOnce: true},
+		{name: "pages/per-handle", pageEviction: true},
+		{name: "pages/export", barrier: func() error { return nil }, pageEviction: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wrote := make(chan struct{}, 1)
+			impl := &recycledInoConnImpl{
+				rootStat:   lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFDIR | 0755, Ino: 1},
+				targetStat: lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFREG | 0666, Ino: 2, Size: pageSize},
+				write: func(buf []byte, off uint64) (uint64, error) {
+					wrote <- struct{}{}
+					return 0, unix.ENOSPC
+				},
+			}
+			barrier := tc.barrier
+			if tc.failBarrierOnce {
+				var once sync.Once
+				barrier = func() (err error) {
+					once.Do(func() { err = unix.EIO })
+					return
+				}
+			}
+			ctx, creds, vfsObj, root := mountTestConnection(t, impl, "/", "cache=fscache,force_page_cache,dcache=0", lisafs.ConnectionOpts{SyncFS: barrier})
+			pop := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse("target")}
+			fd, err := vfsObj.OpenAt(ctx, creds, pop, &vfs.OpenOptions{Flags: linux.O_RDWR})
+			if err != nil {
+				t.Fatal(err)
+			}
+			func() {
+				defer fd.DecRef(ctx)
+				d := fd.Dentry().Impl().(*dentry)
+				page := memmap.MappableRange{End: pageSize}
+				if _, err := d.Translate(ctx, page, page, hostarch.Read); err != nil {
+					t.Fatal(err)
+				}
+				n, err := fd.PWrite(ctx, usermem.BytesIOSequence([]byte{1}), 0, vfs.WriteOptions{})
+				if err != nil || n != 1 {
+					t.Fatalf("buffered write = %d, %v", n, err)
+				}
+				select {
+				case <-wrote:
+					t.Fatal("backend received the write before eviction")
+				default:
+				}
+				if tc.pageEviction {
+					d.inode.Evict(ctx, pgalloc.EvictableRange{End: pageSize})
+				}
+			}()
+			select {
+			case <-wrote:
+			default:
+				t.Fatal("eviction did not attempt writeback")
+			}
+			fs := root.Mount().Filesystem().Impl()
+			if barrier == nil {
+				if err := vfsObj.SyncAllFilesystems(ctx); err != nil {
+					t.Fatalf("global sync after eviction: %v", err)
+				}
+			}
+			if tc.failBarrierOnce {
+				if err := fs.Sync(ctx, vfs.FilesystemSyncOptions{}); err != unix.EIO {
+					t.Fatalf("Sync after storage barrier failure = %v, want EIO", err)
+				}
+			}
+			if err := fs.Sync(ctx, vfs.FilesystemSyncOptions{}); err != unix.ENOSPC {
+				t.Fatalf("Sync after final writeback failure = %v, want ENOSPC", err)
+			}
+			if err := fs.Sync(ctx, vfs.FilesystemSyncOptions{}); err != nil {
+				t.Fatalf("Sync after errors were reported = %v", err)
+			}
+		})
+	}
+}
+
+func TestGlobalSyncRetainsUngrantedUpperError(t *testing.T) {
+	failures := make(chan error, 2)
+	impl := &recycledInoConnImpl{
+		rootStat:   lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFDIR | 0755, Ino: 1},
+		targetStat: lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFREG | 0666, Ino: 2},
+		targetSync: func() error {
+			select {
+			case err := <-failures:
+				return err
+			default:
+				return nil
+			}
+		},
+	}
+	ctx, creds, vfsObj, root := mountTestConnection(t, impl, "/", "cache=remote_revalidating,"+moptDisableFileHandleSharing, lisafs.ConnectionOpts{})
+	pop := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse("target")}
+	open := func() *vfs.FileDescription {
+		t.Helper()
+		fd, err := vfsObj.OpenAt(ctx, creds, pop, &vfs.OpenOptions{Flags: linux.O_RDWR})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { fd.DecRef(ctx) })
+		return fd
+	}
+	fd := open()
+	open()
+
+	vfsObj.MustRegisterFilesystemType(tmpfs.Name, tmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	lower, err := vfsObj.MountDisconnected(ctx, creds, "", tmpfs.Name, &vfs.MountOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lower.DecRef(ctx)
+	ofs, od, err := (overlay.FilesystemType{}).GetFilesystem(ctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
+		InternalData: overlay.FilesystemOptions{UpperRoot: root, LowerRoots: []vfs.VirtualDentry{vfs.MakeVirtualDentry(lower, lower.Root())}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ofs.DecRef(ctx)
+	defer od.DecRef(ctx)
+
+	failures <- unix.EAGAIN
+	failures <- unix.EIO
+	if err := vfsObj.SyncAllFilesystems(ctx); err != unix.EIO {
+		t.Fatalf("global flush = %v, want backend EIO", err)
+	}
+	if err := fd.SyncFS(ctx); err != unix.EIO {
+		t.Fatalf("syncfs after global flush = %v, want EIO", err)
+	}
+	if err := fd.SyncFS(ctx); err != nil {
+		t.Fatalf("repeated syncfs = %v", err)
+	}
+}
+
+func TestSyncFSTargetsCallingDevice(t *testing.T) {
+	for _, virtual := range []bool{false, true} {
+		t.Run(fmt.Sprintf("virtualInodes=%t", virtual), func(t *testing.T) {
+			var parentCalls, fileSyncs atomic.Int32
+			var failFileSync atomic.Bool
+			opts := lisafs.ConnectionOpts{SyncFSDevice: 1, SyncFS: func() error { parentCalls.Add(1); return nil }}
+			mountOpts := "cache=remote_revalidating,dcache=0"
+			if virtual {
+				mountOpts += ",virtual_inode_numbers"
+			}
+			impl := &recycledInoConnImpl{
+				rootStat:   lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFDIR | 0755, Ino: 1, DevMinor: 1},
+				targetStat: lisafs.Statx{Mask: linux.STATX_BASIC_STATS, Mode: linux.S_IFREG | 0666, Ino: 7, DevMinor: 2},
+				targetSync: func() error {
+					fileSyncs.Add(1)
+					if failFileSync.Load() {
+						return unix.EIO
+					}
+					return nil
+				},
+			}
+			ctx, creds, vfsObj, root := mountTestConnection(t, impl, "/", mountOpts, opts)
+			open := func(path string, flags uint32) *vfs.FileDescription {
+				fd, err := vfsObj.OpenAt(ctx, creds, &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse(path)}, &vfs.OpenOptions{Flags: flags})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return fd
+			}
+			parent := open(".", linux.O_RDONLY)
+			defer parent.DecRef(ctx)
+			fs := root.Mount().Filesystem().Impl().(*filesystem)
+			func() {
+				child := open("target", linux.O_RDWR)
+				defer child.DecRef(ctx)
+				failFileSync.Store(true)
+				if err := child.SyncFS(ctx); err != unix.EOPNOTSUPP || parentCalls.Load() != 0 || fileSyncs.Load() != 0 {
+					t.Fatalf("child sync = %v, parent calls = %d", err, parentCalls.Load())
+				}
+				failFileSync.Store(false)
+				if err := parent.SyncFS(ctx); err != nil || parentCalls.Load() != 1 {
+					t.Fatalf("parent sync = %v, parent calls = %d", err, parentCalls.Load())
+				}
+				if err := vfsObj.SyncAllFilesystems(ctx); err != nil || fileSyncs.Load() != 1 {
+					t.Fatalf("aggregate sync = %v, child file syncs = %d", err, fileSyncs.Load())
+				}
+			}()
+			open("target", linux.O_RDONLY).DecRef(ctx)
+			if err := vfsObj.SyncAllFilesystems(ctx); err != nil || parentCalls.Load() != 3 || fileSyncs.Load() != 1 {
+				t.Fatalf("after eviction: sync = %v, parent/file calls = %d/%d", err, parentCalls.Load(), fileSyncs.Load())
+			}
+			if err := fs.Sync(ctx, vfs.FilesystemSyncOptions{}); err != unix.EOPNOTSUPP {
+				t.Fatalf("whole-export sync after nested eviction = %v, want EOPNOTSUPP", err)
+			}
+			fs.iopts.UniqueID.Path = "/test"
+			if err := fs.PrepareSave(ctx, vfs.PrepareSaveOptions{}); err != unix.EOPNOTSUPP {
+				t.Fatalf("PrepareSave after nested device eviction = %v, want EOPNOTSUPP", err)
+			}
+		})
 	}
 }
 

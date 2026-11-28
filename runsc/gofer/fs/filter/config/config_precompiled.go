@@ -28,6 +28,11 @@ import (
 func optionsToPrecompile() []Options {
 	opts := []Options{{}}
 	for _, fn := range []func(opt Options) []Options{
+		func(opt Options) []Options {
+			withVolume := opt
+			withVolume.SyncFSFD = 3 // Actual descriptor is supplied at runtime.
+			return []Options{opt, withVolume}
+		},
 		// Expand host UDS support (open and create are independent).
 		func(opt Options) []Options {
 			udsOpenYes := opt

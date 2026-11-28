@@ -80,7 +80,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 	fs.syncMu.Unlock()
 
 	// Flush local state to the remote filesystem.
-	if err := fs.Sync(ctx); err != nil {
+	if err := fs.Sync(ctx, vfs.FilesystemSyncOptions{}); err != nil {
 		return err
 	}
 
@@ -289,6 +289,12 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	if err := fs.restoreRoot(ctx, &opts); err != nil {
 		return vfs.PrependErrMsg("failed to restore root", err)
 	}
+	canSync := fs.clientSupportsVolumeSync()
+	if fs.volumeSync.Load() && !canSync {
+		return fmt.Errorf("restore of %q requires a volume syncfs backend", fs.iopts.UniqueID)
+	}
+
+	fs.volumeSync.Store(canSync)
 
 	// Restore remaining dentries.
 	if err := fs.root.restoreDescendantsRecursive(ctx, &opts); err != nil { // +checklocksforce: fs.renameMu is locked; fs.root belongs to fs.

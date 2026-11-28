@@ -101,6 +101,14 @@ type Connection struct {
 	nextFDID FDID
 }
 
+func (c *Connection) supportedMessages() []MID {
+	msgs := c.impl.SupportedMessages()
+	if c.opts.SyncFS != nil {
+		return append(slices.Clip(msgs), SyncFS)
+	}
+	return msgs
+}
+
 // CreateConnection initializes a new connection which will be mounted at
 // mountPath. The connection must be started separately.
 func (s *Server) CreateConnection(sock *unet.Socket, mountPath string, opts ConnectionOpts, impl ConnectionImpl) (*Connection, error) {
@@ -131,7 +139,7 @@ func (s *Server) CreateConnection(sock *unet.Socket, mountPath string, opts Conn
 		nextFDID:       InvalidFDID + 1,
 	}
 
-	supportedMs := impl.SupportedMessages()
+	supportedMs := c.supportedMessages()
 	c.supported = make([]bool, slices.Max(supportedMs)+1)
 	for _, m := range supportedMs {
 		c.supported[m] = true

@@ -104,12 +104,14 @@ type goferSyncFDs struct {
 // filesystem gofer.  This command should not be called directly.
 type Gofer struct {
 	util.InternalSubCommand
-	bundleDir  string
-	ioFDs      sandboxsetup.IntFlags
-	devIoFD    int
-	applyCaps  bool
-	setUpRoot  bool
-	mountConfs specutils.GoferMountConfFlags
+	bundleDir        string
+	ioFDs            sandboxsetup.IntFlags
+	devIoFD          int
+	syncFSVolumeFD   int
+	syncFSMountIndex int
+	applyCaps        bool
+	setUpRoot        bool
+	mountConfs       specutils.GoferMountConfFlags
 
 	// uid and gid are the user and group IDs to switch to after setting up the
 	// user namespace.
@@ -149,6 +151,8 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	f.Var(&g.ioFDs, "io-fds", "list of FDs to connect gofer servers. Follows the same order as --gofer-mount-confs. FDs are only donated if the mount is backed by lisafs.")
 	f.Var(&g.mountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured. They must follow this order: root first, then mounts as defined in the spec.")
 	f.IntVar(&g.devIoFD, "dev-io-fd", -1, "optional FD to connect /dev gofer server")
+	f.IntVar(&g.syncFSVolumeFD, "syncfs-volume-fd", -1, "private FD for a dedicated filesystem")
+	f.IntVar(&g.syncFSMountIndex, "syncfs-mount-index", -1, "OCI mount index served by syncfs-volume-fd")
 	f.IntVar(&g.specFD, "spec-fd", -1, "required fd with the container spec")
 	f.IntVar(&g.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to write list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&g.goferToHostRPCFD, "rpc-fd", -1, "gofer-to-host RPC file descriptor.")
@@ -400,6 +404,43 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}
 	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d groups=%v canSetGroups=%t", ruid, euid, rgid, egid, groups, canSetGroups)
 
+	var syncDevice uint64
+	if g.syncFSVolumeFD >= 0 {
+		if g.syncFSVolumeFD < 3 || g.syncFSMountIndex < 0 || g.syncFSMountIndex >= len(spec.Mounts) {
+			util.Fatalf("invalid dedicated syncfs volume")
+		}
+		mount := spec.Mounts[g.syncFSMountIndex]
+		var pinned, served unix.Stat_t
+		if err := unix.Fstat(g.syncFSVolumeFD, &pinned); err != nil {
+			util.Fatalf("stat dedicated filesystem: %v", err)
+		}
+		// Only keep a directory descriptor opened inside the final chroot.
+		fd, err := unix.Openat2(unix.AT_FDCWD, mount.Destination, &unix.OpenHow{
+			Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS,
+		})
+		if err != nil {
+			util.Fatalf("opening served mount %q: %v", mount.Destination, err)
+		}
+		if err := unix.Fstat(fd, &served); err != nil {
+			util.Fatalf("stat served mount %q: %v", mount.Destination, err)
+		}
+		if pinned.Dev != served.Dev || pinned.Ino != served.Ino || specutils.IsReadonlyMount(mount.Options) {
+			util.Fatalf("served mount %q does not match the writable dedicated volume", mount.Destination)
+		}
+		var fsstat unix.Statfs_t
+		if err := unix.Fstatfs(fd, &fsstat); err != nil {
+			util.Fatalf("checking served filesystem %q: %v", mount.Destination, err)
+		}
+		if fsstat.Flags&unix.ST_RDONLY != 0 {
+			util.Fatalf("dedicated filesystem %q is mounted read-only", mount.Destination)
+		}
+		if err := unix.Close(g.syncFSVolumeFD); err != nil {
+			util.Fatalf("closing host volume descriptor: %v", err)
+		}
+		g.syncFSVolumeFD = fd
+		syncDevice = pinned.Dev
+	}
+
 	// Initialize filters.
 	procSelfFD := fsgofer.ProcSelfFD()
 	if procSelfFD < 0 {
@@ -418,18 +459,23 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		ProcSelfFD:       uint32(procSelfFD),
 		CgoEnabled:       config.CgoEnabled,
 		VendorSyscalls:   filter.HostVendorSyscalls(),
+		SyncFSFD:         g.syncFSVolumeFD,
 	}
 	for _, e := range extension.Registered() {
-		opts.ExtraRules = append(opts.ExtraRules, e.SeccompRules())
+		rules := e.SeccompRules()
+		if g.syncFSVolumeFD >= 0 && rules.Size() != 0 {
+			util.Fatalf("dedicated syncfs volume is incompatible with extension syscall rules")
+		}
+		opts.ExtraRules = append(opts.ExtraRules, rules)
 	}
 	if err := filter.Install(opts); err != nil {
 		util.Fatalf("installing seccomp filters: %v", err)
 	}
 
-	return g.serve(spec, conf, root, ruid, euid, rgid, egid, groups, canSetGroups)
+	return g.serve(spec, conf, root, ruid, euid, rgid, egid, groups, canSetGroups, syncDevice)
 }
 
-func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, groups []int, canSetGroups bool) subcommands.ExitStatus {
+func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, groups []int, canSetGroups bool, syncDevice uint64) subcommands.ExitStatus {
 	type connectionConfig struct {
 		sock      *unet.Socket
 		mountPath string
@@ -542,6 +588,10 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 				}
 			}
 		}
+		dedicated := g.syncFSVolumeFD >= 0 && cfg.mount == &spec.Mounts[g.syncFSMountIndex]
+		if dedicated && (connImpl != nil || cfg.readonly) {
+			util.Fatalf("dedicated syncfs requires a writable stock gofer mount")
+		}
 		if connImpl == nil {
 			connConf := fsgoferConf
 			if cfg.devGofer {
@@ -549,6 +599,10 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 			}
 			connImpl = fsgofer.NewConnectionImpl(connConf)
 			connOpts = fsgofer.ConnectionOpts(cfg.readonly)
+			if dedicated {
+				connOpts.SyncFSDevice = syncDevice
+				connOpts.SyncFS = func() error { return unix.Syncfs(g.syncFSVolumeFD) }
+			}
 		}
 		conn, err := server.CreateConnection(cfg.sock, cfg.mountPath, connOpts, connImpl)
 		if err != nil {

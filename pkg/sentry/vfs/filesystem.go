@@ -98,6 +98,12 @@ func (fs *Filesystem) DecRef(ctx context.Context) {
 	})
 }
 
+// FilesystemSyncOptions controls how a filesystem handles writeback errors.
+type FilesystemSyncOptions struct {
+	// ForGlobalSync is set for sync(2), which cannot report errors.
+	ForGlobalSync bool
+}
+
 // FilesystemImpl contains implementation details for a Filesystem.
 // Implementations of FilesystemImpl should contain their associated Filesystem
 // by value as their first field.
@@ -140,7 +146,7 @@ type FilesystemImpl interface {
 
 	// Sync "causes all pending modifications to filesystem metadata and cached
 	// file data to be written to the underlying [filesystem]", as by syncfs(2).
-	Sync(ctx context.Context) error
+	Sync(ctx context.Context, opts FilesystemSyncOptions) error
 
 	// DrainDentryCache evicts unused cached dentries without changing cache
 	// policy. Live references are preserved, and concurrent operations may

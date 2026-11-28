@@ -70,6 +70,8 @@ type Create struct {
 	// passFDs are host FDs exposed to the sandboxed application.
 	passFDs sandboxsetup.FDMappings
 
+	dedicatedSyncFSVolume string
+
 	// userLog is the path to send user-visible logs to. This log is different
 	// from debug logs. The former is meant to be consumed by the users and should
 	// contain only information that is relevant to the person running the
@@ -111,6 +113,7 @@ func (*Create) Usage() string {
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (c *Create) SetFlags(f *flag.FlagSet) {
+	f.StringVar(&c.dedicatedSyncFSVolume, "dedicated-syncfs-volume", "", "host mount point of a complete filesystem dedicated to this container; allow syncfs on its writable bind mount")
 	f.Var(&c.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
 	f.StringVar(&c.bundleDir, "bundle", "", "path to the root of the bundle directory, defaults to the current directory")
 	f.StringVar(&c.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
@@ -194,16 +197,17 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 	// container unless the metadata specifies that it should be run in an
 	// existing container.
 	contArgs := container.Args{
-		ID:                  id,
-		Spec:                spec,
-		BundleDir:           c.bundleDir,
-		ConsoleSocket:       c.consoleSocket,
-		PIDFile:             c.pidFile,
-		UserLog:             c.userLog,
-		PassFiles:           files,
-		FSRestoreImagePaths: []string(c.fsRestoreImagePaths),
-		FSRestoreDirect:     c.fsRestoreDirect,
-		NoRootContainer:     c.noRootContainer,
+		DedicatedSyncFSVolume: c.dedicatedSyncFSVolume,
+		ID:                    id,
+		Spec:                  spec,
+		BundleDir:             c.bundleDir,
+		ConsoleSocket:         c.consoleSocket,
+		PIDFile:               c.pidFile,
+		UserLog:               c.userLog,
+		PassFiles:             files,
+		FSRestoreImagePaths:   []string(c.fsRestoreImagePaths),
+		FSRestoreDirect:       c.fsRestoreDirect,
+		NoRootContainer:       c.noRootContainer,
 	}
 	if _, err := container.New(conf, contArgs); err != nil {
 		return util.Errorf("creating container: %v", err)

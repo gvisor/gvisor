@@ -41,6 +41,7 @@ func TestOptionsConfigKey(t *testing.T) {
 		"UDSOpenEnabled":   func(opt *Options) { opt.UDSOpenEnabled = !opt.UDSOpenEnabled },
 		"UDSCreateEnabled": func(opt *Options) { opt.UDSCreateEnabled = !opt.UDSCreateEnabled },
 		"ProfileEnabled":   func(opt *Options) { opt.ProfileEnabled = !opt.ProfileEnabled },
+		"SyncFSFD":         func(opt *Options) { opt.SyncFSFD = 12 },
 		"HostFS":           func(opt *Options) { opt.HostFS = (opt.HostFS + 1) % (HostFSReadWrite + 1) },
 		"CgoEnabled":       func(opt *Options) { opt.CgoEnabled = !opt.CgoEnabled },
 		"ExtraRules": func(opt *Options) {
@@ -362,6 +363,41 @@ func TestHostFSAccessSyscalls(t *testing.T) {
 		for hostFS, program := range compiled {
 			if allowed, want := filterAllows(t, program, tc.sysno, tc.args), hostFS >= tc.from; allowed != want {
 				t.Errorf("HostFS=%v %s: allowed=%t, want %t", hostFS, tc.name, allowed, want)
+			}
+		}
+	}
+}
+
+func TestDedicatedSyncFS(t *testing.T) {
+	const (
+		fd         = 12
+		procSelfFD = 42
+		ptr        = 0x1000
+	)
+	for _, hostFS := range []HostFSAccess{HostFSNone, HostFSReadOnly, HostFSReadWriteExistingFiles, HostFSReadWrite} {
+		for _, configured := range []int{0, fd} {
+			compiled := compileFilter(t, Options{HostFS: hostFS, ProcSelfFD: procSelfFD, SyncFSFD: configured})
+			for _, tc := range []struct {
+				nr   uintptr
+				args [6]uint64
+				want bool
+			}{
+				{unix.SYS_SYNCFS, [6]uint64{fd}, configured == fd},
+				{unix.SYS_SYNCFS, [6]uint64{fd + 1}, false},
+				{unix.SYS_FSTATFS, [6]uint64{fd + 1, ptr}, hostFS >= HostFSReadOnly},
+				{unix.SYS_FCHMODAT, [6]uint64{procSelfFD, ptr, 0o644}, hostFS >= HostFSReadWriteExistingFiles},
+				{unix.SYS_FCHMODAT, [6]uint64{fd, ptr, 0o644}, false},
+				{unix.SYS_MKDIRAT, [6]uint64{fd + 1, ptr, 0o755}, hostFS == HostFSReadWrite},
+				{unix.SYS_CLOSE, [6]uint64{fd}, configured == 0},
+				{unix.SYS_CLOSE, [6]uint64{1<<32 | fd}, configured == 0},
+				{unix.SYS_CLOSE, [6]uint64{fd + 1}, true},
+				{unix.SYS_CLOSE_RANGE, [6]uint64{0}, false},
+				{unix.SYS_DUP3, [6]uint64{0}, false},
+				{unix.SYS_IO_URING_SETUP, [6]uint64{0}, false},
+			} {
+				if allowed := filterAllows(t, compiled, tc.nr, tc.args); allowed != tc.want {
+					t.Errorf("HostFS=%v configured=%d syscall=%d args=%#x allowed=%t, want %t", hostFS, configured, tc.nr, tc.args, allowed, tc.want)
+				}
 			}
 		}
 	}

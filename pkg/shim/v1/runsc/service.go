@@ -843,6 +843,10 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 	}
 
 	runtime := proc.NewRunsc(options.Root, r.Bundle, namespace, options.BinaryName, options.RunscConfig, spec)
+	runtime.DedicatedSyncFSVolume, err = selectSyncFSVolume(options.DedicatedSyncFSVolume, spec.Mounts)
+	if err != nil {
+		return nil, err
+	}
 	p := proc.New(r.ID, runtime, stdio.Stdio{
 		Stdin:    r.Stdin,
 		Stdout:   r.Stdout,
@@ -865,6 +869,32 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 	p.FuseAbort = utils.FuseAbortOnTeardown(spec, r.Bundle)
 	p.Monitor = reaper.Default
 	return p, nil
+}
+
+func selectSyncFSVolume(pattern string, mounts []specs.Mount) (string, error) {
+	if pattern == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(pattern) || filepath.Clean(pattern) != pattern || pattern == "/" {
+		return "", fmt.Errorf("dedicated_syncfs_volume must be an absolute, clean source pattern, got %q", pattern)
+	}
+	if _, err := filepath.Match(pattern, ""); err != nil {
+		return "", fmt.Errorf("invalid dedicated_syncfs_volume %q: %w", pattern, err)
+	}
+	var source string
+	for _, m := range mounts {
+		if !specutils.IsGoferMount(m) || specutils.IsReadonlyMount(m.Options) || filepath.Clean(m.Source) != m.Source {
+			continue
+		}
+		if matched, _ := filepath.Match(pattern, m.Source); !matched {
+			continue
+		}
+		if source != "" {
+			return "", fmt.Errorf("dedicated_syncfs_volume %q matches multiple writable mounts", pattern)
+		}
+		source = m.Source
+	}
+	return source, nil
 }
 
 // setPodCgroup searches for the pod cgroup path inside the container's cgroup

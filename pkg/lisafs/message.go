@@ -183,6 +183,9 @@ const (
 	// ConnectWithGroups is analogous to connect(2) but it asks the server to
 	// connect with the provided effective uid/gid and supplementary groups.
 	ConnectWithGroups MID = 34
+
+	// SyncFS makes changes in this connection's filesystem durable.
+	SyncFS MID = 35
 )
 
 const (

@@ -104,6 +104,9 @@ type Container struct {
 	// BundleDir is the directory containing the container bundle.
 	BundleDir string `json:"bundleDir"`
 
+	// DedicatedSyncFSVolume is a host mount point authorized by the operator.
+	DedicatedSyncFSVolume string `json:"dedicatedSyncFSVolume,omitempty"`
+
 	// CreatedAt is the time the container was created.
 	CreatedAt time.Time `json:"createdAt"`
 
@@ -179,6 +182,9 @@ type Args struct {
 
 	// BundleDir is the directory containing the container bundle.
 	BundleDir string
+
+	// DedicatedSyncFSVolume grants this container filesystem-wide writeback on this source.
+	DedicatedSyncFSVolume string
 
 	// ConsoleSocket is the path to a unix domain socket that will receive
 	// the console FD. It may be empty.
@@ -264,6 +270,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	}
 
 	if args.NoRootContainer {
+		if args.DedicatedSyncFSVolume != "" {
+			return nil, fmt.Errorf("dedicated-syncfs-volume requires a container with a bind mount")
+		}
 		if !specutils.IsRootContainer(args.Spec) {
 			return nil, fmt.Errorf("NoRootContainer can only be set when creating the sandbox, not a subcontainer")
 		}
@@ -276,14 +285,15 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	}
 
 	c := &Container{
-		ID:            args.ID,
-		Spec:          args.Spec,
-		ConsoleSocket: args.ConsoleSocket,
-		BundleDir:     args.BundleDir,
-		Status:        Creating,
-		allowWrite:    true, // Never serialized yet, so start writable.
-		CreatedAt:     time.Now(),
-		Owner:         os.Getenv("USER"),
+		DedicatedSyncFSVolume: args.DedicatedSyncFSVolume,
+		ID:                    args.ID,
+		Spec:                  args.Spec,
+		ConsoleSocket:         args.ConsoleSocket,
+		BundleDir:             args.BundleDir,
+		Status:                Creating,
+		allowWrite:            true, // Never serialized yet, so start writable.
+		CreatedAt:             time.Now(),
+		Owner:                 os.Getenv("USER"),
 		Saver: StateFile{
 			RootDir: conf.RootDir,
 			ID: FullID{
@@ -1774,6 +1784,71 @@ func goferEnv(conf *config.Config, environ []string, gomaxprocs int) []string {
 	return append(env, godebug, "GOMAXPROCS="+strconv.Itoa(gomaxprocs))
 }
 
+// openSyncFSVolume pins the authorized filesystem before gofer setup. Mount
+// metadata verifies its root; exclusive ownership is the operator's guarantee.
+func (c *Container) openSyncFSVolume() (*os.File, int, error) {
+	source := c.DedicatedSyncFSVolume
+	if !path.IsAbs(source) || source != path.Clean(source) || source == "/" {
+		return nil, 0, fmt.Errorf("expected an absolute volume mount point, got %q", source)
+	}
+	index := -1
+	cfgIndex := 0
+	for i, mount := range c.Spec.Mounts {
+		if !specutils.HasMountConfig(mount) {
+			continue
+		}
+		cfgIndex++
+		if mount.Source != source || specutils.IsReadonlyMount(mount.Options) {
+			continue
+		}
+		cfg := c.GoferMountConfs[cfgIndex]
+		if index >= 0 || !specutils.IsGoferMount(mount) || !cfg.ShouldUseLisafs() || cfg.ShouldUseOverlayfs() {
+			return nil, 0, fmt.Errorf("%q must select one writable bind mount", source)
+		}
+		index = i
+	}
+	if index < 0 {
+		return nil, 0, fmt.Errorf("no writable bind mount for %q", source)
+	}
+	fd, err := unix.Openat2(unix.AT_FDCWD, source, &unix.OpenHow{
+		Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	file := os.NewFile(uintptr(fd), source)
+	cu := cleanup.Make(func() { file.Close() })
+	defer cu.Clean()
+	var stat, root unix.Statx_t
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, unix.STATX_BASIC_STATS|unix.STATX_MNT_ID, &stat); err != nil {
+		return nil, 0, err
+	}
+	if err := unix.Statx(unix.AT_FDCWD, "/", 0, unix.STATX_BASIC_STATS, &root); err != nil {
+		return nil, 0, err
+	}
+	if stat.Mask&unix.STATX_MNT_ID == 0 || stat.Attributes_mask&stat.Attributes&unix.STATX_ATTR_MOUNT_ROOT == 0 || (stat.Dev_major == root.Dev_major && stat.Dev_minor == root.Dev_minor) {
+		return nil, 0, fmt.Errorf("%q must be mounted on its own filesystem", source)
+	}
+	table, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, 0, err
+	}
+	defer table.Close()
+	id := strconv.FormatUint(stat.Mnt_id, 10)
+	scanner := bufio.NewScanner(table)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 5 && fields[0] == id && fields[3] == "/" {
+			cu.Release()
+			return file, index, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, 0, err
+	}
+	return nil, 0, fmt.Errorf("%q must expose the full filesystem root", source)
+}
+
 // createGoferProcess returns an IO file list and a mounts file on success.
 // The IO file list consists of image files and/or socket files to connect to
 // a gofer endpoint for the mount points using Gofers. The mounts file is the
@@ -1786,6 +1861,15 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 	}
 	if err := c.initGoferConfs(conf.GetOverlay2(), mountHints, rootfsHint); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("error initializing gofer confs: %w", err)
+	}
+	var volume *os.File
+	var volumeMount int
+	if c.DedicatedSyncFSVolume != "" {
+		volume, volumeMount, err = c.openSyncFSVolume()
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("opening dedicated syncfs volume: %w", err)
+		}
+		defer volume.Close()
 	}
 	configureGPU := specutils.GPUFunctionalityRequestedViaHook(c.Spec, conf)
 	if !c.GoferMountConfs[0].ShouldUseLisafs() && configureGPU {
@@ -1886,6 +1970,10 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 
 	cmd.Args = append(cmd.Args, "gofer", "--bundle", c.BundleDir)
 	cmd.Args = append(cmd.Args, "--gofer-mount-confs="+c.GoferMountConfs.String())
+	if volume != nil {
+		donations.Donate("syncfs-volume-fd", volume)
+		cmd.Args = append(cmd.Args, fmt.Sprintf("--syncfs-mount-index=%d", volumeMount))
+	}
 
 	donations.Donate("spec-fd", specFile)
 

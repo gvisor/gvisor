@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strings"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/runsc/gofer/filter"
@@ -88,6 +89,8 @@ type Options struct {
 	CgoEnabled       bool
 	VendorSyscalls   precompiledseccomp.VarSyscallNumbers
 	ExtraRules       []seccomp.SyscallRules
+	// SyncFSFD is a private, lifetime-pinned directory descriptor when greater than 2.
+	SyncFSFD int
 }
 
 // vendorSyscalls is the set of vendor-specific syscalls that the gofer may
@@ -129,6 +132,9 @@ func (opt Options) ConfigKey() string {
 	// Extra rules come from registered extensions, whose filters are not
 	// known at precompile time. Cannot precompile.
 	fmt.Fprintf(&sb, "ExtraRules=%t ", len(opt.ExtraRules) > 0)
+	if opt.SyncFSFD > 2 {
+		sb.WriteString("SyncFS ")
+	}
 	return strings.TrimSpace(sb.String())
 }
 
@@ -165,6 +171,9 @@ func (opt Options) Vars() precompiledseccomp.Values {
 		vars[procSelfFDVarName] = opt.ProcSelfFD
 	default:
 		panic(fmt.Sprintf("unknown HostFSAccess: %v", opt.HostFS))
+	}
+	if opt.SyncFSFD > 2 {
+		vars["syncfsFD"] = uint32(opt.SyncFSFD)
 	}
 	opt.VendorSyscalls.SetVars(vars)
 	return vars
@@ -214,5 +223,14 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 	for _, rules := range opt.ExtraRules {
 		s.Merge(rules)
 	}
-	return s, seccomp.DenyNewExecMappings
+	deny := seccomp.DenyNewExecMappings
+	if opt.SyncFSFD > 2 {
+		// Keep the descriptor bound for the lifetime of the filter. The stock
+		// gofer has no dup2/dup3, close_range, io_uring or exec permission.
+		fd := uintptr(vars["syncfsFD"])
+		s.Set(unix.SYS_SYNCFS, seccomp.PerArg{seccomp.EqualTo(fd)})
+		deny = deny.Copy()
+		deny.Add(unix.SYS_CLOSE, seccomp.PerArg{seccomp.MaskedEqual(0xffffffff, fd)})
+	}
+	return s, deny
 }

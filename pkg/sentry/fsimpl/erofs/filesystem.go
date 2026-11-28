@@ -181,7 +181,7 @@ func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
 }
 
 // Sync implements vfs.FilesystemImpl.Sync.
-func (fs *filesystem) Sync(ctx context.Context) error {
+func (fs *filesystem) Sync(ctx context.Context, opts vfs.FilesystemSyncOptions) error {
 	return nil
 }
 

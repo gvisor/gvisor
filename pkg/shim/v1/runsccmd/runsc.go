@@ -82,6 +82,15 @@ type Runsc struct {
 	Debug        bool
 	DebugLog     string
 	DebugLogFD   *int
+	// DedicatedSyncFSVolume is the literal host mount selected by the shim.
+	DedicatedSyncFSVolume string
+}
+
+func (r *Runsc) withVolumeGrant(args []string) []string {
+	if r.DedicatedSyncFSVolume != "" {
+		args = append(args, "--dedicated-syncfs-volume="+r.DedicatedSyncFSVolume)
+	}
+	return args
 }
 
 // List returns all containers created inside the provided runsc root directory.
@@ -153,7 +162,7 @@ func (o *CreateOpts) args() (out []string, err error) {
 
 // Create creates a new container and returns its pid if it was created successfully.
 func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateOpts) error {
-	args := []string{"create", "--bundle", bundle}
+	args := r.withVolumeGrant([]string{"create", "--bundle", bundle})
 	if opts != nil {
 		oargs, err := opts.args()
 		if err != nil {
@@ -287,7 +296,7 @@ func (o *RestoreOpts) args() []string {
 
 // Restore will restore an already created container.
 func (r *Runsc) Restore(context context.Context, id string, cio runc.IO, opts *RestoreOpts) error {
-	args := []string{"restore"}
+	args := r.withVolumeGrant([]string{"restore"})
 	if opts != nil {
 		args = append(args, opts.args()...)
 	}
@@ -544,7 +553,7 @@ func (r *Runsc) Exec(context context.Context, id string, spec specs.Process, opt
 // Run runs the create, start, delete lifecycle of the container and returns
 // its exit status after it has exited.
 func (r *Runsc) Run(context context.Context, id, bundle string, opts *CreateOpts) (int, error) {
-	args := []string{"run", "--bundle", bundle}
+	args := r.withVolumeGrant([]string{"run", "--bundle", bundle})
 	if opts != nil {
 		oargs, err := opts.args()
 		if err != nil {

@@ -86,6 +86,10 @@ type FileDescription struct {
 
 	usedLockBSD atomicbitops.Uint32
 
+	// syncFSCursor is sampled at open. The backing filesystem synchronizes
+	// subsequent access when it reports writeback errors to this description.
+	syncFSCursor uint32
+
 	// impl is the FileDescriptionImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in FileDescription.
 	impl FileDescriptionImpl
@@ -178,6 +182,9 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, creds *a
 	d.IncRef()
 	fd.opts = *opts
 	fd.impl = impl
+	if fs, ok := mnt.fs.impl.(FilesystemImplSyncFSExtension); ok {
+		fd.syncFSCursor = fs.SampleSyncFSError()
+	}
 	mnt.vfs.numFiles.Add(1)
 	return nil
 }
@@ -920,10 +927,20 @@ func (fd *FileDescription) SetPosixACL(ctx context.Context, t ACLType, acl *Posi
 	return fd.impl.SetPosixACL(ctx, t, acl, clearSGID)
 }
 
+// FilesystemImplSyncFSExtension handles filesystem sync for backends
+// that report writeback errors independently to each open file description.
+type FilesystemImplSyncFSExtension interface {
+	SampleSyncFSError() uint32
+	SyncFilesystem(context.Context, *Dentry, *uint32) error
+}
+
 // SyncFS instructs the filesystem containing fd to execute the semantics of
 // syncfs(2).
 func (fd *FileDescription) SyncFS(ctx context.Context) error {
-	return fd.vd.mount.fs.impl.Sync(ctx)
+	if fs, ok := fd.vd.mount.fs.impl.(FilesystemImplSyncFSExtension); ok {
+		return fs.SyncFilesystem(ctx, fd.vd.dentry, &fd.syncFSCursor)
+	}
+	return fd.vd.mount.fs.impl.Sync(ctx, FilesystemSyncOptions{})
 }
 
 // MappedName implements memmap.MappingIdentity.MappedName.

@@ -44,6 +44,73 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
+func TestSelectSyncFSVolume(t *testing.T) {
+	const pattern = "/pods/*/volumes/pvc-A/mount"
+	const source = "/pods/new-uid/volumes/pvc-A/mount"
+	mount := specs.Mount{Type: "bind", Source: source, Destination: "/data"}
+	other := specs.Mount{Type: "bind", Source: "/pods/new-uid/volumes/pvc-B/mount"}
+	for _, tc := range []struct {
+		name    string
+		pattern string
+		mounts  []specs.Mount
+		want    string
+		wantErr bool
+	}{
+		{name: "disabled", mounts: []specs.Mount{mount}},
+		{name: "exact", pattern: source, mounts: []specs.Mount{mount}, want: source},
+		{name: "pod UID", pattern: pattern, mounts: []specs.Mount{other, mount}, want: source},
+		{name: "unrelated", pattern: pattern, mounts: []specs.Mount{other}},
+		{name: "subpath", pattern: pattern, mounts: []specs.Mount{{Type: "bind", Source: source + "/data"}}},
+		{name: "readonly", pattern: pattern, mounts: []specs.Mount{{Type: "bind", Source: source, Options: []string{"ro"}}}},
+		{name: "ambiguous", pattern: pattern, mounts: []specs.Mount{mount, mount}, wantErr: true},
+		{name: "invalid pattern", pattern: "/pods/[", wantErr: true},
+		{name: "relative", pattern: "data", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := selectSyncFSVolume(tc.pattern, tc.mounts)
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("selectSyncFSVolume(%q, %v) = %q, %v; want %q, error %t", tc.pattern, tc.mounts, got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCreateForwardsDedicatedSyncFSVolume(t *testing.T) {
+	dir := t.TempDir()
+	const source = "/pods/uid/volumes/pvc-A/mount"
+	spec := &specs.Spec{Mounts: []specs.Mount{{Type: "bind", Source: source, Destination: "/data"}}}
+	if err := utils.WriteSpec(dir, spec); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, "runsc")
+	args := filepath.Join(dir, "args")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" >%q\nprintf 0 >%q\n", args, filepath.Join(dir, "init.pid"))
+	if err := os.WriteFile(binary, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(dir, "shim.toml")
+	settings := fmt.Sprintf("binary_name = %q\ndedicated_syncfs_volume = %q\n", binary, "/pods/*/volumes/pvc-A/mount")
+	if err := os.WriteFile(config, []byte(settings), 0600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := typeurl.MarshalAnyToProto(&runtimeoptions.Options{ConfigPath: config})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := namespaces.WithNamespace(t.Context(), "test")
+	if _, err := NewContainer(ctx, nil, &ContainerConfig{ID: "test", Bundle: dir, Options: opts}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, afterCreate, ok := strings.Cut(string(got), "\ncreate\n")
+	if !ok || !strings.Contains("\n"+afterCreate, "\n--dedicated-syncfs-volume="+source+"\n") {
+		t.Fatalf("missing per-create volume argument in %q", got)
+	}
+}
+
 func TestCheckpointAPISerializesRuntimeCalls(t *testing.T) {
 	for _, filesystem := range []bool{false, true} {
 		for _, cancelCheckpoint := range []bool{false, true} {

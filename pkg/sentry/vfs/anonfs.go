@@ -107,7 +107,7 @@ func (fs *anonFilesystem) DrainDentryCache(ctx context.Context) error {
 }
 
 // Sync implements FilesystemImpl.Sync.
-func (fs *anonFilesystem) Sync(ctx context.Context) error {
+func (fs *anonFilesystem) Sync(ctx context.Context, opts FilesystemSyncOptions) error {
 	return nil
 }
 

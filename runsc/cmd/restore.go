@@ -148,17 +148,18 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	defer cu.Clean()
 
 	runArgs := container.Args{
-		ID:                  id,
-		Spec:                nil,
-		BundleDir:           bundleDir,
-		ConsoleSocket:       r.consoleSocket,
-		PIDFile:             r.pidFile,
-		UserLog:             r.userLog,
-		Attached:            !r.detach,
-		FSRestoreImagePaths: []string(r.fsRestoreImagePaths),
-		FSRestoreDirect:     r.fsRestoreDirect || r.directIO == sandbox.DirectIOOn,
-		CheckpointDirPath:   r.imagePath,
-		NoRootContainer:     r.noRootContainer,
+		DedicatedSyncFSVolume: r.dedicatedSyncFSVolume,
+		ID:                    id,
+		Spec:                  nil,
+		BundleDir:             bundleDir,
+		ConsoleSocket:         r.consoleSocket,
+		PIDFile:               r.pidFile,
+		UserLog:               r.userLog,
+		Attached:              !r.detach,
+		FSRestoreImagePaths:   []string(r.fsRestoreImagePaths),
+		FSRestoreDirect:       r.fsRestoreDirect || r.directIO == sandbox.DirectIOOn,
+		CheckpointDirPath:     r.imagePath,
+		NoRootContainer:       r.noRootContainer,
 	}
 
 	log.Debugf("Restore container, cid: %s, rootDir: %q", id, conf.RootDir)
@@ -195,6 +196,9 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 			c.Destroy()
 		})
 	} else {
+		if r.dedicatedSyncFSVolume != "" && r.dedicatedSyncFSVolume != c.DedicatedSyncFSVolume {
+			return util.Errorf("dedicated-syncfs-volume differs from the existing container")
+		}
 		if len(r.passFDs) != 0 {
 			return util.Errorf("pass-fd must be supplied when creating the container, not when restoring an existing container")
 		}

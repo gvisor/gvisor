@@ -892,6 +892,7 @@ func (i *inode) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 			continue
 		}
 		if err := fsutil.SyncDirty(ctx, mgapMR, &i.cache, &i.dirty, i.size.Load(), mf, h.writeFromBlocksAt); err != nil {
+			i.recordLostWriteback(err)
 			log.Warningf("Failed to writeback cached data %v: %v", mgapMR, err)
 		}
 		i.cache.Drop(mgapMR, mf)
