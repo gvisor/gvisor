@@ -22,8 +22,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// startLocked starts cmd with m on a new goroutine, which stays locked to its
-// OS thread until the child process exits.
+// startOnLockedThread starts cmd with m on a new goroutine, which stays locked
+// to its OS thread until the child process exits. Each running command holds
+// one OS thread, and starts do not wait for each other.
 //
 // Linux sends the parent-death signal of a child (PR_SET_PDEATHSIG) when the
 // thread that forked the child exits, not when the process exits. Go ends an
@@ -34,7 +35,7 @@ import (
 //
 // The goroutine waits for the child to exit with WNOWAIT, so the child is
 // still reaped by m (for example, by containerd's reaper).
-func startLocked(m ProcessMonitor, cmd *exec.Cmd) (chan runc.Exit, error) {
+func startOnLockedThread(m ProcessMonitor, cmd *exec.Cmd) (chan runc.Exit, error) {
 	type result struct {
 		ec  chan runc.Exit
 		err error

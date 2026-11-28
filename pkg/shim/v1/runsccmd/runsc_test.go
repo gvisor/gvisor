@@ -361,11 +361,12 @@ func (m *tidMonitor) Wait(cmd *exec.Cmd, _ chan runc.Exit) (int, error) {
 	return cmd.ProcessState.ExitCode(), nil
 }
 
-// TestPdeathsigCommandsStartOffCallerThread verifies that each Runsc start
-// path (direct, runOrError, cmdOutput, with and without IO) starts a command
-// with a parent-death signal from an OS thread that is not the thread of the
-// caller, and starts a command without a parent-death signal from the thread
-// of the caller. It checks only which thread starts each command;
+// TestPdeathsigCommandsStartOffCallerThread verifies that a command with a
+// parent-death signal starts from an OS thread that is not the thread of the
+// caller, and that a command without one starts from the thread of the
+// caller. It covers each Runsc start path (direct, and cmdOutput through Wait
+// and Kill, with and without IO) and commands started through Monitor
+// directly. It checks only which thread starts each command;
 // TestWaitSurvivesLockedThreadExit checks that the thread stays alive.
 func TestPdeathsigCommandsStartOffCallerThread(t *testing.T) {
 	dir := t.TempDir()
@@ -454,6 +455,13 @@ func TestPdeathsigCommandsStartOffCallerThread(t *testing.T) {
 		run(call)
 	}
 	noPdeathTID = run(func(ctx context.Context) { noPdeathsig.Kill(ctx, "cid", 9, nil) })
+	// A command that does not come from Runsc has no SysProcAttr.
+	noAttrTID := run(func(ctx context.Context) {
+		cmd := exec.CommandContext(ctx, script)
+		if ec, err := Monitor.Start(cmd); err == nil {
+			Monitor.Wait(cmd, ec)
+		}
+	})
 	close(begin)
 	done.Wait()
 	release.Done()
@@ -471,8 +479,87 @@ func TestPdeathsigCommandsStartOffCallerThread(t *testing.T) {
 			t.Errorf("command with a parent-death signal started from caller thread %d", tid)
 		}
 	}
-	if len(m.otherTIDs) != 1 || m.otherTIDs[0] != noPdeathTID {
-		t.Errorf("commands without a parent-death signal started from threads %v, want caller thread %d", m.otherTIDs, noPdeathTID)
+	if want := map[int]bool{noPdeathTID: true, noAttrTID: true}; len(m.otherTIDs) != len(want) || !want[m.otherTIDs[0]] || !want[m.otherTIDs[1]] || m.otherTIDs[0] == m.otherTIDs[1] {
+		t.Errorf("commands without a parent-death signal started from threads %v, want caller threads %d and %d", m.otherTIDs, noPdeathTID, noAttrTID)
+	}
+}
+
+// reapInStartMonitor is a ProcessMonitor that reaps the command in Start, so the
+// command is already reaped when Start returns.
+type reapInStartMonitor struct{}
+
+// Start implements ProcessMonitor.Start.
+func (reapInStartMonitor) Start(cmd *exec.Cmd) (chan runc.Exit, error) {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	cmd.Wait()
+	ec := make(chan runc.Exit, 1)
+	ec <- runc.Exit{Pid: cmd.Process.Pid, Status: cmd.ProcessState.ExitCode()}
+	return ec, nil
+}
+
+// Wait implements ProcessMonitor.Wait.
+func (reapInStartMonitor) Wait(_ *exec.Cmd, ec chan runc.Exit) (int, error) {
+	return (<-ec).Status, nil
+}
+
+// TestPdeathsigStartGoroutinesExit verifies that the goroutine that starts a
+// command with a parent-death signal exits after the command exits, whether
+// the monitor reaps the command before or after the goroutine sees the exit.
+func TestPdeathsigStartGoroutinesExit(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-runsc")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldMonitor := Monitor
+	t.Cleanup(func() { Monitor = oldMonitor })
+
+	// settled returns the lowest goroutine count seen within d.
+	settled := func(d time.Duration) int {
+		low := runtime.NumGoroutine()
+		for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+			low = min(low, runtime.NumGoroutine())
+		}
+		return low
+	}
+	for _, tc := range []struct {
+		name string
+		next ProcessMonitor
+	}{
+		// runc.Monitor reaps the command in its own goroutine.
+		{name: "runc.Monitor", next: runc.Monitor},
+		// reapInStartMonitor reaps the command before the goroutine waits.
+		{name: "reapInStartMonitor", next: reapInStartMonitor{}},
+		// pollingMonitor reaps the command only when Wait polls.
+		{name: "pollingMonitor", next: pollingMonitor{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			Monitor = &LogMonitor{Next: tc.next}
+			r := &Runsc{
+				Command:      script,
+				Root:         filepath.Join(dir, "root"),
+				PdeathSignal: unix.SIGKILL,
+			}
+			// Warm up, so that goroutines that start on first use are in
+			// the baseline.
+			if err := r.Kill(t.Context(), "cid", 9, nil); err != nil {
+				t.Fatalf("Kill: %v", err)
+			}
+			base := settled(time.Second)
+			const n = 16
+			for i := range n {
+				if err := r.Kill(t.Context(), "cid", 9, nil); err != nil {
+					t.Fatalf("Kill %d: %v", i, err)
+				}
+			}
+			for deadline := time.Now().Add(10 * time.Second); runtime.NumGoroutine() > base; time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("%d goroutines after %d commands exited, want at most %d", runtime.NumGoroutine(), n, base)
+				}
+			}
+		})
 	}
 }
 

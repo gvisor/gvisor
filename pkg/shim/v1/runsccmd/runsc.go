@@ -49,10 +49,10 @@ type ProcessMonitor interface {
 // Monitor is the default process monitor to be used by runsc.
 var Monitor ProcessMonitor = &LogMonitor{Next: runc.Monitor}
 
-// LogMonitor implements the runc.ProcessMonitor interface, logging the command
-// that is getting executed, and then forwarding the call to another
-// implementation. It starts a command that has a parent-death signal on an OS
-// thread that does not exit before the command; see startLocked.
+// LogMonitor implements the runc.ProcessMonitor interface. It logs each command
+// and forwards the call to another implementation, and it starts a command
+// that has a parent-death signal on an OS thread that does not exit before the
+// command; see startOnLockedThread.
 type LogMonitor struct {
 	Next ProcessMonitor
 }
@@ -61,7 +61,7 @@ type LogMonitor struct {
 func (l *LogMonitor) Start(cmd *exec.Cmd) (chan runc.Exit, error) {
 	log.L.Debugf("Executing: %s", cmd.Args)
 	if cmd.SysProcAttr != nil && cmd.SysProcAttr.Pdeathsig != 0 {
-		return startLocked(l.Next, cmd)
+		return startOnLockedThread(l.Next, cmd)
 	}
 	return l.Next.Start(cmd)
 }
