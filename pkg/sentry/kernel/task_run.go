@@ -339,7 +339,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 			if sig == linux.SIGSEGV && t.tg.sigsegvLockCount.Load() != 0 {
 				t.tg.signalHandlers.mu.Lock()
 				if t.tg.sigsegvLockCount.Load() != 0 {
-					t.Infof("Pausing execution due to SigsegvLock")
+					t.Infof("Pausing execution due to SigsegvLock: comm=%q addr=%#x ip=%#x", t.Name(), addr, t.Arch().IP())
 					t.beginInternalStopLocked((*sigsegvLockStop)(nil))
 					t.tg.signalHandlers.mu.Unlock()
 					return (*runApp)(nil)

@@ -17,11 +17,14 @@ package control
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -46,6 +49,13 @@ const (
 	// cudaCheckpointSequentialKey is the checkpoint state key for whether to run
 	// cuda-checkpoint sequentially.
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
+
+	// cudaCheckpointKillTimeout bounds the wait for a killed cuda-checkpoint,
+	// which may be blocked in a host ioctl.
+	cudaCheckpointKillTimeout = 10 * time.Second
+
+	// cudaCheckpointQueryTimeout bounds cuda-checkpoint --get-restore-tid.
+	cudaCheckpointQueryTimeout = 10 * time.Second
 )
 
 func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
@@ -216,9 +226,8 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 	// and direct cuda-checkpoint's stdout/stderr to a pipe.
 	ckptDesc := fmt.Sprintf("cuda-checkpoint %s for PID %d in container %q", opFlag, pid, contID)
 	args.FDTable = k.NewFDTable()
-	cu.Add(func() {
-		args.FDTable.DecRef(ctx)
-	})
+	// The new process takes its own reference, so its exit closes the pipe.
+	defer args.FDTable.DecRef(ctx)
 	if nullFD != nil {
 		if _, err := args.FDTable.NewFDAt(ctx, 0, nullFD, kernel.FDFlags{}); err != nil {
 			log.Warningf("Failed to make /dev/null stdin for %s: %v", ckptDesc, err)
@@ -249,6 +258,129 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 		tg:   ckptTG,
 		out:  ckptOut,
 	}, cu.Release(), nil
+}
+
+// cudaRestoreTID returns the TID of cudaProc's CUDA restore thread, or 0 if
+// cuda-checkpoint can't report it, e.g. on drivers without --get-restore-tid.
+func cudaRestoreTID(sctx context.Context, k *kernel.Kernel, proc *Proc, cudaCheckpointPath string, cudaProc *kernel.ThreadGroup, nullFD *vfs.FileDescription) kernel.ThreadID {
+	ckptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, "--get-restore-tid", nullFD)
+	if err != nil {
+		log.Warningf("Failed to get the CUDA restore thread of PID %d: %v", cudaProc.ID(), err)
+		return 0
+	}
+	if ckptProc.tg == nil {
+		return 0
+	}
+	defer cleanup()
+	if !waitTimeout(ckptProc.tg.WaitExited, cudaCheckpointQueryTimeout) {
+		log.Warningf("%s did not finish within %v; killing it", ckptProc.desc, cudaCheckpointQueryTimeout)
+		killCheckpointProc(k, ckptProc)
+		return 0
+	}
+	if ckptProc.out == nil || !waitTimeout(ckptProc.out.Wait, cudaCheckpointQueryTimeout) {
+		return 0
+	}
+	output := strings.TrimSpace(ckptProc.out.String())
+	if status := ckptProc.tg.ExitStatus(); status != 0 {
+		log.Warningf("%s failed with exit status %d; output: %q", ckptProc.desc, status, output)
+		return 0
+	}
+	tid, err := strconv.ParseInt(output, 10, 32)
+	if err != nil || tid <= 0 {
+		log.Warningf("%s printed unexpected output %q", ckptProc.desc, output)
+		return 0
+	}
+	return kernel.ThreadID(tid)
+}
+
+// waitTimeout waits up to timeout for wait to return, and returns true if it
+// did.
+func waitTimeout(wait func(), timeout time.Duration) bool {
+	exited := make(chan struct{})
+	go func() {
+		wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func killCheckpointProc(k *kernel.Kernel, ckptProc checkpointProc) {
+	if err := k.SendExternalSignalThreadGroup(ckptProc.tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
+		log.Warningf("Failed to kill %s: %v", ckptProc.desc, err)
+	}
+}
+
+// waitCudaCheckpoints waits for ckptProcs, keyed by their target, to exit. It
+// kills each one whose target's CUDA restore thread is stopped by SigsegvLock.
+func waitCudaCheckpoints(sctx context.Context, k *kernel.Kernel, proc *Proc, cudaCheckpointPath string, ckptProcs map[*kernel.ThreadGroup]checkpointProc, nullFD *vfs.FileDescription) map[*kernel.ThreadGroup]error {
+	type waiter struct {
+		done       chan struct{}
+		restoreTID kernel.ThreadID
+		queried    bool
+	}
+	waiters := make(map[*kernel.ThreadGroup]*waiter, len(ckptProcs))
+	exited := make(chan *kernel.ThreadGroup, len(ckptProcs))
+	for cudaProc, ckptProc := range ckptProcs {
+		w := &waiter{done: make(chan struct{})}
+		waiters[cudaProc] = w
+		// This goroutine leaks if a killed cuda-checkpoint never exits.
+		go func() {
+			ckptProc.tg.WaitExited()
+			close(w.done)
+			exited <- cudaProc
+		}()
+	}
+	errs := make(map[*kernel.ThreadGroup]error)
+	// No event fires when a task stops for SigsegvLock, so poll.
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for len(waiters) > 0 {
+		select {
+		case cudaProc := <-exited:
+			delete(waiters, cudaProc)
+			continue
+		case <-ticker.C:
+		}
+		for cudaProc, w := range waiters {
+			stopped := cudaProc.SigsegvLockedTasks()
+			if len(stopped) == 0 {
+				continue
+			}
+			if !w.queried {
+				// This can delay the other targets' checks by up to
+				// cudaCheckpointQueryTimeout.
+				w.queried = true
+				w.restoreTID = cudaRestoreTID(sctx, k, proc, cudaCheckpointPath, cudaProc, nullFD)
+			}
+			if w.restoreTID == 0 {
+				continue
+			}
+			pidns := cudaProc.PIDNamespace()
+			if !slices.ContainsFunc(stopped, func(t *kernel.Task) bool { return pidns.IDOfTask(t) == w.restoreTID }) {
+				continue
+			}
+			ckptProc := ckptProcs[cudaProc]
+			delete(waiters, cudaProc)
+			killCheckpointProc(k, ckptProc)
+			select {
+			case <-w.done:
+				if ckptProc.tg.ExitStatus() == 0 {
+					// cuda-checkpoint succeeded before SIGKILL arrived.
+					continue
+				}
+			case <-time.After(cudaCheckpointKillTimeout):
+				log.Warningf("%s did not exit within %v of SIGKILL", ckptProc.desc, cudaCheckpointKillTimeout)
+			}
+			errs[cudaProc] = fmt.Errorf("%q killed: SigsegvLock stopped the CUDA restore thread (TID %d)", ckptProc.desc, w.restoreTID)
+			log.Warningf("%v", errs[cudaProc])
+		}
+	}
+	return errs
 }
 
 func filterCudaProcsUsingThreadName(sctx context.Context, cudaProcs []*kernel.ThreadGroup) []*kernel.ThreadGroup {
@@ -356,6 +488,7 @@ func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath 
 	}()
 	proc := &Proc{Kernel: k}
 	ckptProcs := make(map[*kernel.ThreadGroup]checkpointProc)
+	killed := make(map[*kernel.ThreadGroup]error)
 	var errs []error
 	for i, cudaProc := range cudaProcs {
 		var ckptTiming *timing.Lease
@@ -377,8 +510,8 @@ func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath 
 		ckptProcs[cudaProc] = ckptProc
 		ckptTimeline := ckptTiming.Transfer()
 		if sequential {
-			ckptProc.tg.WaitExited()
-			if status := ckptProc.tg.ExitStatus(); status != 0 {
+			maps.Copy(killed, waitCudaCheckpoints(sctx, k, proc, cudaCheckpointPath, map[*kernel.ThreadGroup]checkpointProc{cudaProc: ckptProc}, nullFD))
+			if status := ckptProc.tg.ExitStatus(); status != 0 || killed[cudaProc] != nil {
 				ckptTimeline.Reached("exec error")
 			}
 			ckptTimeline.End()
@@ -397,11 +530,14 @@ func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath 
 	// Wait for all cuda-checkpoint processes to exit. Remove all failed
 	// cuda-checkpoint attempts from ckptProcs, so ckptProcs only contains the
 	// successful ones.
+	if !sequential {
+		killed = waitCudaCheckpoints(sctx, k, proc, cudaCheckpointPath, ckptProcs, nullFD)
+	}
 	for cudaProc, ckptProc := range ckptProcs {
-		if !sequential {
-			ckptProc.tg.WaitExited()
-		}
-		if status := ckptProc.tg.ExitStatus(); status != 0 {
+		if err := killed[cudaProc]; err != nil {
+			errs = append(errs, err)
+			delete(ckptProcs, cudaProc)
+		} else if status := ckptProc.tg.ExitStatus(); status != 0 {
 			if ckptProc.out != nil {
 				errs = append(errs, fmt.Errorf("%q failed with exit status %d; output: %q", ckptProc.desc, status, ckptProc.out.String()))
 			} else {
@@ -417,7 +553,8 @@ func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath 
 		// If any cuda-checkpoint process failed, we need to undo the --toggle
 		// operation for all the successful ones to restore the original state.
 		// This is best-effort.
-		undoCkptProcs := make(map[string]checkpointProc)
+		undoCkptProcs := make(map[*kernel.ThreadGroup]checkpointProc)
+		undoKilled := make(map[*kernel.ThreadGroup]error)
 		for cudaProc, ckptProc := range ckptProcs {
 			undoCkptProc, cleanup, err := invokeCudaCheckpoint(sctx, k, proc, cudaCheckpointPath, cudaProc, "--toggle", nullFD)
 			if err != nil {
@@ -428,16 +565,19 @@ func toggleCudaProcs(sctx context.Context, k *kernel.Kernel, cudaCheckpointPath 
 				continue
 			}
 			if sequential {
-				undoCkptProc.tg.WaitExited()
+				maps.Copy(undoKilled, waitCudaCheckpoints(sctx, k, proc, cudaCheckpointPath, map[*kernel.ThreadGroup]checkpointProc{cudaProc: undoCkptProc}, nullFD))
 			}
-			undoCkptProcs[ckptProc.desc] = undoCkptProc
+			undoCkptProcs[cudaProc] = undoCkptProc
 			defer cleanup()
 		}
-		for ckptProcDesc, undoCkptProc := range undoCkptProcs {
-			if !sequential {
-				undoCkptProc.tg.WaitExited()
-			}
-			if status := undoCkptProc.tg.ExitStatus(); status != 0 {
+		if !sequential {
+			undoKilled = waitCudaCheckpoints(sctx, k, proc, cudaCheckpointPath, undoCkptProcs, nullFD)
+		}
+		for cudaProc, undoCkptProc := range undoCkptProcs {
+			ckptProcDesc := ckptProcs[cudaProc].desc
+			if err := undoKilled[cudaProc]; err != nil {
+				log.Warningf("Undoing %q failed: %v", ckptProcDesc, err)
+			} else if status := undoCkptProc.tg.ExitStatus(); status != 0 {
 				if undoCkptProc.out != nil {
 					log.Warningf("Undoing %q failed with exit status %d; output: %q", ckptProcDesc, status, undoCkptProc.out.String())
 				} else {
