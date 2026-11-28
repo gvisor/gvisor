@@ -1,0 +1,37 @@
+# Most Rust standard library tests are libtest binaries. The builder stage
+# builds the library crates from the source of the official toolchain into a
+# new sysroot, builds the test binaries against that sysroot, and copies them to
+# /root/rust-tests. The doctests are not included, because they need rustdoc
+# and a linker at test time. The final image holds only the test binaries.
+FROM rust:1.100.0-trixie AS builder
+RUN rustup component add rust-src
+
+WORKDIR /root
+RUN cp -r "$(rustc --print sysroot)/lib/rustlib/src/rust/library" /root/library
+
+# The library crates must not link to the prebuilt standard library of the
+# toolchain, so they build against an empty sysroot. Then the build copies the
+# built crates into this sysroot. The test build uses the same flags and
+# features, so cargo does not build the library crates again, and the crates
+# that rustc finds in the sysroot are the same crates that cargo gives it. The
+# "dist" profile is the profile that the Rust project uses for the library. Its
+# debug information is compressed to keep the image small.
+WORKDIR /root/library
+ENV RUSTC_BOOTSTRAP=1
+ENV RUSTFLAGS="--sysroot=/root/sysroot -Zforce-unstable-if-unmarked -Clink-arg=-Wl,--compress-debug-sections=zlib"
+ARG TARGET=x86_64-unknown-linux-gnu
+ARG CARGO_FLAGS="--offline --profile dist --target ${TARGET} --manifest-path sysroot/Cargo.toml --features panic-unwind,backtrace"
+RUN mkdir -p /root/sysroot/lib/rustlib/${TARGET}/lib \
+  && cargo build ${CARGO_FLAGS} \
+  && find target/${TARGET}/dist -name '*.rlib' -exec cp {} /root/sysroot/lib/rustlib/${TARGET}/lib/ \;
+RUN cargo test ${CARGO_FLAGS} --all-targets --no-run \
+  -p std -p coretests -p alloctests -p proc_macro -p test -p std_detect
+
+# RUN --mount requires BuildKit, which the public CI image builder does not
+# enable.
+COPY collect.sh /tmp/collect.sh
+RUN /tmp/collect.sh target/${TARGET}/dist/build /root/rust-tests
+
+FROM debian:trixie
+COPY --from=builder /root/rust-tests /root/rust-tests
+WORKDIR /root/rust-tests

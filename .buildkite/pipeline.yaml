@@ -717,6 +717,15 @@ steps:
       <<: *platform_specific_agents
       arch: "amd64"
       queue: "default"
+  - <<: *common
+    <<: *docker
+    label: ":crab: Rust runtime tests"
+    command: make rust1.100.0-runtime-tests RUNTIME_ARGS=--directfs
+    parallelism: 2
+    agents:
+      <<: *platform_specific_agents
+      arch: "amd64"
+      queue: "default"
 
   # Bwrap tests.
   - <<: *common
@@ -781,6 +790,16 @@ steps:
     <<: *docker
     label: ":python: Python runtime tests (goferfs)"
     command: make python3.12.3-runtime-tests RUNTIME_ARGS=--directfs=false
+    parallelism: 2
+    if: build.branch == "master"
+    agents:
+      <<: *platform_specific_agents
+      arch: "amd64"
+      queue: "default"
+  - <<: *common
+    <<: *docker
+    label: ":crab: Rust runtime tests (goferfs)"
+    command: make rust1.100.0-runtime-tests RUNTIME_ARGS=--directfs=false
     parallelism: 2
     if: build.branch == "master"
     agents:

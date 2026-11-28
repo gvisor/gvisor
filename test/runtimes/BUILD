@@ -41,6 +41,13 @@ runtime_test(
     shard_count = more_shards,
 )
 
+runtime_test(
+    name = "rust1.100.0",
+    exclude_file = "exclude/rust1.100.0.csv",
+    lang = "rust",
+    shard_count = more_shards,
+)
+
 bzl_library(
     name = "defs_bzl",
     srcs = ["defs.bzl"],

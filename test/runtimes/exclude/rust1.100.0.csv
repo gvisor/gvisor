@@ -1,0 +1,4 @@
+test name,bug id,comment
+std-process_spawning:issue_15149,,"Broken test. Re-executes itself with the same arguments, so it recurses forever when selected by name."
+std:sys::process::unix::pidfd::tests::test_command_pidfd,gvisor.dev/issue/17875,A zero-length sendmsg with SCM_RIGHTS on a unix SOCK_SEQPACKET or SOCK_DGRAM socket sends no message.
+std:sys::process::unix::pidfd::tests::test_pidfd,gvisor.dev/issue/17875,A zero-length sendmsg with SCM_RIGHTS on a unix SOCK_SEQPACKET or SOCK_DGRAM socket sends no message.

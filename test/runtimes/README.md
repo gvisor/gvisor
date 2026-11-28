@@ -33,6 +33,7 @@ Java     | 21      | `make java21-runtime-tests`
 NodeJS   | 22.2.0  | `make nodejs22.2.0-runtime-tests`
 Php      | 8.5.11  | `make php8.5.11-runtime-tests`
 Python   | 3.12.3  | `make python3.12.3-runtime-tests`
+Rust     | 1.100.0 | `make rust1.100.0-runtime-tests`
 
 You can modify the runtime test behaviors by passing in the following `make`
 variables:

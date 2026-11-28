@@ -33,8 +33,8 @@ running on Linux. For this reason, looking through the
 how widely compatible gVisor is in practice.
 
 gVisor releases go through the regression tests of popular language runtimes
-(Python, Java, Node.js, PHP, Go) to ensure continued compatibility with the base
-libraries of these languages. This means most programs written in these
+(Python, Java, Node.js, PHP, Go, Rust) to ensure continued compatibility with
+the base libraries of these languages. This means most programs written in these
 languages will work.
 
 ## What **doesn't** work?
