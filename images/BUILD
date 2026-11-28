@@ -15,6 +15,7 @@ filegroup(
         "//images/basic:sources",
         "//images/benchmarks:sources",
         "//images/benchmarks/bun-spawn:sources",
+        "//images/benchmarks/wrk2:sources",
         "//images/compatibility:sources",
         "//images/gpu/ollama/client:sources",
     ],
