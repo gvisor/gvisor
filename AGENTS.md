@@ -97,9 +97,9 @@ their parent directory. For example:
     (e.g. "Used by", "Useful for"). If this is not already clear from the
     function name or context, then the function name and/or context is the
     problem, and the comment is a band-aid.
--   References to Linux source code must be limited to ABI only. The only
-    documentation of Linux behavior that matters is actual behavior as exercised
-    by C++ syscall tests.
+-   References in gVisor code comments to Linux source code must be limited to
+    ABI only. The only documentation of Linux behavior that matters is actual
+    behavior as exercised by C++ syscall tests.
 -   Prose (such as comments, documentation, other markdown files) should mostly
     follow ASD-STE100 Simplified Technical English. Some liberties are expected
     (and welcome in some contexts, such as website/blog post contents), but
