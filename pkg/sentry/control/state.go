@@ -209,13 +209,18 @@ func setSaveOptsForCheckpointGofer(o *controlapi.SaveOpts, saveOpts *state.SaveO
 	return nil
 }
 
-// Save saves the running system with the given options. If saveOpts.Resume is
-// true, the caller must call PostResume afterwards.
+// Save saves the running system with the given options.
 func Save(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) error {
 	if err := preSave(k, saveOpts, execOpts); err != nil {
 		return err
 	}
-	return saveOpts.Save(k.SupervisorContext(), k, w)
+	if err := saveOpts.Save(k.SupervisorContext(), k, w); err != nil {
+		return err
+	}
+	if saveOpts.Resume {
+		return PostResume(k, nil)
+	}
+	return nil
 }
 
 // preSave is called before saving the kernel.
