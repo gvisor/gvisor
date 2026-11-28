@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -301,7 +302,7 @@ TEST(Processes, ExitThatOrphansGroupSignalsStoppedMembers) {
 bool readProcessGroupData(int fd, void* data, size_t size) {
   struct pollfd pfd = {.fd = fd, .events = POLLIN};
   return RetryEINTR(poll)(&pfd, 1, 30000) == 1 &&
-         ReadFd(fd, data, size) == size;
+         ReadFd(fd, data, size) == static_cast<ssize_t>(size);
 }
 
 // Keep session_leader in one group and group_leader in another group of the
@@ -347,7 +348,9 @@ void processGroupAncestorAfterParentMoves(bool new_session) {
             if (new_session) {
               readProcessGroupData(child_go[0], &byte, 1);
             } else {
-              TEST_PCHECK(readProcessGroupData(child_go[0], &byte, 1));
+              if (!readProcessGroupData(child_go[0], &byte, 1)) {
+                _exit(0);
+              }
               TEST_PCHECK(setsid() != -1);
               TEST_PCHECK(WriteFd(child_done[1], &byte, 1) == 1);
               close(child_done[1]);
@@ -366,7 +369,8 @@ void processGroupAncestorAfterParentMoves(bool new_session) {
           if (!readProcessGroupData(go[0], &byte, 1)) {
             TEST_PCHECK(kill(grandchild, SIGKILL) == 0 || errno == ESRCH);
             int status;
-            TEST_PCHECK(RetryEINTR(waitpid)(grandchild, &status, 0) == grandchild);
+            TEST_PCHECK(RetryEINTR(waitpid)(grandchild, &status, 0) ==
+                        grandchild);
             _exit(1);
           }
           if (new_session) {
@@ -376,10 +380,11 @@ void processGroupAncestorAfterParentMoves(bool new_session) {
           }
           TEST_PCHECK(WriteFd(done[1], &byte, 1) == 1);
           close(done[1]);
-          bool got_cleanup = readProcessGroupData(go[0], &byte, 1);
+          bool got_cleanup = ReadFd(go[0], &byte, 1) == 0;
           TEST_PCHECK(kill(grandchild, SIGKILL) == 0 || errno == ESRCH);
           int status;
-          TEST_PCHECK(RetryEINTR(waitpid)(grandchild, &status, 0) == grandchild);
+          TEST_PCHECK(RetryEINTR(waitpid)(grandchild, &status, 0) ==
+                      grandchild);
           _exit(got_cleanup ? 0 : 1);
         }
         TEST_PCHECK(child > 0);
@@ -402,46 +407,43 @@ void processGroupAncestorAfterParentMoves(bool new_session) {
       close(done[1]);
       close(child_done[1]);
 
-      char byte;
-      bool ready_received = readProcessGroupData(ready[0], &byte, 1);
-      bool parent_moved = readProcessGroupData(moved[0], &byte, 1);
-      if (!ready_received || !parent_moved) {
-        byte = 1;
-        TEST_PCHECK(WriteFd(go[1], &byte, 1) == 1);
-        TEST_PCHECK(WriteFd(go[1], &byte, 1) == 1);
-        TEST_PCHECK(WriteFd(child_go[1], &byte, 1) == 1);
-        TEST_PCHECK(WriteFd(child_go[1], &byte, 1) == 1);
+      auto cleanup = [&] {
+        close(go[1]);
+        close(child_go[1]);
         TEST_PCHECK(kill(stopped, SIGKILL) == 0 || errno == ESRCH);
         int status;
         TEST_PCHECK(RetryEINTR(waitpid)(stopped, &status, 0) == stopped);
         TEST_PCHECK(RetryEINTR(waitpid)(parent, &status, 0) == parent);
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+      };
+
+      char byte;
+      if (!readProcessGroupData(ready[0], &byte, 1)) {
+        cleanup();
+        _exit(1);
+      }
+      if (!readProcessGroupData(moved[0], &byte, 1)) {
+        cleanup();
         _exit(1);
       }
       TEST_PCHECK(WriteFd(go[1], &byte, 1) == 1);
-      bool operation_succeeded = readProcessGroupData(done[0], &byte, 1);
+      if (!readProcessGroupData(done[0], &byte, 1)) {
+        cleanup();
+        _exit(1);
+      }
       if (!new_session) {
-        if (operation_succeeded) {
-          TEST_PCHECK(WriteFd(child_go[1], &byte, 1) == 1);
-          operation_succeeded = readProcessGroupData(child_done[0], &byte, 1);
+        TEST_PCHECK(WriteFd(child_go[1], &byte, 1) == 1);
+        if (!readProcessGroupData(child_done[0], &byte, 1)) {
+          cleanup();
+          _exit(1);
         }
       }
 
       sigset_t pending;
       TEST_PCHECK(sigpending(&pending) == 0);
       bool received_hup = sigismember(&pending, SIGHUP);
-      if (operation_succeeded) {
-        TEST_PCHECK(WriteFd(go[1], &byte, 1) == 1);
-      } else {
-        TEST_PCHECK(WriteFd(go[1], &byte, 1) == 1);
-        TEST_PCHECK(WriteFd(child_go[1], &byte, 1) == 1);
-        TEST_PCHECK(WriteFd(child_go[1], &byte, 1) == 1);
-      }
-      TEST_PCHECK(kill(stopped, SIGKILL) == 0 || errno == ESRCH);
-      int status;
-      TEST_PCHECK(RetryEINTR(waitpid)(stopped, &status, 0) == stopped);
-      TEST_PCHECK(RetryEINTR(waitpid)(parent, &status, 0) == parent);
-      bool passed = operation_succeeded && !received_hup && WIFEXITED(status) &&
-                    WEXITSTATUS(status) == 0;
+      bool cleanup_succeeded = cleanup();
+      bool passed = !received_hup && cleanup_succeeded;
       _exit(passed ? 0 : 1);
     }
     TEST_PCHECK(group_leader > 0);

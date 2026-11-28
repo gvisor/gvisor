@@ -442,8 +442,8 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 		childTG.processGroup.incRefWithParent(&pg)
 		childTG.processGroup.decRefWithParent(oldPG)
 	})
-	oldPG.decRefWithParent(oldParentPG)
 	tg.processGroup = &pg
+	oldPG.decRefWithParent(oldParentPG)
 
 	// Add the new process group to the session.
 	pg.session.processGroups.PushBack(&pg)
