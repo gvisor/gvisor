@@ -56,8 +56,13 @@ import (
 
 // linkDispatcher reads packets from the link FD and dispatches them to the
 // NetworkDispatcher.
+//
+// A dispatcher runs in cycles to support attaching and reattaching on the same
+// endpoint. The cycle is Attach() -> prepare() -> dispatch() -> release() ->
+// Attach() and so on.
 type linkDispatcher interface {
 	Stop()
+	prepare()
 	dispatch() (bool, tcpip.Error)
 	release()
 	close()
@@ -133,6 +138,9 @@ type endpoint struct {
 	closed func(tcpip.Error) `state:"nosave"`
 
 	inboundDispatchers []linkDispatcher
+
+	// detaching is set while Attach(nil) stops the dispatch goroutines.
+	detaching atomicbitops.Bool `state:"nosave"`
 
 	mu endpointRWMutex `state:"nosave"`
 	// +checklocks:mu
@@ -493,6 +501,7 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 
 	// nil means the NIC is being removed.
 	if dispatcher == nil && e.dispatcher != nil {
+		e.detaching.Store(true)
 		for _, dispatcher := range e.inboundDispatchers {
 			dispatcher.Stop()
 		}
@@ -505,10 +514,12 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	defer e.mu.Unlock()
 	if dispatcher != nil && e.dispatcher == nil {
 		e.dispatcher = dispatcher
+		e.detaching.Store(false)
 		// Link endpoints are not savable. When transportation endpoints are
 		// saved, they stop sending outgoing packets and all incoming packets
 		// are rejected.
 		for i := range e.inboundDispatchers {
+			e.inboundDispatchers[i].prepare()
 			e.wg.Add(1)
 			go func(i int) { // S/R-SAFE: See above.
 				e.dispatchLoop(e.inboundDispatchers[i])
@@ -893,7 +904,9 @@ func (e *endpoint) InjectOutbound(dest tcpip.Address, packet *buffer.View) tcpip
 func (e *endpoint) dispatchLoop(inboundDispatcher linkDispatcher) tcpip.Error {
 	for {
 		cont, err := inboundDispatcher.dispatch()
-		if err != nil || !cont {
+		// The FD may stay readable, so check detaching rather than wait for
+		// dispatch to see the stop event.
+		if err != nil || !cont || e.detaching.Load() {
 			if e.closed != nil {
 				e.closed(err)
 			}
