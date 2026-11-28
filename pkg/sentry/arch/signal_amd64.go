@@ -86,6 +86,29 @@ type UContext64 struct {
 	Sigset   linux.SignalSet
 }
 
+// x86TrapPF is X86_TRAP_PF, the page fault exception vector.
+const x86TrapPF = 14
+
+// Signal codes that the sentry gives to a fault that came from a page fault.
+const (
+	segvMapErr = 1 // SEGV_MAPERR
+	segvAccErr = 2 // SEGV_ACCERR
+	busAdrErr  = 2 // BUS_ADRERR
+)
+
+// fromPageFault returns true if info describes a signal that a page fault
+// raised.
+func fromPageFault(info *linux.SignalInfo) bool {
+	switch linux.Signal(info.Signo) {
+	case linux.SIGSEGV:
+		return info.Code == segvMapErr || info.Code == segvAccErr
+	case linux.SIGBUS:
+		return info.Code == busAdrErr
+	default:
+		return false
+	}
+}
+
 // SignalSetup implements Context.SignalSetup. (Compare to Linux's
 // arch/x86/kernel/signal.c:__setup_rt_frame().)
 func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet, featureSet cpuid.FeatureSet) error {
@@ -143,12 +166,17 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 		uc.Flags |= _UC_FP_XSTATE
 	}
 
-	// TODO(gvisor.dev/issue/159): Set SignalContext64.Err, Trapno, and Cr2
-	// based on the fault that caused the signal. For now, leave Err and
-	// Trapno unset and assume CR2 == info.Addr() for SIGSEGVs and
-	// SIGBUSes.
+	// TODO(gvisor.dev/issue/159): Set SignalContext64.Err and Cr2 based on
+	// the fault that caused the signal. For now, leave Err unset and assume
+	// CR2 == info.Addr() for SIGSEGVs and SIGBUSes.
 	if linux.Signal(info.Signo) == linux.SIGSEGV || linux.Signal(info.Signo) == linux.SIGBUS {
 		uc.MContext.Cr2 = info.Addr()
+		if fromPageFault(info) {
+			// As Linux does, report the page fault vector, X86_TRAP_PF. Some
+			// applications, such as SQL Server's SQLPAL, read it to tell a page
+			// fault they handle from a fatal fault (gvisor.dev/issue/11112).
+			uc.MContext.Trapno = x86TrapPF
+		}
 	}
 
 	// "... the value (%rsp+8) is always a multiple of 16 (...) when

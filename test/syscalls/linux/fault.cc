@@ -24,6 +24,7 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/test_util.h"
 
 namespace gvisor {
@@ -94,6 +95,31 @@ TEST(FaultTest, InRange) {
 
   Fault();
 }
+
+#if defined(__x86_64__)
+// X86_TRAP_PF, the page fault exception vector.
+constexpr greg_t kTrapPageFault = 14;
+
+void trapno_handler(int sig, siginfo_t* siginfo, void* context) {
+  ucontext_t* uc = reinterpret_cast<ucontext_t*>(context);
+  _exit(uc->uc_mcontext.gregs[REG_TRAPNO] == kTrapPageFault ? 0 : 1);
+}
+
+// A SIGSEGV that a page fault raises reports the page fault vector in
+// REG_TRAPNO, as Linux does.
+TEST(FaultTest, PageFaultReportsTrapno) {
+  const auto rest = [] {
+    struct sigaction sa = {};
+    sa.sa_sigaction = trapno_handler;
+    sigfillset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    TEST_PCHECK(sigaction(SIGSEGV, &sa, nullptr) == 0);
+    Fault();
+    _exit(2);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+#endif  // defined(__x86_64__)
 
 }  // namespace
 
