@@ -72,9 +72,9 @@ const (
 // congestionControl is an interface that must be implemented by any supported
 // congestion control algorithm.
 type congestionControl interface {
-	// HandleLossDetected is invoked when the loss is detected by RACK or
-	// sender.dupAckCount >= nDupAckThreshold just before entering fast
-	// retransmit.
+	// HandleLossDetected is invoked when RACK, sender.dupAckCount >=
+	// nDupAckThreshold or a TLP shows a loss that is a new congestion
+	// event.
 	HandleLossDetected()
 
 	// HandleRTOExpired is invoked when the retransmit timer expires.
@@ -1173,6 +1173,25 @@ func (s *sender) sendData() {
 	}
 
 	s.postXmit(dataSent, true /* shouldScheduleProbe */)
+}
+
+// reducedForOutstandingData returns true if the slow-start threshold does not
+// have its initial value and FastRecovery.Last is in the unacknowledged data.
+// A retransmit timeout, an entry to recovery and a TLP loss each set
+// FastRecovery.Last to the last byte sent, so a true result shows that data
+// sent before the most recent of these congestion events is unacknowledged.
+//
+// FastRecovery.Last does not move while there is no loss, so SndUna can be
+// more than 2^31 bytes ahead of it, where LessThan gives the wrong result.
+// InRange gives the wrong result only if SndUna is almost exactly a multiple
+// of 2^32 bytes ahead. The threshold check excludes that case while the
+// threshold has its initial value. CUBIC can also set the threshold when it
+// leaves slow start with no loss, and the check does not exclude the case
+// after that.
+//
+// +checklocks:s.ep.mu
+func (s *sender) reducedForOutstandingData() bool {
+	return s.Ssthresh != InitialSsthresh && s.FastRecovery.Last.InRange(s.SndUna, s.SndNxt)
 }
 
 // +checklocks:s.ep.mu
