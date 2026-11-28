@@ -303,9 +303,14 @@ To build a custom gofer:
     `SeccompRules`.
 2.  Optionally define a `SetFlags(*flag.FlagSet)` method on the extension type
     if it needs gofer flags.
-3.  Optionally define a `PrepareGofer(extension.GoferPrepareContext)` method on
-    the extension type if it needs to run setup before the gofer drops
-    capabilities and enters its final root.
+3.  Optionally define one or both prepare hooks on the extension type to run
+    one-time setup during initial gofer startup, before capabilities are dropped:
+    `PrepareBeforeRootFS(extension.GoferPrepareContext)` runs before root setup
+    while the host filesystem is still visible, and
+    `PrepareGofer(extension.GoferPrepareContext)` runs after root setup. Because
+    `PrepareBeforeRootFS` runs with host filesystem visibility and pre-drop
+    privileges, extensions must not open or connect to unvalidated host paths
+    from untrusted OCI annotations.
 4.  Register your extension in `init()` or early `main()`.
 5.  Build a runsc binary that imports `runsc/cli` and your extension package.
 
@@ -315,7 +320,10 @@ decline. All mounts share the same `lisafs.Server`, preserving server-side
 filesystem tree synchronization across stock and extension-backed mounts.
 Configuration may be read from OCI annotations and mount fields such as source,
 type, and options. `SeccompRules` declares any additional syscalls the extension
-needs beyond the stock gofer allowlist. `PrepareGofer` can return
-`FlagOverrides` for state that must survive gofer re-exec, such as file
-descriptor numbers. Extensions that pass file descriptors this way must clear
-`FD_CLOEXEC` on those descriptors before returning.
+needs beyond the stock gofer allowlist. `PrepareBeforeRootFS` and `PrepareGofer`
+can return `FlagOverrides` for extension-registered flags (applied across gofer
+re-exec or in-process when the gofer does not re-exec) and `PassFDs` for file
+descriptors that must survive re-exec. Keep `FD_CLOEXEC` set on those
+descriptors; the gofer clears `FD_CLOEXEC` on `PassFDs` right before re-exec
+(after spawning helper processes) and leaves `FD_CLOEXEC` set when not
+re-execing.

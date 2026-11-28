@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
+	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -268,5 +270,85 @@ func lisafsMountConfs() []specutils.GoferMountConf {
 func rootfsOnlyMountConfs(lower specutils.GoferMountConfLowerType) []specutils.GoferMountConf {
 	return []specutils.GoferMountConf{
 		{Lower: lower, Upper: specutils.NoOverlay},
+	}
+}
+
+func TestApplyFlagOverrides(t *testing.T) {
+	fs := flag.NewFlagSet("gofer", flag.ContinueOnError)
+	var fd int
+	var name string
+	fs.IntVar(&fd, "ext-fd", -1, "")
+	fs.StringVar(&name, "ext-name", "", "")
+
+	overrides := map[string]string{
+		"ext-fd":   "9",
+		"ext-name": "mock",
+	}
+	if err := applyFlagOverrides(fs, overrides); err != nil {
+		t.Fatalf("applyFlagOverrides(fs, %v) error = %v, want nil", overrides, err)
+	}
+	if fd != 9 || name != "mock" {
+		t.Errorf("applyFlagOverrides(fs, %v) set (fd=%d, name=%q), want (fd=9, name=%q)", overrides, fd, name, "mock")
+	}
+
+	unknown := map[string]string{"unknown-flag": "1"}
+	if err := applyFlagOverrides(fs, unknown); err == nil {
+		t.Errorf("applyFlagOverrides(fs, %v) = nil, want non-nil error", unknown)
+	}
+
+	badVal := map[string]string{"ext-fd": "not-an-int"}
+	if err := applyFlagOverrides(fs, badVal); err == nil {
+		t.Errorf("applyFlagOverrides(fs, %v) = nil, want non-nil error", badVal)
+	}
+}
+
+func TestValidateExtensionOverrides(t *testing.T) {
+	var g Gofer
+	fs := flag.NewFlagSet("gofer", flag.ContinueOnError)
+	g.SetFlags(fs)
+	if g.extensionFlags != nil {
+		t.Errorf("g.extensionFlags with no registered extensions = %v, want nil", g.extensionFlags)
+	}
+
+	var extFD int
+	allowed := registerExtensionFlags(fs, func(f *flag.FlagSet) {
+		f.IntVar(&extFD, "ext-fd", -1, "extension fd")
+	})
+
+	if err := validateExtensionOverrides(allowed, map[string]string{"ext-fd": "7"}); err != nil {
+		t.Errorf("validateExtensionOverrides(allowed, ext-fd) = %v, want nil", err)
+	}
+	for _, coreFlag := range []string{"apply-caps", "setup-root", "rpc-fd"} {
+		reserved := map[string]string{coreFlag: "false"}
+		if err := validateExtensionOverrides(allowed, reserved); err == nil {
+			t.Errorf("validateExtensionOverrides(allowed, %v) = nil, want non-nil error", reserved)
+		}
+	}
+}
+
+func TestValidateExtensionPassFDs(t *testing.T) {
+	if err := validateExtensionPassFDs(nil); err != nil {
+		t.Errorf("validateExtensionPassFDs(nil) = %v, want nil", err)
+	}
+	if err := validateExtensionPassFDs([]int{3, 7}); err != nil {
+		t.Errorf("validateExtensionPassFDs([3 7]) = %v, want nil", err)
+	}
+	for _, bad := range []int{-1, 0, 1, 2} {
+		if err := validateExtensionPassFDs([]int{3, bad}); err == nil {
+			t.Errorf("validateExtensionPassFDs([3 %d]) = nil, want error", bad)
+		}
+	}
+}
+
+func TestMergeOverrides(t *testing.T) {
+	merged := mergeOverrides(nil, nil)
+	if merged != nil {
+		t.Errorf("mergeOverrides(nil, nil) = %v, want nil", merged)
+	}
+	merged = mergeOverrides(nil, map[string]string{"a": "1", "b": "2"})
+	merged = mergeOverrides(merged, map[string]string{"b": "3", "c": "4"})
+	want := map[string]string{"a": "1", "b": "3", "c": "4"}
+	if !maps.Equal(merged, want) {
+		t.Errorf("mergeOverrides() = %v, want %v", merged, want)
 	}
 }

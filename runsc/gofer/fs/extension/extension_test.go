@@ -16,6 +16,8 @@ package extension
 
 import (
 	"errors"
+	"maps"
+	"slices"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -63,6 +65,18 @@ func (f prepareExtension) PrepareGofer(ctx GoferPrepareContext) (GoferPrepareRes
 	return f.prepareGofer(ctx)
 }
 
+type prepareBeforeRootFSExtension struct {
+	fakeExtension
+	prepareBeforeRootFS func(GoferPrepareContext) (GoferPrepareResult, error)
+}
+
+func (f prepareBeforeRootFSExtension) PrepareBeforeRootFS(ctx GoferPrepareContext) (GoferPrepareResult, error) {
+	if f.prepareBeforeRootFS == nil {
+		return GoferPrepareResult{}, nil
+	}
+	return f.prepareBeforeRootFS(ctx)
+}
+
 func TestRegisterAndRegistered(t *testing.T) {
 	registered = nil
 
@@ -103,13 +117,19 @@ func TestPrepareGofer(t *testing.T) {
 			if ctx.ContainerID != "container" || ctx.BundleDir != "/bundle" {
 				t.Fatalf("GoferPrepareContext = %+v", ctx)
 			}
-			return GoferPrepareResult{FlagOverrides: map[string]string{"first-fd": "3"}}, nil
+			return GoferPrepareResult{
+				FlagOverrides: map[string]string{"first-fd": "3"},
+				PassFDs:       []int{3},
+			}, nil
 		},
 	})
 	Register(prepareExtension{
 		fakeExtension: fakeExtension{name: "third"},
 		prepareGofer: func(GoferPrepareContext) (GoferPrepareResult, error) {
-			return GoferPrepareResult{FlagOverrides: map[string]string{"second-fd": "4"}}, nil
+			return GoferPrepareResult{
+				FlagOverrides: map[string]string{"second-fd": "4"},
+				PassFDs:       []int{4},
+			}, nil
 		},
 	})
 
@@ -119,6 +139,10 @@ func TestPrepareGofer(t *testing.T) {
 	}
 	if got.FlagOverrides["first-fd"] != "3" || got.FlagOverrides["second-fd"] != "4" {
 		t.Fatalf("PrepareGofer overrides = %v", got.FlagOverrides)
+	}
+	wantFDs := []int{3, 4}
+	if !slices.Equal(got.PassFDs, wantFDs) {
+		t.Errorf("PrepareGofer().PassFDs = %v, want %v", got.PassFDs, wantFDs)
 	}
 }
 
@@ -134,5 +158,64 @@ func TestPrepareGoferError(t *testing.T) {
 
 	if _, err := PrepareGofer(GoferPrepareContext{}); !errors.Is(err, want) {
 		t.Fatalf("PrepareGofer error = %v, want %v", err, want)
+	}
+}
+
+func TestPrepareBeforeRootFS(t *testing.T) {
+	orig := registered
+	t.Cleanup(func() { registered = orig })
+	registered = nil
+
+	Register(fakeExtension{name: "first"})
+	Register(prepareBeforeRootFSExtension{
+		fakeExtension: fakeExtension{name: "second"},
+		prepareBeforeRootFS: func(ctx GoferPrepareContext) (GoferPrepareResult, error) {
+			if ctx.ContainerID != "container" || ctx.BundleDir != "/bundle" {
+				t.Errorf("PrepareBeforeRootFS callback got ctx = %+v, want ContainerID=%q BundleDir=%q", ctx, "container", "/bundle")
+			}
+			return GoferPrepareResult{
+				FlagOverrides: map[string]string{"host-fd": "7", "shared": "old"},
+				PassFDs:       []int{7},
+			}, nil
+		},
+	})
+	Register(prepareBeforeRootFSExtension{
+		fakeExtension: fakeExtension{name: "third"},
+		prepareBeforeRootFS: func(ctx GoferPrepareContext) (GoferPrepareResult, error) {
+			return GoferPrepareResult{
+				FlagOverrides: map[string]string{"shared": "new", "extra": "val"},
+				PassFDs:       []int{8},
+			}, nil
+		},
+	})
+
+	got, err := PrepareBeforeRootFS(GoferPrepareContext{ContainerID: "container", BundleDir: "/bundle"})
+	if err != nil {
+		t.Fatalf("PrepareBeforeRootFS() error = %v, want nil", err)
+	}
+	wantOverrides := map[string]string{"host-fd": "7", "shared": "new", "extra": "val"}
+	if !maps.Equal(got.FlagOverrides, wantOverrides) {
+		t.Errorf("PrepareBeforeRootFS().FlagOverrides = %v, want %v", got.FlagOverrides, wantOverrides)
+	}
+	wantFDs := []int{7, 8}
+	if !slices.Equal(got.PassFDs, wantFDs) {
+		t.Errorf("PrepareBeforeRootFS().PassFDs = %v, want %v", got.PassFDs, wantFDs)
+	}
+}
+
+func TestPrepareBeforeRootFSError(t *testing.T) {
+	orig := registered
+	t.Cleanup(func() { registered = orig })
+	registered = nil
+	want := errors.New("host setup failed")
+	Register(prepareBeforeRootFSExtension{
+		fakeExtension: fakeExtension{name: "first"},
+		prepareBeforeRootFS: func(GoferPrepareContext) (GoferPrepareResult, error) {
+			return GoferPrepareResult{}, want
+		},
+	})
+
+	if _, err := PrepareBeforeRootFS(GoferPrepareContext{}); !errors.Is(err, want) {
+		t.Fatalf("PrepareBeforeRootFS() error = %v, want %v", err, want)
 	}
 }
