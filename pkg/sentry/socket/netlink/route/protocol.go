@@ -618,6 +618,10 @@ func (p *Protocol) newAddr(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		return syserr.ErrInvalidArgument
 	}
 
+	// IFA_LOCAL is the local address of the interface. IFA_ADDRESS is the
+	// prefix or peer address. If an IPv6 request has no IFA_LOCAL,
+	// IFA_ADDRESS is the local address.
+	var local, address, label []byte
 	for !attrs.Empty() {
 		ahdr, value, rest, ok := attrs.ParseFirst()
 		if !ok {
@@ -625,28 +629,21 @@ func (p *Protocol) newAddr(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		}
 		attrs = rest
 
-		// NOTE: A netlink message will contain multiple header attributes.
-		// Both the IFA_ADDRESS and IFA_LOCAL attributes are typically sent
-		// with IFA_ADDRESS being a prefix address and IFA_LOCAL being the
-		// local interface address. We add the local interface address here
-		// and ignore the IFA_ADDRESS.
 		switch ahdr.Type {
+		case linux.IFA_UNSPEC:
 		case linux.IFA_LOCAL:
-			err := stack.AddInterfaceAddr(withOrigin(ctx, s, msg), int32(ifa.Index), inet.InterfaceAddr{
-				Family:    ifa.Family,
-				PrefixLen: ifa.PrefixLen,
-				Flags:     ifa.Flags,
-				Addr:      value,
-			})
-			if linuxerr.Equals(linuxerr.EEXIST, err) {
-				flags := msg.Header().Flags
-				if flags&linux.NLM_F_EXCL != 0 {
-					return syserr.ErrExists
-				}
-			} else if err != nil {
-				return syserr.ErrInvalidArgument
-			}
+			local = value
 		case linux.IFA_ADDRESS:
+			address = value
+		case linux.IFA_LABEL:
+			// Only IPv4 addresses have labels.
+			if ifa.Family != linux.AF_INET {
+				break
+			}
+			if len(value) == 0 || len(bytes.TrimSuffix(value, []byte{0})) >= linux.IFNAMSIZ {
+				return syserr.ErrRange
+			}
+			label = value
 		case linux.IFA_BROADCAST:
 			// TODO(b/340929168): support IFA_BROADCAST. The standard
 			// broadcast address (the last IP address of the subnet) is
@@ -655,6 +652,38 @@ func (p *Protocol) newAddr(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 			ctx.Warningf("Unknown attribute: %v", ahdr.Type)
 			return syserr.ErrNotSupported
 		}
+	}
+
+	addr := local
+	if addr == nil && ifa.Family == linux.AF_INET6 {
+		addr = address
+	}
+	if addr == nil {
+		return syserr.ErrInvalidArgument
+	}
+
+	// gVisor keeps no label for each address. The address dump reports the
+	// interface name as the label.
+	if label != nil {
+		name, _, _ := bytes.Cut(label, []byte{0})
+		if iface, ok := stack.Interfaces()[int32(ifa.Index)]; ok && string(name) != iface.Name {
+			return syserr.ErrNotSupported
+		}
+	}
+
+	err := stack.AddInterfaceAddr(withOrigin(ctx, s, msg), int32(ifa.Index), inet.InterfaceAddr{
+		Family:    ifa.Family,
+		PrefixLen: ifa.PrefixLen,
+		Flags:     ifa.Flags,
+		Addr:      addr,
+	})
+	if linuxerr.Equals(linuxerr.EEXIST, err) {
+		flags := msg.Header().Flags
+		if flags&linux.NLM_F_EXCL != 0 {
+			return syserr.ErrExists
+		}
+	} else if err != nil {
+		return syserr.ErrInvalidArgument
 	}
 	return nil
 }
