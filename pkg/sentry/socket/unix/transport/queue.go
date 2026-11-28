@@ -36,11 +36,15 @@ type queue struct {
 	readerWaiters *waiter.Queue
 	writerWaiters *waiter.Queue
 
-	mu       queueMutex `state:"nosave"`
-	closed   atomicbitops.Bool
-	unread   bool
-	used     int64
-	limit    int64
+	mu     queueMutex `state:"nosave"`
+	closed atomicbitops.Bool
+	unread bool
+	used   int64
+	limit  int64
+
+	// pooled is true if payloads come from the message buffer pools. Only
+	// stream queues are pooled.
+	pooled   bool
 	dataList messageList
 }
 
@@ -174,7 +178,12 @@ func (q *queue) Enqueue(ctx context.Context, data [][]byte, c ControlMessages, f
 
 	// Aggregate l bytes of data. This will truncate the data if l is less than
 	// the total bytes held in data.
-	v := make([]byte, l)
+	var v []byte
+	if q.pooled {
+		v = getMsgBuf(l)
+	} else {
+		v = make([]byte, l)
+	}
 	for i, b := 0, v; i < len(data) && len(b) > 0; i++ {
 		n := copy(b, data[i])
 		b = b[n:]

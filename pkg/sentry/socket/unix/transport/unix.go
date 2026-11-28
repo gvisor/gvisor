@@ -481,6 +481,8 @@ func (q *queueReceiver) Recv(ctx context.Context, data [][]byte, args RecvArgs) 
 	if err != nil {
 		return RecvOutput{}, false, err
 	}
+	// Datagram payloads are not pooled: a concurrent Peek may still be
+	// copying from m.Data after releasing the queue lock.
 	src := []byte(m.Data)
 	var copied int64
 	for i := 0; i < len(data) && len(src) > 0; i++ {
@@ -558,6 +560,24 @@ type streamQueueReceiver struct {
 	buffer  []byte
 	control ControlMessages
 	addr    Address
+
+	// backing is the pooled buffer that buffer slices, if any.
+	backing []byte `state:"nosave"`
+}
+
+// loadLocked makes m's payload the buffer, releasing the previous one.
+//
+// Preconditions: q.mu is locked and q.buffer is empty.
+func (q *streamQueueReceiver) loadLocked(m *message) {
+	if q.backing != nil {
+		putMsgBuf(q.backing)
+	}
+	q.backing = m.Data
+	// Clip the capacity so that a checkpoint does not save the pool's spare
+	// bytes.
+	q.buffer = m.Data[:len(m.Data):len(m.Data)]
+	q.control = m.Control
+	q.addr = m.Address
 }
 
 func vecCopy(data [][]byte, buf []byte) (int64, [][]byte, []byte) {
@@ -618,9 +638,7 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, args Recv
 			return RecvOutput{}, false, err
 		}
 		notify = n
-		q.buffer = []byte(m.Data)
-		q.control = m.Control
-		q.addr = m.Address
+		q.loadLocked(m)
 	}
 
 	var copied int64
@@ -676,9 +694,7 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, args Recv
 			break
 		}
 		notify = notify || n
-		q.buffer = []byte(m.Data)
-		q.control = m.Control
-		q.addr = m.Address
+		q.loadLocked(m)
 
 		if args.Creds {
 			if (q.control.Credentials == nil) != (c.Credentials == nil) {

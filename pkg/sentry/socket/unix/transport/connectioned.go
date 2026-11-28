@@ -157,9 +157,10 @@ func NewPair(ctx context.Context, stype linux.SockType, uid uniqueid.Provider) (
 	a := newConnectioned(ctx, stype, uid)
 	b := newConnectioned(ctx, stype, uid)
 
-	q1 := &queue{readerWaiters: a.WaitQueue, writerWaiters: b.WaitQueue, limit: defaultBufferSize}
+	pooled := stype == linux.SOCK_STREAM
+	q1 := &queue{readerWaiters: a.WaitQueue, writerWaiters: b.WaitQueue, limit: defaultBufferSize, pooled: pooled}
 	q1.InitRefs()
-	q2 := &queue{readerWaiters: b.WaitQueue, writerWaiters: a.WaitQueue, limit: defaultBufferSize}
+	q2 := &queue{readerWaiters: b.WaitQueue, writerWaiters: a.WaitQueue, limit: defaultBufferSize, pooled: pooled}
 	q2.InitRefs()
 
 	if stype == linux.SOCK_STREAM {
@@ -362,7 +363,8 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 	ne.SocketOptions().SetPassCred(e.SocketOptions().GetPassCred())
 	ne.peerCreds = e.peerCreds
 
-	readQueue := &queue{readerWaiters: ce.WaiterQueue(), writerWaiters: ne.WaitQueue, limit: defaultBufferSize}
+	pooled := e.stype == linux.SOCK_STREAM
+	readQueue := &queue{readerWaiters: ce.WaiterQueue(), writerWaiters: ne.WaitQueue, limit: defaultBufferSize, pooled: pooled}
 	readQueue.InitRefs()
 	ne.peer = &queueSender{
 		endpoint:   ce,
@@ -370,7 +372,7 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 	}
 
 	// Make sure the accepted endpoint inherits this listening socket's SO_SNDBUF.
-	writeQueue := &queue{readerWaiters: ne.WaitQueue, writerWaiters: ce.WaiterQueue(), limit: e.ops.GetSendBufferSize()}
+	writeQueue := &queue{readerWaiters: ne.WaitQueue, writerWaiters: ce.WaiterQueue(), limit: e.ops.GetSendBufferSize(), pooled: pooled}
 	writeQueue.InitRefs()
 	if e.stype == linux.SOCK_STREAM {
 		ne.receiver = &streamQueueReceiver{queueReceiver: queueReceiver{readQueue: writeQueue}}
