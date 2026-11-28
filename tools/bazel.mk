@@ -42,7 +42,7 @@
 ##
 ##   To opt out of these wrappers, set DOCKER_BUILD=false.
 ifneq ($(MAKECMDGOALS),)
-ifeq ($(filter-out help testlogs,$(MAKECMDGOALS)),)
+ifeq ($(filter-out help testlogs $(image_list_goals),$(MAKECMDGOALS)),)
 DOCKER_BUILD := false
 endif
 endif
