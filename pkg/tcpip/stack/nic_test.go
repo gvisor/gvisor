@@ -164,6 +164,52 @@ func (*testIPv6Protocol) Parse(*PacketBuffer) (tcpip.TransportProtocolNumber, bo
 	return 0, false, false
 }
 
+type checksumTestLinkEndpoint struct {
+	NetworkLinkEndpoint
+	caps LinkEndpointCapabilities
+}
+
+func (e *checksumTestLinkEndpoint) Capabilities() LinkEndpointCapabilities {
+	return e.caps
+}
+
+func TestRXChecksumValidated(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		caps LinkEndpointCapabilities
+		want [2]bool
+	}{
+		{"no offload", 0, [2]bool{false, false}},
+		{"global offload", CapabilityRXChecksumOffload, [2]bool{true, true}},
+		{"per packet offload", CapabilityRXChecksumOffloadPerPacket, [2]bool{false, true}},
+		{"global overrides per packet", CapabilityRXChecksumOffload | CapabilityRXChecksumOffloadPerPacket, [2]bool{true, true}},
+	} {
+		for i, validated := range []bool{false, true} {
+			name := "unvalidated"
+			if validated {
+				name = "validated"
+			}
+			t.Run(test.name+"/"+name, func(t *testing.T) {
+				n := nic{
+					NetworkLinkEndpoint: &checksumTestLinkEndpoint{caps: test.caps},
+					networkEndpoints: map[tcpip.NetworkProtocolNumber]NetworkEndpoint{
+						header.IPv6ProtocolNumber: &testIPv6Endpoint{},
+					},
+					stats:   makeNICStats(tcpip.NICStats{}.FillIn()),
+					enabled: atomicbitops.FromBool(true),
+				}
+				pkt := NewPacketBuffer(PacketBufferOptions{})
+				defer pkt.DecRef()
+				pkt.RXChecksumValidated = validated
+				n.DeliverNetworkPacket(header.IPv6ProtocolNumber, pkt)
+				if got, want := pkt.RXChecksumValidated, test.want[i]; got != want {
+					t.Errorf("RXChecksumValidated = %t, want %t", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestDisabledRxStatsWhenNICDisabled(t *testing.T) {
 	// When the NIC is disabled, the only field that matters is the stats field.
 	// This test is limited to stats counter checks.

@@ -185,6 +185,61 @@ func TestFragmentationProcess(t *testing.T) {
 	}
 }
 
+func TestReassembledChecksumValidated(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		firstTrusted bool
+		lastTrusted  bool
+		wantTrusted  bool
+	}{
+		{"neither trusted", false, false, false},
+		{"first only", true, false, false},
+		{"last only", false, true, false},
+		{"both trusted", true, true, true},
+	} {
+		for _, order := range []struct {
+			name    string
+			reverse bool
+		}{
+			{"in order", false},
+			{"reverse order", true},
+		} {
+			t.Run(test.name+"/"+order.name, func(t *testing.T) {
+				f := NewFragmentation(minBlockSize, 2048, 512, reassembleTimeout, &faketime.NullClock{}, nil)
+				defer f.Release()
+				first := pkt(2, "01")
+				defer first.DecRef()
+				first.RXChecksumValidated = test.firstTrusted
+				last := pkt(2, "23")
+				defer last.DecRef()
+				last.RXChecksumValidated = test.lastTrusted
+				fragments := []processInput{
+					{first: 0, last: 1, more: true, pkt: first},
+					{first: 2, last: 3, more: false, pkt: last},
+				}
+				if order.reverse {
+					fragments[0], fragments[1] = fragments[1], fragments[0]
+				}
+				var result *stack.PacketBuffer
+				for _, fragment := range fragments {
+					var err error
+					result, _, _, err = f.Process(FragmentID{}, fragment.first, fragment.last, fragment.more, 0, fragment.pkt)
+					if err != nil {
+						t.Fatalf("Process: %s", err)
+					}
+				}
+				if result == nil {
+					t.Fatal("packet was not reassembled")
+				}
+				defer result.DecRef()
+				if got, want := result.RXChecksumValidated, test.wantTrusted; got != want {
+					t.Errorf("RXChecksumValidated = %t, want %t", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestReassemblingTimeout(t *testing.T) {
 	const (
 		reassemblyTimeout = time.Millisecond

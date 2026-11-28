@@ -703,6 +703,8 @@ func (d PacketData) MergeBuffer(b *buffer.Buffer) {
 // MergeFragment appends the data portion of frag to dst. It modifies
 // frag and frag should not be used again.
 func MergeFragment(dst, frag *PacketBuffer) {
+	// Checksum verification may be skipped only if it is safe for both fragments.
+	dst.RXChecksumValidated = dst.RXChecksumValidated && frag.RXChecksumValidated
 	frag.buf.TrimFront(int64(frag.dataOffset()))
 	dst.buf.Merge(&frag.buf)
 }

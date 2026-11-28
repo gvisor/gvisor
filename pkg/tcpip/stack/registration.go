@@ -1192,6 +1192,10 @@ const (
 	CapabilityResolutionRequired
 	CapabilitySaveRestore
 	CapabilityLoopback
+	// CapabilityRXChecksumOffloadPerPacket indicates that the link endpoint
+	// sets PacketBuffer.RXChecksumValidated for each received packet.
+	// CapabilityRXChecksumOffload takes precedence when both are set.
+	CapabilityRXChecksumOffloadPerPacket
 )
 
 // LinkWriter is an interface that supports sending packets via a data-link

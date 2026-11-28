@@ -136,6 +136,8 @@ func TestLoopbackAcceptAllInSubnetUDP(t *testing.T) {
 		bindAddr   tcpip.Address
 		dstAddr    tcpip.Address
 		expectRx   bool
+		mtu        uint32
+		payload    []byte
 	}{
 		{
 			name:       "IPv4 bind to wildcard and send to assigned address",
@@ -190,6 +192,18 @@ func TestLoopbackAcceptAllInSubnetUDP(t *testing.T) {
 			dstAddr:    otherIPv6Address,
 			expectRx:   false,
 		},
+		{
+			name: "IPv6 fragmented checksum-offloaded loopback",
+			addAddress: tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: header.IPv6Loopback.WithPrefix(),
+			},
+			bindAddr: header.IPv6Loopback,
+			dstAddr:  header.IPv6Loopback,
+			expectRx: true,
+			mtu:      header.IPv6MinimumMTU,
+			payload:  bytes.Repeat(data, 1024),
+		},
 	}
 
 	for _, test := range tests {
@@ -199,7 +213,15 @@ func TestLoopbackAcceptAllInSubnetUDP(t *testing.T) {
 				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 			})
 			defer s.Destroy()
-			if err := s.CreateNIC(nicID, loopback.New()); err != nil {
+			link := loopback.New()
+			if test.mtu != 0 {
+				link.SetMTU(test.mtu)
+			}
+			data := data
+			if test.payload != nil {
+				data = test.payload
+			}
+			if err := s.CreateNIC(nicID, link); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
 			}
 			if err := s.AddProtocolAddress(nicID, test.addAddress, stack.AddressProperties{}); err != nil {
@@ -248,6 +270,9 @@ func TestLoopbackAcceptAllInSubnetUDP(t *testing.T) {
 			}
 			if want := int64(len(data)); n != want {
 				t.Fatalf("got sep.Write(_, _) = (%d, nil), want = (%d, nil)", n, want)
+			}
+			if test.mtu != 0 && s.Stats().IP.PacketsSent.Value() < 2 {
+				t.Fatal("expected multiple fragments")
 			}
 
 			var buf bytes.Buffer

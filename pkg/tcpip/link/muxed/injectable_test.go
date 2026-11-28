@@ -30,7 +30,7 @@ import (
 )
 
 func TestInjectableEndpointMTU(t *testing.T) {
-	endpoint, _, _ := makeTestInjectableEndpoint(t)
+	endpoint, _, _ := makeTestInjectableEndpoint(t, stack.CapabilityNone)
 
 	mtus := []uint32{100, 200}
 	for _, mtu := range mtus {
@@ -43,7 +43,7 @@ func TestInjectableEndpointMTU(t *testing.T) {
 }
 
 func TestInjectableEndpointRawDispatch(t *testing.T) {
-	endpoint, sock, dstIP := makeTestInjectableEndpoint(t)
+	endpoint, sock, dstIP := makeTestInjectableEndpoint(t, stack.CapabilityNone)
 
 	v := buffer.NewViewWithData([]byte{0xFA})
 	defer v.Release()
@@ -60,7 +60,7 @@ func TestInjectableEndpointRawDispatch(t *testing.T) {
 }
 
 func TestInjectableEndpointDispatch(t *testing.T) {
-	endpoint, sock, dstIP := makeTestInjectableEndpoint(t)
+	endpoint, sock, dstIP := makeTestInjectableEndpoint(t, stack.CapabilityRXChecksumOffloadPerPacket)
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: 1,
@@ -85,10 +85,41 @@ func TestInjectableEndpointDispatch(t *testing.T) {
 	if got, want := buf[:bytesRead], []byte{0xFA, 0xFB}; !bytes.Equal(got, want) {
 		t.Fatalf("Read %v from the socketpair, wanted %v", got, want)
 	}
+
+	// Mixed children may use only their common receive-checksum capabilities.
+	for _, test := range []struct {
+		name string
+		caps stack.LinkEndpointCapabilities
+		want [2]bool
+	}{
+		{"no offload", 0, [2]bool{false, false}},
+		{"global offload", stack.CapabilityRXChecksumOffload, [2]bool{false, false}},
+		{"per packet", stack.CapabilityRXChecksumOffloadPerPacket, [2]bool{false, true}},
+		{"both", stack.CapabilityRXChecksumOffload | stack.CapabilityRXChecksumOffloadPerPacket, [2]bool{false, true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			other, _, otherIP := makeTestInjectableEndpoint(t, test.caps)
+			endpoint.routes[tcpip.AddrFrom4([4]byte{1, 2, 3, 5})] = other.routes[otherIP]
+			s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}})
+			defer s.Destroy()
+			if err := s.CreateNIC(1, endpoint); err != nil {
+				t.Fatal(err)
+			}
+			for _, child := range endpoint.routes {
+				for i, validated := range []bool{false, true} {
+					pkt.RXChecksumValidated = validated
+					child.InjectInbound(ipv4.ProtocolNumber, pkt)
+					if got, want := pkt.RXChecksumValidated, test.want[i]; got != want {
+						t.Errorf("RXChecksumValidated = %t, want %t", got, want)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestInjectableEndpointDispatchHdrOnly(t *testing.T) {
-	endpoint, sock, dstIP := makeTestInjectableEndpoint(t)
+	endpoint, sock, dstIP := makeTestInjectableEndpoint(t, stack.CapabilityNone)
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: 1,
@@ -113,20 +144,25 @@ func TestInjectableEndpointDispatchHdrOnly(t *testing.T) {
 	}
 }
 
-func makeTestInjectableEndpoint(t *testing.T) (*InjectableEndpoint, *os.File, tcpip.Address) {
+func makeTestInjectableEndpoint(t *testing.T, caps stack.LinkEndpointCapabilities) (*InjectableEndpoint, *os.File, tcpip.Address) {
 	dstIP := tcpip.AddrFromSlice(net.ParseIP("1.2.3.4").To4())
 	pair, err := unix.Socketpair(unix.AF_UNIX,
 		unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {
 		t.Fatal("Failed to create socket pair:", err)
 	}
-	underlyingEndpoint, err := fdbased.NewInjectable(pair[1], 6500, stack.CapabilityNone)
+	underlyingEndpoint, err := fdbased.NewInjectable(pair[1], 6500, caps)
 	if err != nil {
-		t.Fatalf("fdbased.NewInjectable(%d, 6500, stack.CapabilityNone) failed: %s", pair[1], err)
+		t.Fatalf("fdbased.NewInjectable(%d, 6500, %v) failed: %s", pair[1], caps, err)
 	}
 	routes := map[tcpip.Address]stack.InjectableLinkEndpoint{dstIP: underlyingEndpoint}
 	endpoint := NewInjectableEndpoint(routes)
-	return endpoint, os.NewFile(uintptr(pair[0]), "test route end"), dstIP
+	sock := os.NewFile(uintptr(pair[0]), "test route end")
+	t.Cleanup(func() {
+		sock.Close()
+		unix.Close(pair[1])
+	})
+	return endpoint, sock, dstIP
 }
 
 func TestMain(m *testing.M) {
