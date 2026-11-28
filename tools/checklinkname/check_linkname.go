@@ -439,8 +439,8 @@ func simplifyType(t types.Type, maxDepth int) (string, int) {
 func makeStructSignature(str *types.Struct, maxDepth int) (string, int) {
 	parts := make([]string, 0, str.NumFields())
 	minDepth := maxDepth
-	for i := 0; i < len(parts); i++ {
-		s, localMinDepth := simplifyType(str.Field(i).Type(), maxDepth)
+	for field := range str.Fields() {
+		s, localMinDepth := simplifyType(field.Type(), maxDepth)
 		parts = append(parts, s)
 		minDepth = min(localMinDepth, minDepth)
 	}
@@ -451,8 +451,11 @@ func makeStructSignature(str *types.Struct, maxDepth int) (string, int) {
 func makeInterfaceSignature(iface *types.Interface, maxDepth int) (string, int) {
 	parts := make([]string, 0, iface.NumMethods())
 	minDepth := maxDepth
-	for i := 0; i < len(parts); i++ {
-		s, localMinDepth := makeSignature(iface.Method(i).Type().(*types.Signature), maxDepth)
+	for method := range iface.Methods() {
+		// Omit the implicit receiver, which refers to this interface.
+		sig := method.Type().(*types.Signature)
+		sig = types.NewSignatureType(nil, nil, nil, sig.Params(), sig.Results(), sig.Variadic())
+		s, localMinDepth := makeSignature(sig, maxDepth)
 		parts = append(parts, s)
 		minDepth = min(localMinDepth, minDepth)
 	}
