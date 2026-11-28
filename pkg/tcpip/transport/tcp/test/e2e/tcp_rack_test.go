@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -1250,6 +1252,371 @@ func TestRACKWithWindowFull(t *testing.T) {
 
 	// No packet should be received as the receive window size is zero.
 	c.CheckNoPacket("unexpected packet received after userTimeout has expired")
+}
+
+// sackTest is a connection with SACK, timestamps and RACK on a manual clock.
+// The test plays the peer: it reads what the endpoint sends and acknowledges
+// it by hand.
+type sackTest struct {
+	t     *testing.T
+	c     *context.Context
+	clock *faketime.ManualClock
+	peer  *context.RawEndpoint
+	// echo is the timestamp of the last segment the endpoint sent.
+	echo uint32
+
+	mu sync.Mutex
+	// sackedOut is the endpoint's count of selectively acknowledged
+	// packets after the last segment it received.
+	sackedOut int
+}
+
+// newSACKTest returns a connection whose endpoint has numSegments segments
+// of maxPayload bytes to send. With gso, the endpoint sends several segments
+// in one packet.
+func newSACKTest(t *testing.T, numSegments int, gso bool) *sackTest {
+	t.Helper()
+	st := &sackTest{t: t, clock: faketime.NewManualClock()}
+	probe := func(state *tcp.TCPEndpointState) {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		st.sackedOut = state.Sender.SackedOut
+	}
+	st.c = context.NewWithOpts(t, context.Options{MTU: uint32(mtu), EnableV4: true, Clock: st.clock, Probe: probe})
+	t.Cleanup(st.c.Cleanup)
+	st.c.SetGSOEnabled(gso)
+	e2e.SetStackSACKPermitted(t, st.c, true)
+	e2e.SetStackTCPRecovery(t, st.c, int(tcpip.TCPRACKLossDetection))
+	st.peer = e2e.CreateConnectedWithSACKAndTS(st.c)
+	st.peer.Flags = header.TCPFlagAck
+
+	data := make([]byte, numSegments*maxPayload)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if n, err := st.c.EP.Write(bytes.NewReader(data), tcpip.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(data))
+	}
+	return st
+}
+
+// sent returns the numbers of the segments transmitted since the last call.
+func (st *sackTest) sent() []int {
+	st.t.Helper()
+	st.c.Stack().Pause()
+	st.c.Stack().Resume()
+	var segs []int
+	for {
+		v := st.c.GetPacketNonBlocking()
+		if v == nil {
+			return segs
+		}
+		h := header.TCP(header.IPv4(v.AsSlice()).Payload())
+		offset := int(h.SequenceNumber() - uint32(st.c.IRS) - 1)
+		size := len(h.Payload())
+		opts := h.ParsedOptions()
+		if !opts.TS || size == 0 || size%maxPayload != 0 || offset%maxPayload != 0 {
+			st.t.Fatalf("segment at %d: TS = %t, size = %d", offset, opts.TS, size)
+		}
+		st.echo = opts.TSVal
+		for seg := offset / maxPayload; seg < (offset+size)/maxPayload; seg++ {
+			segs = append(segs, seg)
+		}
+		v.Release()
+	}
+}
+
+// ack acknowledges every segment below cumulative, and selectively the byte
+// ranges in sacked, given as offsets in the data. It returns the numbers of
+// the segments sent in response.
+func (st *sackTest) ack(cumulative int, sacked ...[2]int) []int {
+	st.t.Helper()
+	st.clock.Advance(100 * time.Microsecond)
+	st.peer.TSVal++
+	opts := make([]byte, maxTCPOptionSize)
+	n := header.EncodeTSOption(st.peer.TSVal, st.echo, opts)
+	n += header.EncodeNOP(opts[n:])
+	n += header.EncodeNOP(opts[n:])
+	if len(sacked) != 0 {
+		var blocks []header.SACKBlock
+		for _, r := range sacked {
+			blocks = append(blocks, header.SACKBlock{
+				Start: st.c.IRS.Add(1 + seqnum.Size(r[0])),
+				End:   st.c.IRS.Add(1 + seqnum.Size(r[1])),
+			})
+		}
+		n += header.EncodeNOP(opts[n:])
+		n += header.EncodeNOP(opts[n:])
+		n += header.EncodeSACKBlocks(blocks, opts[n:])
+	}
+	st.peer.AckNum = st.c.IRS.Add(1 + seqnum.Size(cumulative*maxPayload))
+	st.peer.SendPacket(nil, opts[:n])
+	return st.sent()
+}
+
+// TestRACKHonorsSACKBeyondScoreboard checks that RACK does not retransmit
+// segments that were selectively acknowledged after the SACK scoreboard ran
+// out of room to record them.
+func TestRACKHonorsSACKBeyondScoreboard(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// ackEvery is how many segments arrive for each ACK that reaches
+		// the endpoint.
+		ackEvery int
+		gso      bool
+	}{
+		{name: "every ACK arrives", ackEvery: 1},
+		{name: "every second ACK is lost", ackEvery: 2},
+		{name: "segmentation offload", ackEvery: 1, gso: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// holes is the number of lost segments, each followed by one
+			// that arrives: more SACK blocks than the scoreboard holds.
+			const holes = 130
+			st := newSACKTest(t, 1200, test.gso)
+
+			// Slow start, until one flight has room for all the holes.
+			first := 0
+			flight := st.sent()
+			for len(flight) < 2*holes {
+				if len(flight) == 0 {
+					t.Fatalf("nothing sent after the ACK of %d segments", first)
+				}
+				first += len(flight)
+				flight = st.ack(first)
+			}
+			for i, seg := range flight {
+				if seg != first+i {
+					t.Fatalf("flight %v, want consecutive segments from %d", flight, first)
+				}
+			}
+
+			// Every second segment of the flight is lost. The receiver
+			// acknowledges each one that arrives as a receiver does: its
+			// own block first, then the two before it.
+			arrived := make(map[int]bool)
+			var resent []int
+			for i := 0; i < holes; i++ {
+				seg := first + 2*i + 1
+				arrived[seg] = true
+				if (i+1)%test.ackEvery != 0 && i != holes-1 {
+					continue
+				}
+				blocks := [][2]int{{seg * maxPayload, (seg + 1) * maxPayload}}
+				for prev := seg - 2; prev > first && len(blocks) < 3; prev -= 2 {
+					blocks = append(blocks, [2]int{prev * maxPayload, (prev + 1) * maxPayload})
+				}
+				resent = append(resent, st.ack(first, blocks...)...)
+			}
+
+			repaired := make(map[int]bool)
+			spurious := 0
+			for _, seg := range resent {
+				switch {
+				case arrived[seg]:
+					spurious++
+				case seg < first+len(flight):
+					repaired[seg] = true
+				}
+			}
+			if spurious != 0 {
+				t.Errorf("%d retransmissions of segments that had been selectively acknowledged, want 0", spurious)
+			}
+			if len(repaired) != holes {
+				t.Errorf("%d lost segments retransmitted, want %d; sent %v", len(repaired), holes, resent)
+			}
+			if got := st.c.Stack().Stats().TCP.Timeouts.Value(); got != 0 {
+				t.Errorf("%d retransmission timeouts, want 0", got)
+			}
+		})
+	}
+}
+
+// TestRACKRetransmitsPartlySACKedSegment checks that RACK still retransmits a
+// segment of which only the first part was selectively acknowledged.
+func TestRACKRetransmitsPartlySACKedSegment(t *testing.T) {
+	st := newSACKTest(t, 20, false /* gso */)
+	if flight := st.sent(); len(flight) < 7 {
+		t.Fatalf("flight %v, want at least 7 segments", flight)
+	}
+
+	// Segment 1 is lost, and so is the second half of segment 2. The
+	// segments after it arrive one by one.
+	half := [2]int{2 * maxPayload, 2*maxPayload + maxPayload/2}
+	resent := st.ack(1, half)
+	for seg := 3; seg <= 6; seg++ {
+		resent = append(resent, st.ack(1, [2]int{3 * maxPayload, (seg + 1) * maxPayload}, half)...)
+	}
+
+	if !slices.Contains(resent, 2) {
+		t.Errorf("sent %v, want a retransmission of segment 2", resent)
+	}
+	if got := st.c.Stack().Stats().TCP.Timeouts.Value(); got != 0 {
+		t.Errorf("%d retransmission timeouts, want 0", got)
+	}
+}
+
+// TestRACKIgnoresInvalidSACKBlock checks that RACK repairs a lost segment that
+// an invalid SACK block claims was delivered.
+func TestRACKIgnoresInvalidSACKBlock(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cumulative int
+		invalid    [2]int
+	}{
+		{
+			// Segment 1 is lost too, so that the block starts after
+			// the cumulative acknowledgement.
+			name:       "block ends after the data sent",
+			cumulative: 1,
+			invalid:    [2]int{2 * maxPayload, 11 * maxPayload},
+		},
+		{
+			name:       "block starts at the cumulative acknowledgement",
+			cumulative: 2,
+			invalid:    [2]int{2 * maxPayload, 3 * maxPayload},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st := newSACKTest(t, 20, false /* gso */)
+			if flight := st.sent(); len(flight) != 10 {
+				t.Fatalf("flight %v, want 10 segments", flight)
+			}
+
+			// Segment 2 is lost, segments 3 to 9 arrive.
+			resent := st.ack(test.cumulative, test.invalid)
+			resent = append(resent, st.ack(test.cumulative, [2]int{3 * maxPayload, 10 * maxPayload})...)
+			// Let the reorder timer expire, but not the retransmission
+			// timer.
+			st.clock.Advance(5 * time.Millisecond)
+			resent = append(resent, st.sent()...)
+
+			if !slices.Contains(resent, 2) {
+				t.Errorf("sent %v, want a retransmission of segment 2", resent)
+			}
+			if got := st.c.Stack().Stats().TCP.Timeouts.Value(); got != 0 {
+				t.Errorf("%d retransmission timeouts, want 0", got)
+			}
+		})
+	}
+}
+
+// TestRACKDetectsLossFromPartlySACKedOffloadedSegment checks that RACK uses
+// the delivery of some of the packets of a segment sent as one offloaded
+// packet to detect the loss of a segment sent before them.
+func TestRACKDetectsLossFromPartlySACKedOffloadedSegment(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// Segments below cumulative arrive, and so do the segments in
+		// sacked. lost is the first segment that does not.
+		cumulative int
+		sacked     [2]int
+		lost       int
+	}{
+		{
+			// The first packet holds segments 5 to 9, the second
+			// segments 10 to 19.
+			name:       "block covers the start of a packet",
+			cumulative: 9,
+			sacked:     [2]int{10, 15},
+			lost:       9,
+		},
+		{
+			name:       "block starts inside a packet",
+			cumulative: 5,
+			sacked:     [2]int{6, 10},
+			lost:       5,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st := newSACKTest(t, 40, true /* gso */)
+			if flight := st.sent(); len(flight) != 10 {
+				t.Fatalf("flight %v, want 10 segments", flight)
+			}
+			if flight := st.ack(5); len(flight) != 10 {
+				t.Fatalf("flight %v after the ACK of 5 segments, want 10 segments", flight)
+			}
+
+			resent := st.ack(test.cumulative, [2]int{test.sacked[0] * maxPayload, test.sacked[1] * maxPayload})
+			// Let the reorder timer expire, but not the retransmission
+			// timer.
+			st.clock.Advance(5 * time.Millisecond)
+			resent = append(resent, st.sent()...)
+
+			if !slices.Contains(resent, test.lost) {
+				t.Errorf("sent %v, want a retransmission of segment %d", resent, test.lost)
+			}
+			for _, seg := range resent {
+				if seg >= test.sacked[0] && seg < test.sacked[1] {
+					t.Errorf("sent %v, want no retransmission of segments %d to %d", resent, test.sacked[0], test.sacked[1]-1)
+					break
+				}
+			}
+			if got := st.c.Stack().Stats().TCP.Timeouts.Value(); got != 0 {
+				t.Errorf("%d retransmission timeouts, want 0", got)
+			}
+		})
+	}
+}
+
+// TestRACKRepairsRenegedSegmentAfterTimeout checks that after a retransmission
+// timeout, RACK repairs a segment that was selectively acknowledged before it,
+// since the receiver may have discarded the segment.
+func TestRACKRepairsRenegedSegmentAfterTimeout(t *testing.T) {
+	st := newSACKTest(t, 4, false /* gso */)
+	if flight := st.sent(); len(flight) != 4 {
+		t.Fatalf("flight %v, want 4 segments", flight)
+	}
+
+	// Only segment 1 arrives. Everything sent after it is lost, until the
+	// retransmission timer expires.
+	st.ack(0, [2]int{1 * maxPayload, 2 * maxPayload})
+	for st.c.Stack().Stats().TCP.Timeouts.Value() == 0 {
+		st.clock.Advance(10 * time.Millisecond)
+		st.sent()
+	}
+
+	// The receiver has discarded segment 1. The retransmission of segment 0
+	// arrives.
+	resent := st.ack(1)
+	st.clock.Advance(5 * time.Millisecond)
+	resent = append(resent, st.sent()...)
+
+	if !slices.Contains(resent, 1) {
+		t.Errorf("sent %v, want a retransmission of segment 1", resent)
+	}
+	if got := st.c.Stack().Stats().TCP.Timeouts.Value(); got != 1 {
+		t.Errorf("%d retransmission timeouts, want 1", got)
+	}
+}
+
+// TestRACKForgetsSACKedCountOnTimeout checks that a retransmission timeout
+// resets the count of selectively acknowledged packets with the SACK
+// information it expunges.
+func TestRACKForgetsSACKedCountOnTimeout(t *testing.T) {
+	st := newSACKTest(t, 10, false /* gso */)
+	if flight := st.sent(); len(flight) != 10 {
+		t.Fatalf("flight %v, want 10 segments", flight)
+	}
+
+	// Segments 0 to 4 are lost. RACK starts a recovery after segment 5
+	// arrives, during which segments 6 and 7 arrive.
+	st.ack(0, [2]int{5 * maxPayload, 6 * maxPayload})
+	st.clock.Advance(5 * time.Millisecond)
+	st.sent()
+	st.ack(0, [2]int{5 * maxPayload, 8 * maxPayload})
+	for st.c.Stack().Stats().TCP.Timeouts.Value() == 0 {
+		st.clock.Advance(10 * time.Millisecond)
+		st.sent()
+	}
+
+	// After the timeout, all the data arrives.
+	st.ack(10)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.sackedOut != 0 {
+		t.Errorf("SackedOut = %d after the ACK of all data, want 0", st.sackedOut)
+	}
 }
 
 func TestMain(m *testing.M) {

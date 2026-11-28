@@ -398,6 +398,17 @@ func (rc *rackControl) exitRecovery() {
 	rc.exitedRecovery = true
 }
 
+// sacked reports whether seg has been selectively acknowledged.
+//
+// The scoreboard alone cannot tell: it holds a limited number of blocks, and
+// does not record a block that arrives when it is full. The segment itself
+// records that a block covered it.
+//
+// +checklocks:rc.snd.ep.mu
+func (rc *rackControl) sacked(seg *segment) bool {
+	return seg.acked || rc.snd.ep.scoreboard.IsSACKED(seg.sackBlock())
+}
+
 // detectLoss marks the segment as lost if the reordering window has elapsed
 // and the ACK is not received. It will also arm the reorder timer.
 // See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2 Step 5.
@@ -408,7 +419,7 @@ func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
 	numLost := 0
 	clockResolution := rc.snd.ep.stack.ClockResolution()
 	for seg := rc.snd.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
-		if rc.snd.ep.scoreboard.IsSACKED(seg.sackBlock()) {
+		if rc.sacked(seg) {
 			continue
 		}
 
@@ -516,7 +527,7 @@ func (rc *rackControl) recover(retransmitHead bool) {
 		}
 
 		// Reset seg.lost as it is already SACKed.
-		if snd.ep.scoreboard.IsSACKED(seg.sackBlock()) {
+		if rc.sacked(seg) {
 			seg.lost = false
 			continue
 		}
