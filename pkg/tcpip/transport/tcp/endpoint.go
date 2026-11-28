@@ -2646,7 +2646,14 @@ func (e *Endpoint) connect(addr tcpip.FullAddress, handshake bool) tcpip.Error {
 			}
 		}
 		e.segmentQueue.mu.Unlock()
+		// initGSO sets the GSO options for the new route without an MSS,
+		// and updateMaxPayloadSize changes the MSS only when it shrinks.
+		// Set the restored sender's GSO state and MSS from the new route.
+		e.snd.gso = e.gso.Type != stack.GSONone
 		e.snd.updateMaxPayloadSize(int(e.route.MTU()), 0)
+		if e.snd.gso {
+			e.gso.MSS = uint16(e.snd.MaxPayloadSize)
+		}
 		e.setEndpointState(StateEstablished)
 		// Set the new auto tuned send buffer size after entering
 		// established state.
@@ -3401,6 +3408,7 @@ func (e *Endpoint) initHostGSO() {
 }
 
 func (e *Endpoint) initGSO() {
+	e.gso = stack.GSO{}
 	if e.route.HasHostGSOCapability() {
 		e.initHostGSO()
 	} else if e.route.HasGVisorGSOCapability() {
