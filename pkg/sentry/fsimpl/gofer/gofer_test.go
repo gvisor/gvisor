@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -33,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -250,6 +252,8 @@ func (s *recycledInoConnImpl) SupportedMessages() []lisafs.MID {
 		lisafs.Walk,
 		lisafs.WalkStat,
 		lisafs.OpenAt,
+		lisafs.BindAt,
+		lisafs.UnlinkAt,
 		lisafs.Close,
 		lisafs.Flush,
 	}
@@ -273,13 +277,7 @@ func (fd *recycledInoControlFD) Stat() (lisafs.Statx, error) {
 	return fd.stat, nil
 }
 
-// +checklocksread:fd.ControlFD.conn.server.renameMu
-// +checklocksexclude:fd.ControlFD.conn.fdsMu
-func (fd *recycledInoControlFD) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, error) {
-	if !fd.isRoot || (name != "target" && name != "target_link") {
-		return nil, lisafs.Statx{}, unix.ENOENT
-	}
-	st := fd.connImpl.getTargetStat()
+func (fd *recycledInoControlFD) newChildFD(name string, st lisafs.Statx) *recycledInoControlFD {
 	var childNode *lisafs.Node
 	fd.Node().WithChildrenMu(func() {
 		childNode = fd.Node().LookupChildLocked(name)
@@ -294,7 +292,20 @@ func (fd *recycledInoControlFD) Walk(name string) (*lisafs.ControlFD, lisafs.Sta
 	// Conn returns fd.ControlFD.conn, whose server rename lock is required
 	// on entry; checklocks does not retain that identity across the getter.
 	child.Init(fd.Conn(), childNode, linux.FileMode(st.Mode), child) // +checklocksignore
-	return child.FD(), st, nil
+	return child
+}
+
+// +checklocksread:fd.ControlFD.conn.server.renameMu
+// +checklocksexclude:fd.ControlFD.conn.fdsMu
+func (fd *recycledInoControlFD) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, error) {
+	if !fd.isRoot || (name != "target" && name != "target_link") {
+		return nil, lisafs.Statx{}, unix.ENOENT
+	}
+	st := fd.connImpl.getTargetStat()
+	if st.Mask == 0 {
+		return nil, lisafs.Statx{}, unix.ENOENT
+	}
+	return fd.newChildFD(name, st).FD(), st, nil
 }
 
 func (fd *recycledInoControlFD) WalkStat(path lisafs.StringArray, recordStat func(lisafs.Statx)) error {
@@ -309,9 +320,11 @@ func (fd *recycledInoControlFD) WalkStat(path lisafs.StringArray, recordStat fun
 			continue
 		}
 		if curIsRoot && (comp == "target" || comp == "target_link") {
-			recordStat(fd.connImpl.getTargetStat())
-			curIsRoot = false
-			continue
+			if st := fd.connImpl.getTargetStat(); st.Mask != 0 {
+				recordStat(st)
+				curIsRoot = false
+				continue
+			}
 		}
 		break
 	}
@@ -322,6 +335,51 @@ func (fd *recycledInoControlFD) Open(flags uint32) (*lisafs.OpenFD, int, error) 
 	ofd := &recycledInoOpenFD{stat: fd.stat}
 	ofd.Init(fd.FD(), flags, ofd)
 	return &ofd.OpenFD, -1, nil
+}
+
+type recycledInoBoundSocketFD struct {
+	lisafs.BoundSocketFD
+	lisafs.BoundSocketFDImpl
+}
+
+func (s *recycledInoBoundSocketFD) FD() *lisafs.BoundSocketFD {
+	return &s.BoundSocketFD
+}
+
+func (s *recycledInoBoundSocketFD) Close() {
+}
+
+func (fd *recycledInoControlFD) BindAt(name string, sockType uint32, mode linux.FileMode, uid lisafs.UID, gid lisafs.GID) (*lisafs.ControlFD, lisafs.Statx, *lisafs.BoundSocketFD, int, error) {
+	if !fd.isRoot || name != "target" {
+		return nil, lisafs.Statx{}, nil, -1, unix.EPERM
+	}
+	if fd.connImpl.getTargetStat().Mask != 0 {
+		return nil, lisafs.Statx{}, nil, -1, unix.EADDRINUSE
+	}
+	sockFD, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0 /* protocol */)
+	if err != nil {
+		return nil, lisafs.Statx{}, nil, -1, err
+	}
+	st := lisafs.Statx{
+		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO,
+		Mode:     linux.S_IFSOCK | (uint16(mode) &^ linux.S_IFMT),
+		DevMajor: 0,
+		DevMinor: 1,
+		Ino:      42,
+	}
+	fd.connImpl.setTargetStat(st)
+	child := fd.newChildFD(name, st)
+	bsFD := &recycledInoBoundSocketFD{}
+	bsFD.Init(child.FD(), bsFD)
+	return child.FD(), st, bsFD.FD(), sockFD, nil
+}
+
+func (fd *recycledInoControlFD) Unlink(name string, flags uint32) error {
+	if !fd.isRoot || name != "target" {
+		return unix.ENOENT
+	}
+	fd.connImpl.setTargetStat(lisafs.Statx{})
+	return nil
 }
 
 type recycledInoOpenFD struct {
@@ -399,6 +457,7 @@ func mountTestLisafsFSWithOpts(t *testing.T, targetStat lisafs.Statx, extraOpts 
 		t.Fatalf("NewMountNamespace: %v", err)
 	}
 	t.Cleanup(func() { mntns.DecRef(ctx) })
+	ctx = vfs.WithMountNamespace(ctx, mntns)
 
 	root := mntns.Root(ctx)
 	t.Cleanup(func() { root.DecRef(ctx) })
@@ -796,6 +855,170 @@ func TestValidateRestoredFileType(t *testing.T) {
 				t.Errorf("validateRestoredFileType(%#o, %d, %d) = %v, want vfs.ErrCorruption", test.restoredMode, test.restoredRdev[0], test.restoredRdev[1], err)
 			}
 		})
+	}
+}
+
+type testHostBoundEndpoint struct {
+	transport.Endpoint
+	transport.BoundEndpoint
+}
+
+func (*testHostBoundEndpoint) Type() linux.SockType               { return linux.SOCK_STREAM }
+func (*testHostBoundEndpoint) Passcred() bool                     { return false }
+func (*testHostBoundEndpoint) Release(context.Context)            {}
+func (*testHostBoundEndpoint) ResetBoundSocketFD(context.Context) {}
+func (*testHostBoundEndpoint) SetBoundSocketFD(ctx context.Context, bsFD transport.BoundSocketFD) error {
+	bsFD.Close(ctx)
+	return nil
+}
+
+func TestInodeCacheIsolationOnCreate(t *testing.T) {
+	sockStat := lisafs.Statx{
+		Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_INO,
+		Mode: linux.S_IFSOCK | 0777,
+		Ino:  42,
+	}
+	regStat := sockStat
+	regStat.Mode = linux.S_IFREG | 0666
+	regStat.Mask |= linux.STATX_SIZE
+
+	ep1 := &testHostBoundEndpoint{}
+	ep2 := &testHostBoundEndpoint{}
+	for _, tc := range []struct {
+		name       string
+		create     func(context.Context, *filesystem) (*dentry, error)
+		wantShared bool
+		wantEP     transport.BoundEndpoint
+		wantErr    bool
+	}{
+		{
+			name: "shared_lookup",
+			create: func(ctx context.Context, fs *filesystem) (*dentry, error) {
+				return fs.newLisafsDentry(ctx, &lisafs.Inode{ControlFD: 2, Stat: sockStat})
+			},
+			wantShared: true,
+			wantEP:     ep1,
+		},
+		{
+			name: "new_bound_socket",
+			create: func(ctx context.Context, fs *filesystem) (*dentry, error) {
+				return fs.newLisafsDentryForBoundSocket(ctx, &lisafs.Inode{ControlFD: 2, Stat: sockStat}, ep2)
+			},
+			wantEP: ep2,
+		},
+		{
+			name: "new_regular_file",
+			create: func(ctx context.Context, fs *filesystem) (*dentry, error) {
+				return fs.newLisafsDentryForNewFile(ctx, &lisafs.Inode{ControlFD: 2, Stat: regStat})
+			},
+		},
+		{
+			name: "non_socket_bind",
+			create: func(ctx context.Context, fs *filesystem) (*dentry, error) {
+				return fs.newLisafsDentryForBoundSocket(ctx, &lisafs.Inode{ControlFD: 2, Stat: regStat}, ep2)
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			fs := filesystem{
+				mf:                pgalloc.MemoryFileFromContext(ctx),
+				inoByKey:          make(map[inoKey]uint64),
+				inodeByKey:        make(map[inoKey]*inode),
+				clock:             ktime.RealtimeClockFromContext(ctx),
+				devMinorByHostDev: map[uint64]uint32{0: 1},
+				dentryCache:       &dentryCache{maxCachedDentries: 0},
+				client:            &lisafs.Client{},
+			}
+			d1, err := fs.newLisafsDentryForBoundSocket(ctx, &lisafs.Inode{ControlFD: 1, Stat: sockStat}, ep1)
+			if err != nil {
+				t.Fatalf("seed socket: %v", err)
+			}
+			d2, err := tc.create(ctx, &fs)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("create succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if gotShared := d2.inode == d1.inode; gotShared != tc.wantShared {
+				t.Fatalf("shared inode = %v, want %v", gotShared, tc.wantShared)
+			}
+			if d1.inode.endpoint != ep1 || d2.inode.endpoint != tc.wantEP {
+				t.Fatalf("endpoints = (%p, %p), want (%p, %p)", d1.inode.endpoint, d2.inode.endpoint, ep1, tc.wantEP)
+			}
+			if got := fs.inodeByKey[inoKeyFromStatx(&sockStat)]; got != d2.inode {
+				t.Fatalf("inodeByKey = %p, want %p", got, d2.inode)
+			}
+		})
+	}
+}
+
+func TestBindAtRecycledInodeRace(t *testing.T) {
+	ctx, creds, _, vfsObj, root := mountTestLisafsFS(t, lisafs.Statx{})
+	creds = auth.NewRootCredentials(creds.UserNamespace)
+	pop := vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse("target")}
+
+	ep1 := &testHostBoundEndpoint{}
+	if err := vfsObj.MknodAt(ctx, creds, &pop, &vfs.MknodOptions{Mode: linux.S_IFSOCK | 0777, Endpoint: ep1}); err != nil {
+		t.Fatalf("MknodAt(ep1): %v", err)
+	}
+	pinnedFD, err := vfsObj.OpenAt(ctx, creds, &pop, &vfs.OpenOptions{Flags: linux.O_PATH})
+	if err != nil {
+		t.Fatalf("OpenAt(O_PATH): %v", err)
+	}
+	defer pinnedFD.DecRef(ctx)
+	if err := vfsObj.UnlinkAt(ctx, creds, &pop); err != nil {
+		t.Fatalf("UnlinkAt(ep1): %v", err)
+	}
+
+	ep2a, ep2b := &testHostBoundEndpoint{}, &testHostBoundEndpoint{}
+	func() {
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if bep, err := vfsObj.BoundEndpointAt(ctx, creds, &pop, &vfs.BoundEndpointOptions{Addr: "/target"}); err == nil && bep != ep2a && bep != ep2b {
+					t.Errorf("BoundEndpointAt() = %p, want %p or %p", bep, ep2a, ep2b)
+					return
+				}
+			}
+		}()
+		defer func() {
+			close(done)
+			wg.Wait()
+		}()
+
+		for i := 0; i < 200; i++ {
+			ep := ep2a
+			if i%2 == 1 {
+				ep = ep2b
+			}
+			if err := vfsObj.MknodAt(ctx, creds, &pop, &vfs.MknodOptions{Mode: linux.S_IFSOCK | 0777, Endpoint: ep}); err != nil {
+				t.Fatalf("MknodAt(iter %d): %v", i, err)
+			}
+			if got, err := vfsObj.BoundEndpointAt(ctx, creds, &pop, &vfs.BoundEndpointOptions{Addr: "/target"}); err != nil || got != ep {
+				t.Fatalf("BoundEndpointAt(iter %d) = (%p, %v), want (%p, nil)", i, got, err, ep)
+			}
+			if err := vfsObj.UnlinkAt(ctx, creds, &pop); err != nil {
+				t.Fatalf("UnlinkAt(iter %d): %v", i, err)
+			}
+		}
+	}()
+
+	if got := pinnedFD.Dentry().Impl().(*dentry).inode.endpoint; got != ep1 {
+		t.Fatalf("pinned inode.endpoint = %p, want %p", got, ep1)
 	}
 }
 
