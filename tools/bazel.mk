@@ -23,6 +23,9 @@
 ##
 ##     USER                   - The in-container user.
 ##     DOCKER_RUN_OPTIONS     - Options for the container (default: --privileged, required for tests).
+##     DOCKER_EXTRA_RUN_OPTIONS - Options appended to DOCKER_RUN_OPTIONS (e.g. extra mounts).
+##                                Applied when the container starts; run
+##                                `make bazel-shutdown` after changing them.
 ##     DOCKER_NAME            - The container name (default: gvisor-bazel-HASH).
 ##     DOCKER_HOSTNAME        - The container name (default: same as DOCKER_NAME).
 ##     DOCKER_PRIVILEGED      - Docker privileged flags (default: --privileged).
@@ -94,6 +97,7 @@ DOCKER_CONFIG ?= /etc/docker/daemon.json
 DOCKER_CLI_PATH ?= docker
 DEVICE_FILE ?=
 PRE_BAZEL_INIT ?=
+DOCKER_EXTRA_RUN_OPTIONS ?=
 
 # If `GO_REPOSITORY_USE_HOST_CACHE` is set to `1`, Go environment variables
 # are passed through to the build container and work as they do with
@@ -333,7 +337,7 @@ endif
 	  -v "$(CURDIR):$(CURDIR)" \
 	  --workdir "$(CURDIR)" \
 	  --pid=host \
-	  $(DOCKER_RUN_OPTIONS) \
+	  $(DOCKER_RUN_OPTIONS) $(DOCKER_EXTRA_RUN_OPTIONS) \
 	  gvisor.dev/images/builder \
 	  bash -c "set -x; tail -f --pid=\$$($(BAZEL) info server_pid) /dev/null"
 else
