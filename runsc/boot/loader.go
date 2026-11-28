@@ -1456,6 +1456,8 @@ func containerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []s
 			}
 			if mc.ShouldUseOverlayfs() && (hint == nil || !hint.ShouldShareMount()) {
 				need = max(need, filter.HostFSReadOnly)
+			} else if mc.NonDir {
+				need = max(need, filter.HostFSReadWriteExistingFiles)
 			} else {
 				return filter.HostFSReadWrite, nil
 			}
@@ -1465,6 +1467,8 @@ func containerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []s
 		if mountConfs[mountIdx].ShouldUseLisafs() {
 			if mountConfs[mountIdx].ShouldUseOverlayfs() {
 				need = max(need, filter.HostFSReadOnly)
+			} else if mountConfs[mountIdx].NonDir {
+				need = max(need, filter.HostFSReadWriteExistingFiles)
 			} else {
 				return filter.HostFSReadWrite, nil
 			}

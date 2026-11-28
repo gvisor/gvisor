@@ -1855,9 +1855,11 @@ func TestMultiContainerHostFSAccess(t *testing.T) {
 		overlay         string
 		podSandbox      bool
 		rootBindDir     bool
+		rootBindFile    bool
 		subBindFile     bool
 		subBindDir      bool
 		suppressSubDir  bool
+		wantNeedErr     string
 		wantStartSubErr string
 	}{
 		{
@@ -1866,11 +1868,13 @@ func TestMultiContainerHostFSAccess(t *testing.T) {
 		{
 			name:            "readonly root rejects file",
 			subBindFile:     true,
+			wantNeedErr:     "needs readwriteexistingfiles access",
 			wantStartSubErr: "only allow readonly",
 		},
 		{
 			name:            "readonly root rejects directory",
 			subBindDir:      true,
+			wantNeedErr:     "needs readwrite access",
 			wantStartSubErr: "only allow readonly",
 		},
 		{
@@ -1878,7 +1882,20 @@ func TestMultiContainerHostFSAccess(t *testing.T) {
 			overlay:         "all:memory",
 			rootBindDir:     true,
 			subBindDir:      true,
+			wantNeedErr:     "needs readwrite access",
 			wantStartSubErr: "only allow readonly",
+		},
+		{
+			name:         "file root allows file",
+			rootBindFile: true,
+			subBindFile:  true,
+		},
+		{
+			name:            "file root rejects directory",
+			rootBindFile:    true,
+			subBindDir:      true,
+			wantNeedErr:     "needs readwrite access",
+			wantStartSubErr: "only allow readwriteexistingfiles",
 		},
 		{
 			name:       "pod sandbox keeps readwrite",
@@ -1940,6 +1957,13 @@ func TestMultiContainerHostFSAccess(t *testing.T) {
 					Destination: hostDir,
 				})
 			}
+			if tc.rootBindFile {
+				sps[0].Mounts = append(sps[0].Mounts, specs.Mount{
+					Type:        "bind",
+					Source:      hostFile,
+					Destination: hostFile,
+				})
+			}
 			if tc.subBindFile {
 				sps[1].Mounts = append(sps[1].Mounts, specs.Mount{
 					Type:        "bind",
@@ -1976,6 +2000,27 @@ func TestMultiContainerHostFSAccess(t *testing.T) {
 				"set -e; mkdir -p /overlay-test; echo ok > /overlay-test/f; chmod 0600 /overlay-test/f; rm -rf /overlay-test"); err != nil {
 				t.Fatalf("overlay mutations in root container failed: %v (output: %q)", err, out)
 			}
+			if tc.rootBindFile {
+				// Exercise directfs file operations under HostFSReadWriteExistingFiles.
+				if out, err := executeCombinedOutput(conf, containers[0], nil, "/bin/sh", "-c",
+					`set -e; [ "$(cat "$1")" = "host" ]; echo updated > "$1"; chmod 0600 "$1"; touch "$1"`, "--", hostFile); err != nil {
+					t.Fatalf("file mutations in root container failed: %v (output: %q)", err, out)
+				}
+				got, err := os.ReadFile(hostFile)
+				if err != nil {
+					t.Fatalf("os.ReadFile(%q) failed: %v", hostFile, err)
+				}
+				if string(got) != "updated\n" {
+					t.Errorf("hostFile content = %q, want %q", got, "updated\n")
+				}
+				info, err := os.Stat(hostFile)
+				if err != nil {
+					t.Fatalf("os.Stat(%q) failed: %v", hostFile, err)
+				}
+				if info.Mode().Perm() != 0600 {
+					t.Errorf("hostFile mode = %#o, want %#o", info.Mode().Perm(), 0600)
+				}
+			}
 
 			// For the all-overlay case, use a root-only overlay config for the
 			// subcontainer so its bind mount is un-overlaid while the root
@@ -2005,13 +2050,26 @@ func TestMultiContainerHostFSAccess(t *testing.T) {
 				if err != nil {
 					t.Fatalf("error starting subcontainer: %v", err)
 				}
+				if tc.subBindFile {
+					if out, err := executeCombinedOutput(&subConf, sub, nil, "/bin/sh", "-c",
+						`set -e; [ "$(cat "$1")" = "updated" ]; echo sub > "$1"`, "--", hostFile); err != nil {
+						t.Fatalf("file mutations in subcontainer failed: %v (output: %q)", err, out)
+					}
+					got, err := os.ReadFile(hostFile)
+					if err != nil {
+						t.Fatalf("os.ReadFile(%q) failed: %v", hostFile, err)
+					}
+					if string(got) != "sub\n" {
+						t.Errorf("hostFile content after subcontainer write = %q, want %q", got, "sub\n")
+					}
+				}
 				return
 			}
 			if err == nil {
 				t.Fatalf("the second container started, want an error containing %q", tc.wantStartSubErr)
 			}
-			if !strings.Contains(err.Error(), "needs readwrite access") || !strings.Contains(err.Error(), tc.wantStartSubErr) {
-				t.Errorf("error starting subcontainer: got %v, want an error containing %q and %q", err, "needs readwrite access", tc.wantStartSubErr)
+			if !strings.Contains(err.Error(), tc.wantNeedErr) || !strings.Contains(err.Error(), tc.wantStartSubErr) {
+				t.Errorf("error starting subcontainer: got %v, want an error containing %q and %q", err, tc.wantNeedErr, tc.wantStartSubErr)
 			}
 		})
 	}
