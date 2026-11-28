@@ -203,6 +203,12 @@ type sender struct {
 	// RFC3522 Section 3.2.
 	retransmitTS uint32
 
+	// pipePrev is the sender's estimate of the usable network pipe when
+	// loss recovery was last initiated, captured before the congestion
+	// controller reduced Ssthresh. It is consumed and reset when a detected
+	// spurious recovery (RFC3522) ends. Zero means nothing to restore.
+	pipePrev int
+
 	// startCork start corking the segments.
 	startCork bool
 
@@ -663,6 +669,7 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 	}
 
 	s.startSpuriousRecoveryDetection()
+	s.captureTimeoutPipePrev()
 
 	s.state = tcpip.RTORecovery
 	s.cc.HandleRTOExpired()
@@ -1221,6 +1228,72 @@ func (s *sender) leaveRecovery() {
 	s.cc.PostRecovery()
 }
 
+// capturePipePrev sets pipePrev before cc.HandleLossDetected reduces
+// Ssthresh. Inside a recovery that Eifel has already found spurious, it
+// clears pipePrev instead, so that the new loss response stands.
+//
+// See: https://datatracker.ietf.org/doc/html/rfc4015#section-3 step (0).
+//
+// +checklocks:s.ep.mu
+func (s *sender) capturePipePrev() {
+	// Like Eifel detection, this is not restarted during a recovery.
+	if s.inRecovery() {
+		if s.spuriousRecovery {
+			s.pipePrev = 0
+		}
+		return
+	}
+	// pipe_prev is max(FlightSize, ssthresh). Use SndCwnd for FlightSize,
+	// because the ACKs that detected the loss can have reduced Outstanding.
+	// Skip an Ssthresh that was never reduced.
+	s.pipePrev = s.SndCwnd
+	if s.Ssthresh != InitialSsthresh && s.Ssthresh > s.pipePrev {
+		s.pipePrev = s.Ssthresh
+	}
+}
+
+// captureTimeoutPipePrev is capturePipePrev for a retransmission timeout. No
+// ACK triggered the timeout, so Outstanding is still FlightSize, which can be
+// far below cwnd when the sender is application-limited. An Ssthresh that was
+// never reduced is kept, so a spurious timeout leaves it unlimited.
+//
+// +checklocks:s.ep.mu
+func (s *sender) captureTimeoutPipePrev() {
+	// See capturePipePrev.
+	if s.inRecovery() {
+		if s.spuriousRecovery {
+			s.pipePrev = 0
+		}
+		return
+	}
+	s.pipePrev = max(s.Outstanding, s.Ssthresh)
+}
+
+// undoSpuriousRecovery applies the RFC 4015 Eifel response when a spurious
+// recovery ends. It restores Ssthresh to pipePrev and sets SndCwnd to
+// FlightSize + min(ackedPackets, IW), so that the sender slow-starts back
+// instead of sending the difference in one burst. ackedPackets is what the
+// exit ACK removed from flight, and Outstanding must already be FlightSize.
+//
+// See: https://datatracker.ietf.org/doc/html/rfc4015#section-3 step (9).
+//
+// +checklocks:s.ep.mu
+func (s *sender) undoSpuriousRecovery(ackedPackets int) {
+	if s.pipePrev == 0 {
+		return
+	}
+	// TODO(gvisor.dev/issue/995): RFC4015 step (9) skips the reversal if
+	// the ACK carries ECN-Echo; netstack does not negotiate ECN yet.
+	if s.pipePrev > s.Ssthresh {
+		s.Ssthresh = s.pipePrev
+	}
+	// Outstanding can be negative while an ACK for data sent before an
+	// RTO is processed. FlightSize is never negative.
+	s.SndCwnd = max(s.Outstanding, 0) + min(ackedPackets, InitialCwnd)
+	s.pipePrev = 0
+	s.cc.PostRecovery()
+}
+
 // isAssignedSequenceNumber relies on the fact that we only set flags once a
 // sequencenumber is assigned and that is only done right before we send the
 // segment. As a result any segment that has a non-zero flag has a valid
@@ -1343,6 +1416,7 @@ func (s *sender) detectLoss(seg *segment) (fastRetransmit bool) {
 		s.DupAckCount = 0
 		return false
 	}
+	s.capturePipePrev()
 	s.cc.HandleLossDetected()
 	s.enterRecovery()
 	return true
@@ -1509,6 +1583,11 @@ func (s *sender) startSpuriousRecoveryDetection() {
 func (s *sender) detectSpuriousRecovery(hasDSACK bool, tsEchoReply uint32) {
 	// Return if the sender has already detected spurious recovery.
 	if s.spuriousRecovery {
+		return
+	}
+
+	// Eifel detection needs a usable timestamp echo (RFC 3522 Section 3.2).
+	if !s.ep.SendTSOk || tsEchoReply == 0 {
 		return
 	}
 
@@ -1769,6 +1848,13 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		if !s.FastRecovery.Active {
 			s.cc.Update(originalOutstanding-s.Outstanding, bestRTT, rcvdSeg.rcvdTime)
 			if s.FastRecovery.Last.LessThan(s.SndUna) {
+				// Every recovery ends here: RTO recovery
+				// directly, and fast recovery after
+				// leaveRecovery above. Outstanding is now
+				// FlightSize.
+				if s.inRecovery() && s.spuriousRecovery {
+					s.undoSpuriousRecovery(originalOutstanding - s.Outstanding)
+				}
 				s.state = tcpip.Open
 				// Update RACK when we are exiting fast or RTO
 				// recovery as described in the RFC
