@@ -1208,9 +1208,22 @@ TEST(FcntlTest, GetOwnExNone) {
   FileDescriptor s = ASSERT_NO_ERRNO_AND_VALUE(
       Socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
 
+  // Both fields start with values that F_GETOWN_EX must overwrite.
   f_owner_ex owner = {};
-  EXPECT_THAT(syscall(__NR_fcntl, s.get(), F_GETOWN_EX, &owner),
+  owner.type = F_OWNER_PID;
+  owner.pid = -1;
+  ASSERT_THAT(syscall(__NR_fcntl, s.get(), F_GETOWN_EX, &owner),
               SyscallSucceedsWithValue(0));
+  EXPECT_EQ(owner.type, F_OWNER_TID);
+  EXPECT_EQ(owner.pid, 0);
+}
+
+TEST(FcntlTest, GetOwnExNoneBadAddress) {
+  FileDescriptor s = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+
+  EXPECT_THAT(syscall(__NR_fcntl, s.get(), F_GETOWN_EX, nullptr),
+              SyscallFailsWithErrno(EFAULT));
 }
 
 TEST(FcntlTest, SetOwnInvalidPid) {

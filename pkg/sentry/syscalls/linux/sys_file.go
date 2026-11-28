@@ -359,14 +359,10 @@ func Ioctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		return 0, nil, file.SetStatusFlags(t, t.Credentials(), flags)
 
 	case linux.FIOGETOWN, linux.SIOCGPGRP:
-		var who int32
-		owner, hasOwner := getAsyncOwner(t, file)
-		if hasOwner {
-			if owner.Type == linux.F_OWNER_PGRP {
-				who = -owner.PID
-			} else {
-				who = owner.PID
-			}
+		owner := getAsyncOwner(t, file)
+		who := owner.PID
+		if owner.Type == linux.F_OWNER_PGRP {
+			who = -owner.PID
 		}
 		_, err := primitive.CopyInt32Out(t, args[2].Pointer(), who)
 		return 0, nil, err
@@ -739,10 +735,7 @@ func Fcntl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	case linux.F_SETFL:
 		return 0, nil, file.SetStatusFlags(t, t.Credentials(), args[2].Uint())
 	case linux.F_GETOWN:
-		owner, hasOwner := getAsyncOwner(t, file)
-		if !hasOwner {
-			return 0, nil, nil
-		}
+		owner := getAsyncOwner(t, file)
 		if owner.Type == linux.F_OWNER_PGRP {
 			return uintptr(-owner.PID), nil, nil
 		}
@@ -760,10 +753,7 @@ func Fcntl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		}
 		return 0, nil, setAsyncOwner(t, int(fd), file, ownerType, who)
 	case linux.F_GETOWN_EX:
-		owner, hasOwner := getAsyncOwner(t, file)
-		if !hasOwner {
-			return 0, nil, nil
-		}
+		owner := getAsyncOwner(t, file)
 		_, err := owner.CopyOut(t, args[2].Pointer())
 		return 0, nil, err
 	case linux.F_SETOWN_EX:
@@ -830,10 +820,12 @@ func Fcntl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	}
 }
 
-func getAsyncOwner(t *kernel.Task, fd *vfs.FileDescription) (ownerEx linux.FOwnerEx, hasOwner bool) {
+// getAsyncOwner returns who receives the async I/O signals of fd. If no one
+// does, it returns FOwnerEx{}: type F_OWNER_TID and PID 0.
+func getAsyncOwner(t *kernel.Task, fd *vfs.FileDescription) linux.FOwnerEx {
 	a := fd.AsyncHandler()
 	if a == nil {
-		return linux.FOwnerEx{}, false
+		return linux.FOwnerEx{}
 	}
 
 	ot, otg, opg := a.(*fasync.FileAsync).Owner()
@@ -842,19 +834,19 @@ func getAsyncOwner(t *kernel.Task, fd *vfs.FileDescription) (ownerEx linux.FOwne
 		return linux.FOwnerEx{
 			Type: linux.F_OWNER_TID,
 			PID:  int32(t.PIDNamespace().IDOfTask(ot)),
-		}, true
+		}
 	case otg != nil:
 		return linux.FOwnerEx{
 			Type: linux.F_OWNER_PID,
 			PID:  int32(t.PIDNamespace().IDOfThreadGroup(otg)),
-		}, true
+		}
 	case opg != nil:
 		return linux.FOwnerEx{
 			Type: linux.F_OWNER_PGRP,
 			PID:  int32(t.PIDNamespace().IDOfProcessGroup(opg)),
-		}, true
+		}
 	default:
-		return linux.FOwnerEx{}, true
+		return linux.FOwnerEx{}
 	}
 }
 
