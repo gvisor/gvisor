@@ -28,8 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/stubfilter"
 )
 
-const syscallEvent unix.Signal = 0x80
-
 // createStub creates a fresh stub processes.
 //
 // Precondition: the runtime OS thread must be locked.

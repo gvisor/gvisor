@@ -61,21 +61,6 @@ func (t *thread) setRegs(regs *arch.Registers) error {
 	return nil
 }
 
-// getSignalInfo retrieves information about the signal that caused the stop.
-func (t *thread) getSignalInfo(si *linux.SignalInfo) error {
-	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_PTRACE,
-		unix.PTRACE_GETSIGINFO,
-		uintptr(t.tid),
-		0,
-		uintptr(unsafe.Pointer(si)),
-		0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
 // clone creates a new sysmsg thread from this one.
 //
 // The returned thread will be stopped and available for any system thread to

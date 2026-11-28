@@ -29,20 +29,6 @@ func cputicksFreq() uint64 {
 	return nominalTSCFreq
 }
 
-// x86 use the fs_base register to store the TLS pointer which can be
-// get/set in "func (t *thread) get/setRegs(regs *arch.Registers)".
-// So both of the get/setTLS() operations are noop here.
-
-// getTLS gets the thread local storage register.
-func (t *thread) getTLS(tls *uint64) error {
-	return nil
-}
-
-// setTLS sets the thread local storage register.
-func (t *thread) setTLS(tls *uint64) error {
-	return nil
-}
-
 // disablePointerAuth has no effect on amd64.
 func (t *thread) disablePointerAuth() error {
 	return nil

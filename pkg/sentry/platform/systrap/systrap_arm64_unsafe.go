@@ -25,44 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 )
 
-// getTLS gets the thread local storage register.
-func (t *thread) getTLS(tls *uint64) error {
-	iovec := unix.Iovec{
-		Base: (*byte)(unsafe.Pointer(tls)),
-		Len:  uint64(unsafe.Sizeof(*tls)),
-	}
-	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_PTRACE,
-		unix.PTRACE_GETREGSET,
-		uintptr(t.tid),
-		linux.NT_ARM_TLS,
-		uintptr(unsafe.Pointer(&iovec)),
-		0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-// setTLS sets the thread local storage register.
-func (t *thread) setTLS(tls *uint64) error {
-	iovec := unix.Iovec{
-		Base: (*byte)(unsafe.Pointer(tls)),
-		Len:  uint64(unsafe.Sizeof(*tls)),
-	}
-	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_PTRACE,
-		unix.PTRACE_SETREGSET,
-		uintptr(t.tid),
-		linux.NT_ARM_TLS,
-		uintptr(unsafe.Pointer(&iovec)),
-		0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
 // setEnabledPointerAuthKeys sets the enabled pointer authentication
 // address keys for the thread.
 func (t *thread) setEnabledPointerAuthKeys(keys uint64) error {
