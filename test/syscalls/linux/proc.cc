@@ -16,6 +16,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <features.h>
 #include <limits.h>
 #include <linux/capability.h>
 #include <linux/limits.h>
@@ -44,6 +45,12 @@
 #include <syscall.h>
 #include <time.h>
 #include <unistd.h>
+
+// Only some versions of glibc define the statx types in sys/stat.h.
+#if defined(__GLIBC__) && \
+    !(__GLIBC__ == 2 && (__GLIBC_MINOR__ == 28 || __GLIBC_MINOR__ == 29))
+#include <linux/stat.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -4406,6 +4413,76 @@ TEST(Proc, GetdentsPartialBufferSparsePids) {
   for (const auto& child : children) {
     EXPECT_EQ(child.second, 1) << "Missing PID " << child.first;
   }
+}
+
+// The owner of /proc/PID/fd and friends follows the task's current
+// credentials, not the ones it had when the entries were first looked up.
+TEST(ProcPid, FdOwnerFollowsSetuid) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETGID)));
+  static constexpr int kNobody = 65534;
+
+  const pid_t child_pid = fork();
+  if (child_pid == 0) {
+    // Instantiate the entries while still root.
+    struct stat st;
+    TEST_PCHECK(stat("/proc/self/fd", &st) == 0);
+    TEST_PCHECK(stat("/proc/self/fdinfo", &st) == 0);
+    TEST_PCHECK(lstat("/proc/self/fd/0", &st) == 0);
+    TEST_PCHECK(syscall(SYS_setresgid, kNobody, kNobody, kNobody) == 0);
+    TEST_PCHECK(syscall(SYS_setresuid, kNobody, kNobody, kNobody) == 0);
+    // Changing credentials cleared dumpability.
+    TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER) == 0);
+    raise(SIGSTOP);
+    _exit(0);
+  }
+  ASSERT_THAT(child_pid, SyscallSucceeds());
+  auto cont_cleanup = Cleanup([child_pid] {
+    EXPECT_THAT(kill(child_pid, SIGCONT), SyscallSucceeds());
+    EXPECT_THAT(RetryEINTR(waitpid)(child_pid, nullptr, 0),
+                SyscallSucceedsWithValue(child_pid));
+  });
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, WUNTRACED),
+              SyscallSucceedsWithValue(child_pid));
+  ASSERT_TRUE(WIFSTOPPED(status)) << status;
+
+  // A raw setuid changes only the calling thread's credentials. Run the
+  // ownership checks as kNobody too so the test only needs CAP_SETUID and
+  // CAP_SETGID.
+  ScopedThread nobody_thread([child_pid] {
+    ASSERT_THAT(syscall(SYS_setuid, kNobody), SyscallSucceeds());
+    for (const char* name : {"fd", "fdinfo", "fd/0"}) {
+      SCOPED_TRACE(name);
+      const std::string path = absl::StrCat("/proc/", child_pid, "/", name);
+      struct stat st;
+      ASSERT_THAT(lstat(path.c_str(), &st), SyscallSucceeds());
+      EXPECT_EQ(st.st_uid, kNobody);
+      EXPECT_EQ(st.st_gid, kNobody);
+      struct statx stx = {};
+      ASSERT_THAT(syscall(SYS_statx, AT_FDCWD, path.c_str(),
+                          AT_SYMLINK_NOFOLLOW, STATX_UID, &stx),
+                  SyscallSucceeds());
+      EXPECT_EQ(stx.stx_uid, kNobody);
+      if (stx.stx_mask & STATX_GID) {
+        EXPECT_EQ(stx.stx_gid, kNobody);
+      }
+      struct statx stx_ino = {};
+      ASSERT_THAT(syscall(SYS_statx, AT_FDCWD, path.c_str(),
+                          AT_SYMLINK_NOFOLLOW, STATX_INO, &stx_ino),
+                  SyscallSucceeds());
+      if (stx_ino.stx_mask & STATX_UID) {
+        EXPECT_EQ(stx_ino.stx_uid, kNobody);
+      }
+      if (stx_ino.stx_mask & STATX_GID) {
+        EXPECT_EQ(stx_ino.stx_gid, kNobody);
+      }
+    }
+    EXPECT_NO_ERRNO(
+        Open(absl::StrCat("/proc/", child_pid, "/fd"), O_RDONLY | O_DIRECTORY));
+  });
+  nobody_thread.Join();
 }
 
 TEST(Proc, GetdentsEnoent) {
