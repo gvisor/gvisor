@@ -125,6 +125,9 @@ type endpoint struct {
 	// is added/removed; otherwise an ethernet header is used.
 	hdrSize int
 
+	// noARP has the same meaning as Options.NoARP.
+	noARP bool
+
 	// caps holds the endpoint capabilities.
 	caps stack.LinkEndpointCapabilities
 
@@ -198,6 +201,13 @@ type Options struct {
 	// EthernetHeader is true.
 	Address tcpip.LinkAddress
 
+	// NoARP if true, indicates that the link does not resolve link
+	// addresses, like a host device with IFF_NOARP set (e.g. netkit in L3
+	// mode). A frame whose route has no remote link address is then sent to
+	// the multicast link address of a multicast destination, and to Address
+	// otherwise, as on Linux. Only used if EthernetHeader is true.
+	NoARP bool
+
 	// SaveRestore if true, indicates that this NIC capability set should
 	// include CapabilitySaveRestore
 	SaveRestore bool
@@ -269,7 +279,9 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 	hdrSize := 0
 	if opts.EthernetHeader {
 		hdrSize = header.EthernetMinimumSize
-		caps |= stack.CapabilityResolutionRequired
+		if !opts.NoARP {
+			caps |= stack.CapabilityResolutionRequired
+		}
 	}
 
 	if opts.SaveRestore {
@@ -290,6 +302,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		closed:                opts.ClosedFunc,
 		addr:                  opts.Address,
 		hdrSize:               hdrSize,
+		noARP:                 opts.NoARP,
 		packetDispatchMode:    opts.PacketDispatchMode,
 		maxSyscallHeaderBytes: uintptr(opts.MaxSyscallHeaderBytes),
 		writevMaxIovs:         rawfile.MaxIovs,
@@ -621,12 +634,30 @@ const (
 func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
 	if e.hdrSize > 0 {
 		// Add ethernet header if needed.
+		dstAddr := pkt.EgressRoute.RemoteLinkAddress
+		if e.noARP && len(dstAddr) == 0 {
+			dstAddr = noARPDestination(pkt)
+		}
 		eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
 		eth.Encode(&header.EthernetFields{
 			SrcAddr: pkt.EgressRoute.LocalLinkAddress,
-			DstAddr: pkt.EgressRoute.RemoteLinkAddress,
+			DstAddr: dstAddr,
 			Type:    pkt.NetworkProtocolNumber,
 		})
+	}
+}
+
+// noARPDestination returns the destination link address of pkt on a link
+// that does not resolve link addresses: the multicast link address of a
+// multicast destination, and the local link address otherwise.
+func noARPDestination(pkt *stack.PacketBuffer) tcpip.LinkAddress {
+	switch addr := pkt.EgressRoute.RemoteAddress; {
+	case header.IsV4MulticastAddress(addr):
+		return header.EthernetAddressFromMulticastIPv4Address(addr)
+	case header.IsV6MulticastAddress(addr):
+		return header.EthernetAddressFromMulticastIPv6Address(addr)
+	default:
+		return pkt.EgressRoute.LocalLinkAddress
 	}
 }
 

@@ -392,6 +392,103 @@ func TestPreserveSrcAddress(t *testing.T) {
 	}
 }
 
+func TestNoARP(t *testing.T) {
+	unicast := tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
+	multicastV4 := tcpip.AddrFrom4([4]byte{224, 0, 0, 251})
+	multicastV6 := tcpip.AddrFrom16([16]byte{0: 0xff, 1: 0x02, 15: 0x01})
+	for _, test := range []struct {
+		name           string
+		noARP          bool
+		remoteAddr     tcpip.Address
+		remoteLinkAddr tcpip.LinkAddress
+		wantResolution bool
+		wantDstAddr    tcpip.LinkAddress
+	}{
+		{
+			name:           "resolution required",
+			noARP:          false,
+			remoteAddr:     unicast,
+			remoteLinkAddr: raddr,
+			wantResolution: true,
+			wantDstAddr:    raddr,
+		},
+		{
+			name:           "NoARP unicast",
+			noARP:          true,
+			remoteAddr:     unicast,
+			wantResolution: false,
+			wantDstAddr:    laddr,
+		},
+		{
+			name:           "NoARP IPv4 multicast",
+			noARP:          true,
+			remoteAddr:     multicastV4,
+			wantResolution: false,
+			wantDstAddr:    header.EthernetAddressFromMulticastIPv4Address(multicastV4),
+		},
+		{
+			name:           "NoARP IPv6 multicast",
+			noARP:          true,
+			remoteAddr:     multicastV6,
+			wantResolution: false,
+			wantDstAddr:    header.EthernetAddressFromMulticastIPv6Address(multicastV6),
+		},
+		{
+			name:           "NoARP IPv4 broadcast",
+			noARP:          true,
+			remoteAddr:     tcpip.AddrFrom4([4]byte{255, 255, 255, 255}),
+			wantResolution: false,
+			wantDstAddr:    laddr,
+		},
+		{
+			name:           "NoARP with remote link address",
+			noARP:          true,
+			remoteAddr:     unicast,
+			remoteLinkAddr: raddr,
+			wantResolution: false,
+			wantDstAddr:    raddr,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := newContext(t, &Options{Address: laddr, MTU: mtu, EthernetHeader: true, NoARP: test.noARP})
+			defer c.cleanup()
+
+			if got := c.ep.Capabilities()&stack.CapabilityResolutionRequired != 0; got != test.wantResolution {
+				t.Errorf("CapabilityResolutionRequired = %t, want %t", got, test.wantResolution)
+			}
+
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				ReserveHeaderBytes: header.EthernetMinimumSize,
+			})
+			defer pkt.DecRef()
+			pkt.NetworkProtocolNumber = proto
+			pkt.EgressRoute.RemoteAddress = test.remoteAddr
+			pkt.EgressRoute.LocalLinkAddress = laddr
+			pkt.EgressRoute.RemoteLinkAddress = test.remoteLinkAddr
+			c.ep.AddHeader(pkt)
+
+			var pkts stack.PacketBufferList
+			pkts.PushBack(pkt)
+			if _, err := c.ep.WritePackets(pkts); err != nil {
+				t.Fatalf("WritePackets failed: %s", err)
+			}
+
+			b := make([]byte, mtu)
+			n, err := unix.Read(c.readFDs[0], b)
+			if err != nil {
+				t.Fatalf("Read failed: %v", err)
+			}
+			h := header.Ethernet(b[:n])
+			if a := h.DestinationAddress(); a != test.wantDstAddr {
+				t.Errorf("DestinationAddress() = %v, want %v", a, test.wantDstAddr)
+			}
+			if a := h.SourceAddress(); a != laddr {
+				t.Errorf("SourceAddress() = %v, want %v", a, laddr)
+			}
+		})
+	}
+}
+
 func TestDeliverPacket(t *testing.T) {
 	lengths := []int{100, 1000}
 	eths := []bool{true, false}

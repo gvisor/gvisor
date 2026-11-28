@@ -196,6 +196,7 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 				MTU:                  uint32(link.MTU),
 				EthernetHeader:       mac != "" && !link.IsProxy,
 				Address:              mac,
+				NoARP:                link.NoARP,
 				PacketDispatchMode:   linkDispatchMode,
 				GSOMaxSize:           link.GSOMaxSize,
 				GVisorGSOEnabled:     link.GVisorGSOEnabled,
@@ -262,7 +263,10 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 				routes = append(routes, route)
 			}
 
-			if !link.IsProxy {
+			if link.NoARP && len(link.Neighbors) > 0 {
+				// Static neighbor entries need link address resolution.
+				log.Warningf("Ignoring %d static neighbor entries on interface %q: the interface does not resolve link addresses", len(link.Neighbors), link.Name)
+			} else if !link.IsProxy {
 				for _, neigh := range link.Neighbors {
 					proto, tcpipAddr := ipToAddressAndProto(neigh.IP)
 					n.Stack.AddStaticNeighbor(nicID, proto, tcpipAddr, tcpip.LinkAddress(neigh.HardwareAddr))

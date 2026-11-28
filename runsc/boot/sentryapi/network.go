@@ -100,6 +100,11 @@ type FDBasedLink struct {
 	// have already been performed on the host FDs.
 	PreConfigured bool
 
+	// NoARP indicates that the host device has IFF_NOARP set and an
+	// all-zero hardware address, so the sandbox must not resolve link
+	// addresses on it (see fdbased.Options.NoARP).
+	NoARP bool
+
 	// IsProxy indicates that this link is backed by a SOCK_SEQPACKET Unix domain
 	// socket connected to an external network proxy rather than by AF_PACKET
 	// sockets on a host device. Such a link carries bare IP packets with no
