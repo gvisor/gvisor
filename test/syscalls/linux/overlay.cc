@@ -1231,6 +1231,23 @@ TEST_F(OverlayCopyUpTest, Utimes) {
   EXPECT_EQ(2, st.st_mtime);
 }
 
+// Copy up copies file data that spans several copy buffers.
+TEST_F(OverlayCopyUpTest, Data) {
+  // Span several 32 KiB copy-up buffers and end with a partial one.
+  std::string contents(2 * 32 * 1024 + 17, '\0');
+  for (size_t i = 0; i < contents.size(); ++i) {
+    contents[i] = static_cast<char>(i % 251);
+  }
+  ASSERT_NO_ERRNO(CreateWithContents(LowerPath("file"), contents));
+  ASSERT_NO_ERRNO(MountOverlay());
+
+  // Force a copy up.
+  FileDescriptor const file =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(MergedPath("file"), O_WRONLY));
+
+  EXPECT_THAT(GetContents(UpperPath("file")), IsPosixErrorOkAndHolds(contents));
+}
+
 // Inode attributes are preserved across copy up.
 TEST_F(OverlayCopyUpTest, InodeAttributes) {
   ASSERT_NO_ERRNO(CreateWithContents(LowerPath("file"), "hello"));
