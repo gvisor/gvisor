@@ -62,6 +62,7 @@ BAZEL_IMAGE_CONTEXTS := \
   benchmarks_bun-spawn=//images/benchmarks/bun-spawn:bun_spawn_context \
   benchmarks_httpd=//images/benchmarks:httpd_context \
   benchmarks_redis=//images/basic:benchmark_redis_context \
+  compatibility_mariadb_mariadb=//images/compatibility:mariadb_context \
   compatibility_postgresql_postgresql=//images/compatibility:postgresql_context
 ifeq ($(ARCH),x86_64)
 BAZEL_IMAGE_CONTEXTS += benchmarks_syscallbench=//images/benchmarks/syscallbench:syscallbench_context
