@@ -371,7 +371,6 @@ go_library(
         "//pkg/rand",
         "//pkg/refs",
         "//pkg/safemem",
-        "//pkg/secio",
         "//pkg/sentry/arch",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/devices/nvproxy/nvconf",
