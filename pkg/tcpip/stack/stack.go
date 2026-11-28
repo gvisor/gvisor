@@ -148,6 +148,13 @@ type Stack struct {
 	// least one rule on a chain at a network hook.
 	nftablesConfigured atomicbitops.Bool
 
+	// bridgeNFCallIPTables, bridgeNFCallIP6Tables and bridgeNFCallARPTables
+	// are Linux's net.bridge.bridge-nf-call-{iptables,ip6tables,arptables}
+	// sysctls.
+	bridgeNFCallIPTables  atomicbitops.Bool
+	bridgeNFCallIP6Tables atomicbitops.Bool
+	bridgeNFCallARPTables atomicbitops.Bool
+
 	// restoredEndpoints is a list of endpoints that need to be restored if the
 	// stack is being restored.
 	restoredEndpoints []RestoredEndpoint
@@ -484,6 +491,10 @@ func New(opts Options) *Stack {
 		allowLiveTCPMigration: opts.AllowLiveTCPMigration,
 	}
 	s.SetNFTables(opts.NFTables)
+	// Linux enables bridge netfilter for all three by default.
+	s.bridgeNFCallIPTables.Store(true)
+	s.bridgeNFCallIP6Tables.Store(true)
+	s.bridgeNFCallARPTables.Store(true)
 
 	// Add specified network protocols.
 	for _, netProtoFactory := range opts.NetworkProtocols {
@@ -2533,18 +2544,19 @@ func (s *Stack) WritePacketToRemoteWithMark(nicID tcpip.NICID, remote tcpip.Link
 }
 
 // WriteRawPacket writes data directly to the specified NIC without adding any
-// headers.
+// headers. It takes ownership of payload.
 func (s *Stack) WriteRawPacket(nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, payload buffer.Buffer) tcpip.Error {
 	return s.WriteRawPacketWithMark(nicID, proto, payload, 0)
 }
 
 // WriteRawPacketWithMark writes data directly to the specified NIC without adding any
-// headers, setting the specified packet mark.
+// headers, setting the specified packet mark. It takes ownership of payload.
 func (s *Stack) WriteRawPacketWithMark(nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, payload buffer.Buffer, mark uint32) tcpip.Error {
 	s.mu.RLock()
 	nic, ok := s.nics[nicID]
 	s.mu.RUnlock()
 	if !ok {
+		payload.Release()
 		return &tcpip.ErrUnknownNICID{}
 	}
 
@@ -2657,6 +2669,49 @@ func (s *Stack) IsNFTablesConfigured() bool {
 // SetNFTablesConfigured sets whether the stack has nftables configured.
 func (s *Stack) SetNFTablesConfigured(configured bool) {
 	s.nftablesConfigured.Store(configured)
+}
+
+// BridgeNetfilterCall is one of Linux's net.bridge.bridge-nf-call-* sysctls,
+// which select the bridged frames that go through netfilter.
+type BridgeNetfilterCall int
+
+const (
+	// BridgeNetfilterCallIPTables is whether bridged IPv4 frames go through
+	// the IPv4 hooks.
+	BridgeNetfilterCallIPTables BridgeNetfilterCall = iota
+
+	// BridgeNetfilterCallIP6Tables is whether bridged IPv6 frames go through
+	// the IPv6 hooks.
+	BridgeNetfilterCallIP6Tables
+
+	// BridgeNetfilterCallARPTables is whether forwarded ARP frames go through
+	// the ARP netfilter hook. There is no ARP netfilter, so the only effect is
+	// that forwarded ARP frames too short for an ARP header are dropped, as
+	// br_nf_forward_arp does.
+	BridgeNetfilterCallARPTables
+)
+
+func (s *Stack) bridgeNetfilterCall(c BridgeNetfilterCall) *atomicbitops.Bool {
+	switch c {
+	case BridgeNetfilterCallIPTables:
+		return &s.bridgeNFCallIPTables
+	case BridgeNetfilterCallIP6Tables:
+		return &s.bridgeNFCallIP6Tables
+	case BridgeNetfilterCallARPTables:
+		return &s.bridgeNFCallARPTables
+	default:
+		panic(fmt.Sprintf("unknown BridgeNetfilterCall %d", c))
+	}
+}
+
+// BridgeNetfilterCall returns whether c is set.
+func (s *Stack) BridgeNetfilterCall(c BridgeNetfilterCall) bool {
+	return s.bridgeNetfilterCall(c).Load()
+}
+
+// SetBridgeNetfilterCall sets c to enable.
+func (s *Stack) SetBridgeNetfilterCall(c BridgeNetfilterCall, enable bool) {
+	s.bridgeNetfilterCall(c).Store(enable)
 }
 
 // ICMPLimit returns the maximum number of ICMP messages that can be sent
