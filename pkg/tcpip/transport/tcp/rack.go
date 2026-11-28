@@ -499,6 +499,9 @@ func (rc *rackControl) recover(retransmitHead bool) {
 		// before a SACK reveals a later hole.
 		retransmitHead = snd.writeList.Front().lost
 	}
+	// detectLoss may have marked more segments lost, which are no longer in
+	// flight.
+	snd.SetPipe()
 	if retransmitHead {
 		snd.resendSegment()
 	}
