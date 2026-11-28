@@ -19,14 +19,21 @@ package runsccmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	runc "github.com/containerd/go-runc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 // TestRunscUpdateCLI verifies Update runs the OCI update flow: JSON resources on
@@ -173,6 +180,330 @@ func TestCommandWaitDelayUnblocksWait(t *testing.T) {
 	elapsed := time.Since(start)
 	if elapsed < 200*time.Millisecond || elapsed > 30*time.Second {
 		t.Fatalf("cmdOutput returned after %v, want between waitDelay and the child lifetime", elapsed)
+	}
+}
+
+// pollingMonitor is a ProcessMonitor that polls for process exit instead of
+// blocking a thread in wait4(2).
+type pollingMonitor struct{}
+
+// Start implements ProcessMonitor.Start.
+func (pollingMonitor) Start(cmd *exec.Cmd) (chan runc.Exit, error) {
+	return nil, cmd.Start()
+}
+
+// Wait implements ProcessMonitor.Wait.
+func (pollingMonitor) Wait(cmd *exec.Cmd, _ chan runc.Exit) (int, error) {
+	for {
+		var ws unix.WaitStatus
+		pid, err := unix.Wait4(cmd.Process.Pid, &ws, unix.WNOHANG, nil)
+		if err != nil {
+			return -1, err
+		}
+		if pid == cmd.Process.Pid {
+			// Wait for the output to be copied. The process is already
+			// reaped, so ignore the error.
+			cmd.Wait()
+			if ws.Signaled() {
+				return 128 + int(ws.Signal()), nil
+			}
+			return ws.ExitStatus(), nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestWaitSurvivesLockedThreadExit verifies that a running "runsc wait"
+// started with a parent-death signal is not killed when goroutines exit while
+// locked to their OS thread, which makes Go end that thread.
+func TestWaitSurvivesLockedThreadExit(t *testing.T) {
+	dir := t.TempDir()
+	startedDir := filepath.Join(dir, "started")
+	if err := os.Mkdir(startedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doneFile := filepath.Join(dir, "done")
+	script := filepath.Join(dir, "fake-runsc")
+	const wantStatus = 7
+	scriptBody := fmt.Sprintf(`#!/bin/sh
+touch %q/$$
+while [ ! -e %q ]; do sleep 0.01; done
+printf '{"exitStatus":%d}'
+`, startedDir, doneFile, wantStatus)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// With one P, the waits may all fork from the main thread, which Go
+	// never ends.
+	if n := runtime.GOMAXPROCS(0); n < 4 {
+		runtime.GOMAXPROCS(4)
+		t.Cleanup(func() { runtime.GOMAXPROCS(n) })
+	}
+	// Like the shim's reaper, do not block a thread in wait4(2): a blocked
+	// thread is never ended, which would keep the forking thread alive.
+	oldMonitor := Monitor
+	Monitor = pollingMonitor{}
+	t.Cleanup(func() { Monitor = oldMonitor })
+
+	r := &Runsc{
+		Command:      script,
+		Root:         filepath.Join(dir, "root"),
+		PdeathSignal: unix.SIGKILL,
+	}
+	// Start the waits from many goroutines, so that without a dedicated
+	// start thread they fork from many OS threads.
+	const numWaits = 32
+	var wg sync.WaitGroup
+	errs := make([]error, numWaits)
+	for i := range numWaits {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			status, err := r.Wait(t.Context(), fmt.Sprintf("cid-%d", i))
+			if err == nil && status != wantStatus {
+				err = fmt.Errorf("status %d, want %d", status, wantStatus)
+			}
+			errs[i] = err
+		}()
+	}
+	t.Cleanup(func() {
+		// Let the scripts exit even if the test fails early.
+		os.WriteFile(doneFile, nil, 0o644)
+		wg.Wait()
+	})
+
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		entries, err := os.ReadDir(startedDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) == numWaits {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d waits started", len(entries), numWaits)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Lock goroutines to threads in batches, holding each batch until all of
+	// its goroutines are locked, so that each batch ends several distinct
+	// OS threads.
+	for range 32 {
+		const batch = 16
+		var locked, release sync.WaitGroup
+		locked.Add(batch)
+		release.Add(1)
+		for range batch {
+			go func() {
+				runtime.LockOSThread()
+				locked.Done()
+				release.Wait()
+			}()
+		}
+		locked.Wait()
+		release.Done()
+	}
+	// Give the kernel time to deliver parent-death signals.
+	time.Sleep(500 * time.Millisecond)
+
+	if err := os.WriteFile(doneFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("Wait(cid-%d): %v", i, err)
+		}
+	}
+}
+
+// tidMonitor is a ProcessMonitor that records the thread ID that starts each
+// command.
+type tidMonitor struct {
+	mu sync.Mutex
+	// pdeathsigTIDs holds the thread IDs that started commands with a
+	// parent-death signal, and otherTIDs those that started other commands.
+	//
+	// +checklocks:mu
+	pdeathsigTIDs []int
+	// +checklocks:mu
+	otherTIDs []int
+	// waits counts the started commands that Wait has not returned for.
+	waits sync.WaitGroup
+}
+
+// Start implements ProcessMonitor.Start.
+func (m *tidMonitor) Start(cmd *exec.Cmd) (chan runc.Exit, error) {
+	tid := unix.Gettid()
+	m.mu.Lock()
+	if cmd.SysProcAttr != nil && cmd.SysProcAttr.Pdeathsig != 0 {
+		m.pdeathsigTIDs = append(m.pdeathsigTIDs, tid)
+	} else {
+		m.otherTIDs = append(m.otherTIDs, tid)
+	}
+	m.mu.Unlock()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	m.waits.Add(1)
+	return nil, nil
+}
+
+// Wait implements ProcessMonitor.Wait.
+func (m *tidMonitor) Wait(cmd *exec.Cmd, _ chan runc.Exit) (int, error) {
+	defer m.waits.Done()
+	err := cmd.Wait()
+	if cmd.ProcessState == nil {
+		return -1, err
+	}
+	return cmd.ProcessState.ExitCode(), nil
+}
+
+// TestCommandsStartOnStartThread verifies that each Runsc start path (direct,
+// runOrError, cmdOutput, with and without IO) starts a command with a
+// parent-death signal from the same OS thread, which is not the thread of the
+// caller, and starts a command without a parent-death signal from the thread
+// of the caller.
+func TestCommandsStartOnStartThread(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-runsc")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := &tidMonitor{}
+	oldMonitor := Monitor
+	Monitor = m
+	t.Cleanup(func() { Monitor = oldMonitor })
+
+	r := &Runsc{
+		Command:      script,
+		Root:         filepath.Join(dir, "root"),
+		PdeathSignal: unix.SIGKILL,
+	}
+	noPdeathsig := &Runsc{
+		Command: script,
+		Root:    filepath.Join(dir, "root"),
+	}
+	var ios []runc.IO
+	for range 3 {
+		io, err := runc.NewNullIO()
+		if err != nil {
+			t.Fatalf("NewNullIO: %v", err)
+		}
+		ios = append(ios, io)
+	}
+	calls := map[string]func(ctx context.Context){
+		"Create": func(ctx context.Context) { r.Create(ctx, "cid", dir, nil) },
+		"CreateWithIO": func(ctx context.Context) {
+			r.Create(ctx, "cid", dir, &CreateOpts{IO: ios[0]})
+		},
+		"Start":       func(ctx context.Context) { r.Start(ctx, "cid", nil) },
+		"StartWithIO": func(ctx context.Context) { r.Start(ctx, "cid", ios[1]) },
+		"Exec":        func(ctx context.Context) { r.Exec(ctx, "cid", specs.Process{}, nil) },
+		"ExecWithIO": func(ctx context.Context) {
+			r.Exec(ctx, "cid", specs.Process{}, &ExecOpts{IO: ios[2]})
+		},
+		"Run": func(ctx context.Context) { r.Run(ctx, "cid", dir, nil) },
+		"Events": func(ctx context.Context) {
+			ec, err := r.Events(ctx, "cid", time.Second)
+			if err != nil {
+				return
+			}
+			for range ec {
+			}
+		},
+		"Wait": func(ctx context.Context) { r.Wait(ctx, "cid") },
+		"Kill": func(ctx context.Context) { r.Kill(ctx, "cid", 9, nil) },
+	}
+
+	// Run each call on its own locked thread, and keep all of these threads
+	// alive until every call returns, so that no two calls share a thread.
+	var (
+		done, release sync.WaitGroup
+		mu            sync.Mutex
+		callerTIDs    = map[int]bool{}
+		noPdeathTID   int
+	)
+	release.Add(1)
+	run := func(call func(ctx context.Context)) int {
+		done.Add(1)
+		tidCh := make(chan int, 1)
+		go func() {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			tid := unix.Gettid()
+			mu.Lock()
+			callerTIDs[tid] = true
+			mu.Unlock()
+			tidCh <- tid
+			call(t.Context())
+			done.Done()
+			release.Wait()
+		}()
+		return <-tidCh
+	}
+	for _, call := range calls {
+		run(call)
+	}
+	noPdeathTID = run(func(ctx context.Context) { noPdeathsig.Kill(ctx, "cid", 9, nil) })
+	done.Wait()
+	release.Done()
+	// Let the Wait calls that run after their Runsc method returned (Events)
+	// finish before Monitor is restored.
+	m.waits.Wait()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pdeathsigTIDs) != len(calls) {
+		t.Fatalf("got %d starts with a parent-death signal, want %d", len(m.pdeathsigTIDs), len(calls))
+	}
+	for _, tid := range m.pdeathsigTIDs {
+		if tid != m.pdeathsigTIDs[0] {
+			t.Errorf("commands with a parent-death signal started from threads %v, want one thread", m.pdeathsigTIDs)
+			break
+		}
+	}
+	if callerTIDs[m.pdeathsigTIDs[0]] {
+		t.Errorf("command with a parent-death signal started from caller thread %d", m.pdeathsigTIDs[0])
+	}
+	if len(m.otherTIDs) != 1 || m.otherTIDs[0] != noPdeathTID {
+		t.Errorf("commands without a parent-death signal started from threads %v, want caller thread %d", m.otherTIDs, noPdeathTID)
+	}
+}
+
+// TestStartErrorWithPdeathsig verifies that an error to start a command with a
+// parent-death signal is returned, and that later commands still start.
+func TestStartErrorWithPdeathsig(t *testing.T) {
+	dir := t.TempDir()
+	missing := &Runsc{
+		Command:      filepath.Join(dir, "missing-runsc"),
+		Root:         filepath.Join(dir, "root"),
+		PdeathSignal: unix.SIGKILL,
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- missing.Kill(t.Context(), "cid", 9, nil) }()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Kill with a missing runsc binary: got error %v, want %v", err, fs.ErrNotExist)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("Kill with a missing runsc binary did not return")
+	}
+
+	script := filepath.Join(dir, "fake-runsc")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runsc{
+		Command:      script,
+		Root:         filepath.Join(dir, "root"),
+		PdeathSignal: unix.SIGKILL,
+	}
+	if err := r.Kill(t.Context(), "cid", 9, nil); err != nil {
+		t.Errorf("Kill after a failed start: %v", err)
 	}
 }
 
