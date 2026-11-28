@@ -8,6 +8,7 @@ package(
 go_library(
     name = "runsccmd",
     srcs = [
+        "pdeathsig.go",
         "runsc.go",
         "utils.go",
     ],
@@ -25,5 +26,9 @@ go_test(
     size = "small",
     srcs = ["runsc_test.go"],
     embed = [":runsccmd"],
-    deps = ["@com_github_opencontainers_runtime_spec//specs-go:go_default_library"],
+    deps = [
+        "@com_github_containerd_go_runc//:go_default_library",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )
