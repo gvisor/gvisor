@@ -1361,10 +1361,20 @@ func (l *Loader) rootHostFSAccess() filter.HostFSAccess {
 		return filter.HostFSReadWrite
 	}
 	need, err := containerHostFSAccess(l.root.conf, l.root.spec, l.root.goferMountConfs, l.mountHints, l.root.devGoferFD != nil)
-	if err != nil || need > filter.HostFSNone {
+	if err != nil {
 		return filter.HostFSReadWrite
 	}
-	return filter.HostFSNone
+	if need > filter.HostFSNone && need < filter.HostFSReadWrite {
+		// Precompiled seccomp programs only exist for HostFSNone and
+		// HostFSReadWrite when a device proxy is enabled.
+		hasDeviceProxy := specutils.NVProxyEnabled(l.root.spec, l.root.conf) ||
+			specutils.TPUProxyEnabled(l.root.spec, l.root.conf) ||
+			specutils.RDMAEnabled(l.root.spec, l.root.conf)
+		if hasDeviceProxy {
+			return filter.HostFSReadWrite
+		}
+	}
+	return need
 }
 
 func (l *Loader) restoreHostFSAccess() filter.HostFSAccess {

@@ -1075,6 +1075,83 @@ func TestContainerHostFSAccess(t *testing.T) {
 			want:       filter.HostFSNone,
 		},
 		{
+			name:     "overlay on every host mount",
+			directFS: true,
+			mutate: func(_ *config.Config, spec *specs.Spec) {
+				spec.Mounts = []specs.Mount{
+					{Destination: "/data", Type: "bind", Source: "/data"},
+				}
+			},
+			mountConfs: []specutils.GoferMountConf{overlayDirConf, overlayDirConf},
+			want:       filter.HostFSReadOnly,
+		},
+		{
+			name:     "erofs root with overlaid bind mount",
+			directFS: true,
+			mutate: func(_ *config.Config, spec *specs.Spec) {
+				spec.Mounts = []specs.Mount{
+					{Destination: "/data", Type: "bind", Source: "/data"},
+				}
+			},
+			mountConfs: []specutils.GoferMountConf{erofsConf, overlayDirConf},
+			want:       filter.HostFSReadOnly,
+		},
+		{
+			name:     "overlaid root with suppressed bind mount",
+			directFS: true,
+			mutate: func(_ *config.Config, spec *specs.Spec) {
+				spec.Annotations = map[string]string{
+					sentryapi.MountPrefix + "m1.source":   "/data",
+					sentryapi.MountPrefix + "m1.type":     "bind",
+					sentryapi.MountPrefix + "m1.share":    "shared",
+					sentryapi.MountPrefix + "m1.directfs": "off",
+				}
+				spec.Mounts = []specs.Mount{
+					{Destination: "/data", Type: "bind", Source: "/data"},
+				}
+			},
+			mountConfs: []specutils.GoferMountConf{overlayDirConf, dirConf},
+			want:       filter.HostFSReadOnly,
+		},
+		{
+			name:     "overlaid root with readonly bind mount without overlay",
+			directFS: true,
+			mutate: func(_ *config.Config, spec *specs.Spec) {
+				spec.Mounts = []specs.Mount{
+					{Destination: "/data", Type: "bind", Source: "/data", Options: []string{"ro"}},
+				}
+			},
+			mountConfs: []specutils.GoferMountConf{overlayDirConf, dirConf},
+			want:       filter.HostFSReadWrite,
+		},
+		{
+			name:     "overlaid root with shared mount hint",
+			directFS: true,
+			mutate: func(_ *config.Config, spec *specs.Spec) {
+				spec.Annotations = map[string]string{
+					sentryapi.MountPrefix + "m1.source": "/data",
+					sentryapi.MountPrefix + "m1.type":   "tmpfs",
+					sentryapi.MountPrefix + "m1.share":  "pod",
+				}
+				spec.Mounts = []specs.Mount{
+					{Destination: "/data", Type: "bind", Source: "/data"},
+				}
+			},
+			mountConfs: []specutils.GoferMountConf{overlayDirConf, overlayDirConf},
+			want:       filter.HostFSReadWrite,
+		},
+		{
+			name:     "directory without overlay",
+			directFS: true,
+			mutate: func(_ *config.Config, spec *specs.Spec) {
+				spec.Mounts = []specs.Mount{
+					{Destination: "/data", Type: "bind", Source: "/data"},
+				}
+			},
+			mountConfs: []specutils.GoferMountConf{overlayDirConf, dirConf},
+			want:       filter.HostFSReadWrite,
+		},
+		{
 			name:       "root without overlay",
 			directFS:   true,
 			mountConfs: []specutils.GoferMountConf{dirConf},
@@ -1091,6 +1168,13 @@ func TestContainerHostFSAccess(t *testing.T) {
 			directFS:    true,
 			hasDevGofer: true,
 			mountConfs:  []specutils.GoferMountConf{erofsConf},
+			want:        filter.HostFSReadWrite,
+		},
+		{
+			name:        "dev gofer with overlaid root",
+			directFS:    true,
+			hasDevGofer: true,
+			mountConfs:  []specutils.GoferMountConf{overlayDirConf},
 			want:        filter.HostFSReadWrite,
 		},
 		{
@@ -1220,7 +1304,7 @@ func TestContainerHostFSAccess(t *testing.T) {
 					{Destination: "/active", Type: "none", Source: "/active", Options: []string{"bind"}},
 				}
 			},
-			mountConfs: []specutils.GoferMountConf{erofsConf, dirConf, dirConf},
+			mountConfs: []specutils.GoferMountConf{overlayDirConf, dirConf, dirConf},
 			want:       filter.HostFSReadWrite,
 		},
 		{
@@ -1688,12 +1772,18 @@ func TestMountSharedMasterHostFSAccess(t *testing.T) {
 }
 
 func TestRootHostFSAccess(t *testing.T) {
+	addUverbs := func(spec *specs.Spec) {
+		if spec.Linux == nil {
+			spec.Linux = &specs.Linux{}
+		}
+		spec.Linux.Devices = append(spec.Linux.Devices, specs.LinuxDevice{Path: "/dev/infiniband/uverbs0"})
+	}
 	for _, tc := range []struct {
 		name            string
 		directFS        bool
 		noRootContainer bool
 		hasDevGofer     bool
-		mutateSpec      func(*specs.Spec)
+		mutate          func(*config.Config, *specs.Spec)
 		mountConfs      []specutils.GoferMountConf
 		want            filter.HostFSAccess
 	}{
@@ -1718,7 +1808,62 @@ func TestRootHostFSAccess(t *testing.T) {
 			name:       "single container overlaid dir",
 			directFS:   true,
 			mountConfs: []specutils.GoferMountConf{overlayDirConf},
+			want:       filter.HostFSReadOnly,
+		},
+		{
+			name:       "overlaid dir with nvproxy widens to readwrite",
+			directFS:   true,
+			mutate:     func(conf *config.Config, _ *specs.Spec) { conf.NVProxy = true },
+			mountConfs: []specutils.GoferMountConf{overlayDirConf},
 			want:       filter.HostFSReadWrite,
+		},
+		{
+			name:       "overlaid dir with tpuproxy widens to readwrite",
+			directFS:   true,
+			mutate:     func(conf *config.Config, _ *specs.Spec) { conf.TPUProxy = true },
+			mountConfs: []specutils.GoferMountConf{overlayDirConf},
+			want:       filter.HostFSReadWrite,
+		},
+		{
+			name:     "overlaid dir with rdma proxy and uverbs widens to readwrite",
+			directFS: true,
+			mutate: func(conf *config.Config, spec *specs.Spec) {
+				conf.RDMAProxy = true
+				addUverbs(spec)
+			},
+			mountConfs: []specutils.GoferMountConf{overlayDirConf},
+			want:       filter.HostFSReadWrite,
+		},
+		{
+			name:       "overlaid dir with rdma proxy without uverbs stays readonly",
+			directFS:   true,
+			mutate:     func(conf *config.Config, _ *specs.Spec) { conf.RDMAProxy = true },
+			mountConfs: []specutils.GoferMountConf{overlayDirConf},
+			want:       filter.HostFSReadOnly,
+		},
+		{
+			name:       "erofs with nvproxy stays none",
+			directFS:   true,
+			mutate:     func(conf *config.Config, _ *specs.Spec) { conf.NVProxy = true },
+			mountConfs: []specutils.GoferMountConf{erofsConf},
+			want:       filter.HostFSNone,
+		},
+		{
+			name:       "erofs with tpuproxy stays none",
+			directFS:   true,
+			mutate:     func(conf *config.Config, _ *specs.Spec) { conf.TPUProxy = true },
+			mountConfs: []specutils.GoferMountConf{erofsConf},
+			want:       filter.HostFSNone,
+		},
+		{
+			name:     "erofs with rdma proxy and uverbs stays none",
+			directFS: true,
+			mutate: func(conf *config.Config, spec *specs.Spec) {
+				conf.RDMAProxy = true
+				addUverbs(spec)
+			},
+			mountConfs: []specutils.GoferMountConf{erofsConf},
+			want:       filter.HostFSNone,
 		},
 		{
 			name:        "single container with dev gofer",
@@ -1730,7 +1875,7 @@ func TestRootHostFSAccess(t *testing.T) {
 		{
 			name:     "single container with suppressed submount hint",
 			directFS: true,
-			mutateSpec: func(spec *specs.Spec) {
+			mutate: func(_ *config.Config, spec *specs.Spec) {
 				spec.Annotations = map[string]string{
 					sentryapi.MountPrefix + "m1.source":   "/data",
 					sentryapi.MountPrefix + "m1.type":     "bind",
@@ -1752,7 +1897,7 @@ func TestRootHostFSAccess(t *testing.T) {
 		{
 			name:     "pod sandbox (containerd)",
 			directFS: true,
-			mutateSpec: func(spec *specs.Spec) {
+			mutate: func(_ *config.Config, spec *specs.Spec) {
 				spec.Annotations = map[string]string{
 					specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox,
 				}
@@ -1763,7 +1908,7 @@ func TestRootHostFSAccess(t *testing.T) {
 		{
 			name:     "pod sandbox (CRI-O)",
 			directFS: true,
-			mutateSpec: func(spec *specs.Spec) {
+			mutate: func(_ *config.Config, spec *specs.Spec) {
 				spec.Annotations = map[string]string{
 					specutils.CRIOContainerTypeAnnotation: specutils.CRIOContainerTypeSandbox,
 				}
@@ -1774,7 +1919,7 @@ func TestRootHostFSAccess(t *testing.T) {
 		{
 			name:     "pod container annotation",
 			directFS: true,
-			mutateSpec: func(spec *specs.Spec) {
+			mutate: func(_ *config.Config, spec *specs.Spec) {
 				spec.Annotations = map[string]string{
 					specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeContainer,
 				}
@@ -1784,7 +1929,7 @@ func TestRootHostFSAccess(t *testing.T) {
 		},
 		{
 			name: "pod sandbox without directfs",
-			mutateSpec: func(spec *specs.Spec) {
+			mutate: func(_ *config.Config, spec *specs.Spec) {
 				spec.Annotations = map[string]string{
 					specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox,
 				}
@@ -1808,8 +1953,8 @@ func TestRootHostFSAccess(t *testing.T) {
 			conf := testConfig()
 			conf.DirectFS = tc.directFS
 			spec := testSpec()
-			if tc.mutateSpec != nil {
-				tc.mutateSpec(spec)
+			if tc.mutate != nil {
+				tc.mutate(conf, spec)
 			}
 			mountHints, err := sentryapi.NewPodMountHints(spec)
 			if err != nil {
