@@ -797,6 +797,50 @@ TEST(PidfdTest, WaitNonblock) {
   cleanup.Release();
 }
 
+// Checks that waitid(P_PIDFD) on the pidfd of a child that has already been
+// reaped fails with ECHILD, with and without WNOHANG and O_NONBLOCK.
+void ExpectWaitReapedFailsWithECHILD(int pidfd) {
+  siginfo_t info = {};
+  EXPECT_THAT(RetryEINTR(waitid)(P_PIDFD, pidfd, &info, WEXITED),
+              SyscallFailsWithErrno(ECHILD));
+  EXPECT_THAT(RetryEINTR(waitid)(P_PIDFD, pidfd, &info, WEXITED | WNOHANG),
+              SyscallFailsWithErrno(ECHILD));
+
+  int flags = fcntl(pidfd, F_GETFL, 0);
+  ASSERT_THAT(flags, SyscallSucceeds());
+  ASSERT_THAT(fcntl(pidfd, F_SETFL, flags | O_NONBLOCK), SyscallSucceeds());
+  EXPECT_THAT(RetryEINTR(waitid)(P_PIDFD, pidfd, &info, WEXITED),
+              SyscallFailsWithErrno(ECHILD));
+}
+
+TEST(PidfdTest, WaitChildReapedViaPidfdFails) {
+  pid_t child = -1;
+  auto pidfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Clone3Pidfd(child, []() { _exit(0); }));
+  ScopedChildReaper cleanup(child);
+
+  siginfo_t info = {};
+  ASSERT_THAT(RetryEINTR(waitid)(P_PIDFD, pidfd.get(), &info, WEXITED),
+              SyscallSucceeds());
+  cleanup.Release();
+
+  ExpectWaitReapedFailsWithECHILD(pidfd.get());
+}
+
+TEST(PidfdTest, WaitChildReapedViaWaitpidFails) {
+  pid_t child = -1;
+  auto pidfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Clone3Pidfd(child, []() { _exit(0); }));
+  ScopedChildReaper cleanup(child);
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  cleanup.Release();
+
+  ExpectWaitReapedFailsWithECHILD(pidfd.get());
+}
+
 TEST(PidfdTest, Poll) {
   pid_t child = -1;
   auto pidfd =
