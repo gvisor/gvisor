@@ -28,12 +28,14 @@ steps:
   - <<: *common
     <<: *source_test
     label: ":fire: Smoke tests (AMD64)"
+    timeout_in_minutes: 25
     command: make smoke-tests
   - <<: *common
     <<: *source_test
     env:
       GLIBC_TUNABLES: glibc.pthread.rseq=0
     label: ":fire: Smoke race tests"
+    timeout_in_minutes: 40
     command: make smoke-race-tests
   - <<: *common
     <<: *source_test
