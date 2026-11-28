@@ -87,6 +87,35 @@ func (h *handle) allocate(ctx context.Context, mode, offset, length uint64) erro
 	return nil
 }
 
+// flush emulates the implicit flush that close(2) performs on the host.
+// Linux calls f_op->flush on every close(2) of a file descriptor, not just
+// when the last reference is dropped, so closing a duplicate delivers
+// FUSE_FLUSH (and any deferred write error, e.g. EDQUOT) without closing
+// h.fd, which may be shared by other file descriptors.
+// flush emulates the implicit flush that close(2) performs on the host.
+//
+// Linux runs f_op->flush on every close(2) of a file descriptor, not only
+// when the last reference to the open file is dropped. Closing a duplicate
+// of h.fd therefore triggers the host filesystem's close-time flush (e.g.
+// FUSE_FLUSH, NFS writeback) and returns its error, while h.fd itself stays
+// open for other users of the handle. Filesystems without a flush operation
+// (ext4, tmpfs, ...) make this a no-op.
+func (h *handle) flush(ctx context.Context) error {
+	if h.fd >= 0 {
+		ctx.UninterruptibleSleepStart()
+		defer ctx.UninterruptibleSleepFinish()
+		dupFD, err := unix.Dup(int(h.fd))
+		if err != nil {
+			return err
+		}
+		return unix.Close(dupFD)
+	}
+	if h.fdLisa.Ok() {
+		return h.fdLisa.Flush(ctx)
+	}
+	return nil
+}
+
 func (h *handle) sync(ctx context.Context) error {
 	// If we have a host FD, fsyncing it is likely to be faster than an fsync
 	// RPC.

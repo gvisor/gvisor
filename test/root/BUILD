@@ -26,6 +26,7 @@ go_test(
     srcs = [
         "cgroup_test.go",
         "chroot_test.go",
+        "gofer_fuse_errors_test.go",
         "main_test.go",
         "oom_score_adj_test.go",
         "runsc_test.go",
@@ -33,6 +34,7 @@ go_test(
     ],
     data = [
         "//:release",
+        "//test/root/fuse_probe",
     ],
     embed = [":root"],
     local = True,
@@ -57,6 +59,9 @@ go_test(
         "@com_github_cilium_ebpf//asm:go_default_library",
         "@com_github_cilium_ebpf//link:go_default_library",
         "@com_github_docker_docker//api/types/container:go_default_library",
+        "@com_github_docker_docker//api/types/mount:go_default_library",
+        "@com_github_hanwen_go_fuse_v2//fs:go_default_library",
+        "@com_github_hanwen_go_fuse_v2//fuse:go_default_library",
         "@com_github_moby_sys_capability//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",

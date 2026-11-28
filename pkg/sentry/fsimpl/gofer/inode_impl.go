@@ -432,8 +432,11 @@ func (i *inode) flush(ctx context.Context) error {
 	case *lisafsInode:
 		return flush(ctx, it.writeFDLisa)
 	case *directfsInode:
-		// Nothing to do here.
-		return nil
+		if !i.isWriteHandleOk() {
+			return nil
+		}
+		h := i.writeHandle()
+		return h.flush(ctx)
 	default:
 		panic("unknown inode implementation")
 	}

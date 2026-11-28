@@ -167,7 +167,7 @@ func (fd *specialFileFD) OnClose(ctx context.Context) error {
 	if !fd.vfsfd.IsWritable() {
 		return nil
 	}
-	return flush(ctx, fd.handle.fdLisa)
+	return fd.handle.flush(ctx)
 }
 
 // Readiness implements waiter.Waitable.Readiness.
