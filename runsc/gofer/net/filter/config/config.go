@@ -27,10 +27,38 @@ import (
 	"gvisor.dev/gvisor/runsc/gofer/filter"
 )
 
+// Mode is the netgofer mode that the seccomp filter allows.
+//
+// The zero value is not a valid mode.
+type Mode int
+
+const (
+	// ProxyMode is the mode where netgofer runs a netstack proxy and opens
+	// host sockets.
+	ProxyMode Mode = iota + 1
+
+	// PasstMode is the mode where netgofer only reads and writes two
+	// inherited sockets.
+	PasstMode
+)
+
+// String implements fmt.Stringer.
+func (m Mode) String() string {
+	switch m {
+	case ProxyMode:
+		return "proxy"
+	case PasstMode:
+		return "passt"
+	default:
+		return fmt.Sprintf("Mode(%d)", int(m))
+	}
+}
+
 // Options are seccomp filter related options.
 type Options struct {
 	ProfileEnabled bool
 	CgoEnabled     bool
+	Mode           Mode
 	ExtraRules     []seccomp.SyscallRules
 }
 
@@ -52,6 +80,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "ProfileEnabled=%t ", opt.ProfileEnabled)
 	fmt.Fprintf(&sb, "Instrumentation=%t ", isInstrumentationEnabled())
 	fmt.Fprintf(&sb, "CgoEnabled=%t ", opt.CgoEnabled)
+	fmt.Fprintf(&sb, "Mode=%v ", opt.Mode)
 	// Extra rules are not known at precompile time. Cannot precompile.
 	fmt.Fprintf(&sb, "ExtraRules=%t ", len(opt.ExtraRules) > 0)
 	return strings.TrimSpace(sb.String())
@@ -98,6 +127,13 @@ func Rules(opt Options) (seccomp.SyscallRules, seccomp.SyscallRules) {
 // using `vars` as override for variables defined during precompilation.
 func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, seccomp.SyscallRules) {
 	s := allowedSyscalls.Copy()
+	switch opt.Mode {
+	case ProxyMode:
+		s.Merge(proxyModeFilters())
+	case PasstMode:
+	default:
+		panic(fmt.Sprintf("invalid netgofer mode: %v", opt.Mode))
+	}
 	s.Merge(filter.SelfPIDFilters(vars.GetUint64(filter.SelfPIDVarName)))
 	if opt.ProfileEnabled {
 		s.Merge(filter.ProfileFilters())

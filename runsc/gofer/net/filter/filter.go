@@ -25,6 +25,17 @@ import (
 // Options is a re-export of the config Options type under this package.
 type Options = config.Options
 
+// Mode selects which netgofer seccomp allowlist to install. It is re-exported
+// here because the config package is private to runsc/gofer/net/filter.
+type Mode = config.Mode
+
+// Valid Mode values, re-exported here because the config package is private to
+// runsc/gofer/net/filter.
+const (
+	ProxyMode = config.ProxyMode
+	PasstMode = config.PasstMode
+)
+
 // Install installs seccomp filters.
 func Install(opt Options) error {
 	return goferfilter.Install(opt, GetPrecompiled, ListPrecompiled)

@@ -15,8 +15,11 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -27,18 +30,30 @@ import (
 // TestOptionsConfigKey verifies the behavior of `Options.ConfigKey`.
 func TestOptionsConfigKey(t *testing.T) {
 	// mutateFn mutates the value of a specific Options field.
-	type mutateFn func(opt *Options)
+	type mutateFn func(t *testing.T, opt *Options)
 
-	var defaultOpt Options
+	defaultOpt := Options{
+		Mode: ProxyMode,
+	}
 
 	// Map of `Options` struct field names mapped to a function to mutate them.
 	// This should only contain fields which influence the configuration.
 	// Calling the mutation function of these should change the value of
 	// `Options.ConfigKey`.
 	configFields := map[string]mutateFn{
-		"ProfileEnabled": func(opt *Options) { opt.ProfileEnabled = !opt.ProfileEnabled },
-		"CgoEnabled":     func(opt *Options) { opt.CgoEnabled = !opt.CgoEnabled },
-		"ExtraRules": func(opt *Options) {
+		"ProfileEnabled": func(_ *testing.T, opt *Options) { opt.ProfileEnabled = !opt.ProfileEnabled },
+		"CgoEnabled":     func(_ *testing.T, opt *Options) { opt.CgoEnabled = !opt.CgoEnabled },
+		"Mode": func(t *testing.T, opt *Options) {
+			switch opt.Mode {
+			case ProxyMode:
+				opt.Mode = PasstMode
+			case PasstMode:
+				opt.Mode = ProxyMode
+			default:
+				t.Fatalf("invalid mode: %v", opt.Mode)
+			}
+		},
+		"ExtraRules": func(_ *testing.T, opt *Options) {
 			if len(opt.ExtraRules) == 0 {
 				opt.ExtraRules = []seccomp.SyscallRules{
 					seccomp.NewSyscallRules().Add(uintptr(123456), seccomp.MatchAll{}),
@@ -62,7 +77,7 @@ func TestOptionsConfigKey(t *testing.T) {
 		opt := defaultOpt // Make a copy, as we're about to mutate it.
 		key := opt.ConfigKey()
 		for name, mutateFn := range configFields {
-			mutateFn(&opt)
+			mutateFn(t, &opt)
 			newKey := opt.ConfigKey()
 			if key == newKey {
 				t.Fatalf("mutating config field %q did not cause the ConfigKey to change: %q", name, key)
@@ -86,6 +101,20 @@ func TestPrecompiledPrograms(t *testing.T) {
 			t.Errorf("programs %d and %d have the same name: %q", prev, i, program.Name)
 		}
 		byName[program.Name] = i
+	}
+	for _, cgo := range []bool{false, true} {
+		for _, mode := range []Mode{ProxyMode, PasstMode} {
+			key := (Options{CgoEnabled: cgo, Mode: mode}).ConfigKey()
+			if _, found := byName[key]; !found {
+				t.Errorf("no precompiled program for ConfigKey %q", key)
+			}
+		}
+		for _, mode := range []Mode{0, Mode(99)} {
+			key := (Options{CgoEnabled: cgo, Mode: mode}).ConfigKey()
+			if _, found := byName[key]; found {
+				t.Errorf("unexpected precompiled program for invalid mode %v (ConfigKey %q)", mode, key)
+			}
+		}
 	}
 	for _, opt := range optionsToPrecompile() {
 		i, found := byName[opt.ConfigKey()]
@@ -126,7 +155,7 @@ func TestPrecompiledProgramsDeterministic(t *testing.T) {
 }
 
 func TestRules(t *testing.T) {
-	rules, _ := Rules(Options{})
+	rules, _ := Rules(Options{Mode: ProxyMode})
 
 	// Check some allowed syscalls
 	allowed := []uintptr{
@@ -169,11 +198,69 @@ func TestRules(t *testing.T) {
 			t.Errorf("Rules().Has(%d) = true, want false", sys)
 		}
 	}
+
+	// Only proxy mode opens and configures sockets, and uses the fdbased
+	// endpoint for I/O.
+	proxyOnly := []uintptr{
+		unix.SYS_SOCKET,
+		unix.SYS_CONNECT,
+		unix.SYS_GETSOCKOPT,
+		unix.SYS_SETSOCKOPT,
+		unix.SYS_GETPEERNAME,
+		unix.SYS_GETSOCKNAME,
+		unix.SYS_SHUTDOWN,
+		unix.SYS_PPOLL,
+		unix.SYS_READV,
+		unix.SYS_WRITEV,
+		unix.SYS_RECVMMSG,
+		unix.SYS_SENDMMSG,
+	}
+	for _, sys := range proxyOnly {
+		if !rules.Has(sys) {
+			t.Errorf("Rules().Has(%d) = false, want true", sys)
+		}
+	}
+	passtRules, _ := Rules(Options{Mode: PasstMode})
+	for _, sys := range []uintptr{
+		unix.SYS_READ,
+		unix.SYS_WRITE,
+	} {
+		if !passtRules.Has(sys) {
+			t.Errorf("Rules(Mode: PasstMode).Has(%d) = false, want true", sys)
+		}
+	}
+	for _, sys := range slices.Concat(proxyOnly, denied) {
+		if instrumentation.Has(sys) {
+			continue
+		}
+		if passtRules.Has(sys) {
+			t.Errorf("Rules(Mode: PasstMode).Has(%d) = true, want false", sys)
+		}
+	}
+}
+
+func TestRulesInvalidMode(t *testing.T) {
+	for _, mode := range []Mode{0, Mode(99)} {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Errorf("Rules(Mode: %v) did not panic, want panic", mode)
+					return
+				}
+				if want := "invalid netgofer mode"; !strings.Contains(fmt.Sprint(r), want) {
+					t.Errorf("Rules(Mode: %v) panicked with %q, want message containing %q", mode, r, want)
+				}
+			}()
+			Rules(Options{Mode: mode})
+		}()
+	}
 }
 
 func TestRulesExtraRules(t *testing.T) {
 	const extraSyscall = uintptr(123456)
 	rules, _ := Rules(Options{
+		Mode: ProxyMode,
 		ExtraRules: []seccomp.SyscallRules{
 			seccomp.NewSyscallRules().Add(extraSyscall, seccomp.MatchAll{}),
 		},

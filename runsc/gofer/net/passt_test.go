@@ -18,12 +18,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -35,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/runsc/config"
 	egressfilter "gvisor.dev/gvisor/runsc/gofer/net/egressfilter"
+	netgoferfilter "gvisor.dev/gvisor/runsc/gofer/net/filter"
 )
 
 // testIPv4Pkt returns an IPv4 packet from the sandbox to dst with the given
@@ -525,22 +528,99 @@ func waitForStartupGoroutines() {
 	}
 }
 
-func TestRunPasstModeWithSeccomp(t *testing.T) {
-	if os.Getenv("NETGOFER_PASST_SECCOMP_CHILD") == "1" {
-		log.SetLevel(log.Info)
-		waitForStartupGoroutines()
+// seccompChildEnv is set in the child processes of the seccomp tests. Its
+// value selects what the child does.
+const seccompChildEnv = "NETGOFER_TEST_CHILD_ROLE"
+
+// Values of seccompChildEnv.
+const (
+	// seccompChildPasstForward runs passt mode on FDs 3 and 4.
+	seccompChildPasstForward = "passt-forward"
+
+	// seccompChildPasstSocket runs passt mode on FDs 3 and 4, then calls
+	// socket(2).
+	seccompChildPasstSocket = "passt-socket"
+
+	// seccompChildProxySocket installs the proxy mode seccomp filters, then
+	// calls socket(2).
+	seccompChildProxySocket = "proxy-socket"
+)
+
+// TestMain runs the tests of this package, or a child process of the seccomp
+// tests if seccompChildEnv is set.
+func TestMain(m *testing.M) {
+	if role := os.Getenv(seccompChildEnv); role != "" {
+		runSeccompChild(role)
+	}
+	os.Exit(m.Run())
+}
+
+// runSeccompChild runs a child process of the seccomp tests. It does not
+// return.
+func runSeccompChild(role string) {
+	log.SetLevel(log.Info)
+	waitForStartupGoroutines()
+	switch role {
+	case seccompChildPasstForward:
 		n := &Netgofer{
 			udsFD:   3,
 			passtFD: 4,
 		}
 		os.Exit(int(n.runPasstMode(&config.Config{})))
+	case seccompChildPasstSocket:
+		// The kernel writes a core dump when seccomp kills the process with
+		// SIGSYS. Make the process not dumpable to prevent it.
+		if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+			fmt.Fprintf(os.Stderr, "prctl(PR_SET_DUMPABLE, 0) failed: %v\n", err)
+			os.Exit(1)
+		}
+		ready := make(chan struct{})
+		n := &Netgofer{
+			udsFD:   3,
+			passtFD: 4,
+			ready:   ready,
+		}
+		go func() {
+			os.Exit(int(n.runPasstMode(&config.Config{})))
+		}()
+		<-ready
+		_, _, _ = unix.RawSyscall(unix.SYS_SOCKET, unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		os.Exit(0)
+	case seccompChildProxySocket:
+		if err := netgoferfilter.Install(netgoferfilter.Options{
+			CgoEnabled: config.CgoEnabled,
+			Mode:       netgoferfilter.ProxyMode,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Install() failed: %v\n", err)
+			os.Exit(2)
+		}
+		fd, _, errno := unix.RawSyscall(unix.SYS_SOCKET, unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		if errno != 0 {
+			// The filter allows write(2).
+			fmt.Fprintf(os.Stderr, "socket() failed: %v\n", errno)
+			os.Exit(3)
+		}
+		_, _, _ = unix.RawSyscall(unix.SYS_CLOSE, fd, 0, 0)
+		os.Exit(0)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown %s value: %q\n", seccompChildEnv, role)
+		os.Exit(1)
 	}
+}
 
+// seccompChildCommand returns a command that runs this test binary as a child
+// process of the seccomp tests.
+func seccompChildCommand(role string) *exec.Cmd {
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), seccompChildEnv+"="+role, "GOTRACEBACK=system")
+	return cmd
+}
+
+func TestRunPasstModeWithSeccomp(t *testing.T) {
 	udsFD, passtFD, peers := newPasstSocketPairs(t)
 	udsFile := os.NewFile(uintptr(udsFD), "uds")
 	passtFile := os.NewFile(uintptr(passtFD), "passt")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestRunPasstModeWithSeccomp$")
-	cmd.Env = append(os.Environ(), "NETGOFER_PASST_SECCOMP_CHILD=1", "GOTRACEBACK=system")
+	cmd := seccompChildCommand(seccompChildPasstForward)
 	cmd.ExtraFiles = []*os.File{udsFile, passtFile}
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -566,6 +646,14 @@ func TestRunPasstModeWithSeccomp(t *testing.T) {
 	// ready signal is needed. The child reads them after it installs seccomp.
 	verifyPasstRoundTrip(t, peers)
 
+	// netgofer drops a packet to a destination that the egress filter does
+	// not allow, logs the drop, and forwards the packets that follow.
+	blocked := testIPv4Pkt([4]byte{169, 254, 169, 254}, header.TCPProtocolNumber, testTCP(80), 0)
+	if _, err := peers.sentry.Write(blocked); err != nil {
+		t.Fatalf("writing to the sandbox socket failed: %v", err)
+	}
+	verifyPasstRoundTrip(t, peers)
+
 	_ = peers.sentry.Close()
 	waited = true
 	if err := cmd.Wait(); err != nil {
@@ -575,4 +663,31 @@ func TestRunPasstModeWithSeccomp(t *testing.T) {
 		}
 		t.Fatalf("cmd.Wait() failed: %v", err)
 	}
+
+	t.Run("blocks_socket_syscall", func(t *testing.T) {
+		// Control: the proxy mode allowlist permits socket(AF_INET, SOCK_STREAM|...).
+		ctrl := seccompChildCommand(seccompChildProxySocket)
+		if out, err := ctrl.CombinedOutput(); err != nil {
+			t.Fatalf("proxy control child failed: %v; output:\n%s", err, out)
+		}
+
+		// runPasstMode must install the passt mode allowlist, which kills the
+		// child with SIGSYS when it invokes socket().
+		udsFD, passtFD, _ := newPasstSocketPairs(t)
+		udsFile := os.NewFile(uintptr(udsFD), "uds")
+		passtFile := os.NewFile(uintptr(passtFD), "passt")
+		child := seccompChildCommand(seccompChildPasstSocket)
+		child.ExtraFiles = []*os.File{udsFile, passtFile}
+		out, err := child.CombinedOutput()
+		_ = udsFile.Close()
+		_ = passtFile.Close()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("socket child err = %v, want SIGSYS ExitError; output:\n%s", err, out)
+		}
+		ws := exitErr.Sys().(syscall.WaitStatus)
+		if !ws.Signaled() || ws.Signal() != syscall.SIGSYS {
+			t.Fatalf("socket child status = %v (signal %v), want SIGSYS; output:\n%s", ws, ws.Signal(), out)
+		}
+	})
 }
