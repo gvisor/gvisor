@@ -26,22 +26,19 @@ func (i *inode) isSymlink() bool {
 
 // Precondition: d.isSymlink().
 func (d *dentry) readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
-	if d.inode.fs.opts.interop != InteropModeShared {
-		d.touchAtime(mnt)
-		d.inode.dataMu.Lock()
-		if d.inode.haveTarget {
-			target := d.inode.target
-			d.inode.dataMu.Unlock()
-			return target, nil
-		}
+	if d.inode.fs.opts.interop == InteropModeShared {
+		return d.inode.readlinkImpl(ctx)
+	}
+	d.touchAtime(mnt)
+	d.inode.dataMu.Lock()
+	defer d.inode.dataMu.Unlock()
+	if d.inode.haveTarget {
+		return d.inode.target, nil
 	}
 	target, err := d.inode.readlinkImpl(ctx)
-	if d.inode.fs.opts.interop != InteropModeShared {
-		if err == nil {
-			d.inode.haveTarget = true
-			d.inode.target = target
-		}
-		d.inode.dataMu.Unlock() // +checklocksforce: guaranteed locked from above.
+	if err == nil {
+		d.inode.haveTarget = true
+		d.inode.target = target
 	}
 	return target, err
 }
