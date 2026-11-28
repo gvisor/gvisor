@@ -350,6 +350,62 @@ func TestMemLimit(t *testing.T) {
 	}
 }
 
+// TestTmpfsDefaultSizeMemLimit tests that the default size of a tmpfs mount is
+// half of the total memory that /proc/meminfo reports when the container has a
+// memory limit.
+func TestTmpfsDefaultSizeMemLimit(t *testing.T) {
+	ctx := t.Context()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	const memLimitKb = 512 * 1024
+	opts := dockerutil.RunOpts{
+		Image:  "basic/alpine",
+		Memory: memLimitKb * 1024, // In bytes.
+		Mounts: []mount.Mount{
+			{
+				// No size option, so the default size limit applies.
+				Type:   mount.TypeTmpfs,
+				Target: "/tmpfs",
+			},
+		},
+	}
+	cmd := `echo "memtotal $(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"; ` +
+		`echo "tmpfs $(df -Pk /tmpfs | awk 'NR == 2 {print $2}')"`
+	out, err := d.Run(ctx, opts, "sh", "-c", cmd)
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	// The output may contain a Docker warning about swap before the values.
+	values := make(map[string]uint64)
+	for line := range strings.Lines(out) {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || (key != "memtotal" && key != "tmpfs") {
+			continue
+		}
+		v, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			t.Fatalf("failed to parse %q: %v", line, err)
+		}
+		values[key] = v
+	}
+	memTotal, ok := values["memtotal"]
+	if !ok {
+		t.Fatalf("MemTotal not found in output: %q", out)
+	}
+	tmpfsSize, ok := values["tmpfs"]
+	if !ok {
+		t.Fatalf("tmpfs size not found in output: %q", out)
+	}
+	if memTotal != memLimitKb {
+		t.Fatalf("MemTotal is %d KiB, not the %d KiB memory limit", memTotal, memLimitKb)
+	}
+	if want := memTotal / 2; tmpfsSize != want {
+		t.Errorf("tmpfs size got: %d KiB, want: %d KiB", tmpfsSize, want)
+	}
+}
+
 func TestNumCPU(t *testing.T) {
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)

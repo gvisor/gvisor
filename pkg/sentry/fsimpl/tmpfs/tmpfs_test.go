@@ -170,8 +170,8 @@ func newPipeFD(ctx context.Context, mode linux.FileMode) (*vfs.FileDescription, 
 }
 
 func TestParseSize(t *testing.T) {
-	// 4 GiB of host memory
-	SetTotalHostMem(4096 * 1024 * 1024)
+	// 4 GiB of total memory
+	SetTotalMem(4096 * 1024 * 1024)
 
 	tests := []struct {
 		s                  string
@@ -186,7 +186,7 @@ func TestParseSize(t *testing.T) {
 		{"5t", (5 * 1024 * 1024 * 1024 * 1024), false, false},
 		{"5P", (5 * 1024 * 1024 * 1024 * 1024 * 1024), false, false},
 		{"5e", (5 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024), false, false},
-		{"5%", (5 * (totalHostMem / 100)), true, false},
+		{"5%", (5 * (totalMem / 100)), true, false},
 		{"5e3", 0, false, true},
 		{"", 0, false, true},
 		{"9999999999999999P", 0, false, true},
@@ -214,8 +214,8 @@ func TestMountOptions(t *testing.T) {
 	ctx := contexttest.Context(t)
 	creds := auth.CredentialsFromContext(ctx)
 
-	// Ensure totalHostMem is set for default size calculation.
-	SetTotalHostMem(4096 * 1024 * 1024) // 4 GiB
+	// Ensure totalMem is set for default size calculation.
+	SetTotalMem(4096 * 1024 * 1024) // 4 GiB
 
 	tests := []struct {
 		name       string
@@ -226,7 +226,7 @@ func TestMountOptions(t *testing.T) {
 		{
 			name:       "default size",
 			opts:       "",
-			wantBlocks: (totalHostMem / 2) >> hostarch.PageShift,
+			wantBlocks: (totalMem / 2) >> hostarch.PageShift,
 			wantErr:    false,
 		},
 		{
@@ -266,7 +266,7 @@ func TestMountOptions(t *testing.T) {
 		{
 			name:       "huge always",
 			opts:       "huge=always",
-			wantBlocks: (totalHostMem / 2) >> hostarch.PageShift,
+			wantBlocks: (totalMem / 2) >> hostarch.PageShift,
 			wantErr:    false,
 		},
 		{

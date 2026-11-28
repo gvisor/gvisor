@@ -32,6 +32,7 @@
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -1172,6 +1173,27 @@ TEST(MountTest, TmpfsHardLinkAllocCheck) {
   EXPECT_EQ(buf.st_size, kPageSize);
   EXPECT_THAT(unlink(fileTwo.c_str()), SyscallSucceeds());
   EXPECT_THAT(unlink(fileOne.c_str()), SyscallSucceeds());
+}
+
+// Tests that the default size and inode limits of a tmpfs mount are half of
+// the total RAM that sysinfo(2) reports, in pages.
+TEST(MountTest, TmpfsDefaultLimitsAreHalfOfTotalRam) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), kTmpfs, 0, "", 0));
+
+  struct sysinfo info;
+  ASSERT_THAT(sysinfo(&info), SyscallSucceeds());
+  struct statfs st;
+  ASSERT_THAT(statfs(dir.path().c_str(), &st), SyscallSucceeds());
+
+  const uint64_t total_ram_pages =
+      static_cast<uint64_t>(info.totalram) * info.mem_unit / kPageSize;
+  EXPECT_EQ(st.f_bsize, getpagesize());
+  // Allow one page of difference for rounding.
+  EXPECT_NEAR(st.f_blocks, total_ram_pages / 2, 1);
+  EXPECT_NEAR(st.f_files, total_ram_pages / 2, 1);
 }
 
 // Tests memory allocation for empty size.
