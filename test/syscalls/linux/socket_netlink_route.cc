@@ -5155,6 +5155,445 @@ TEST_P(NetlinkRouteIpInvariantTest, AddressMulticastGroup) {
   }
 }
 
+struct AddrRequest {
+  struct nlmsghdr hdr;
+  struct ifaddrmsg ifa;
+  char buf[256];
+};
+
+// Returns an RTM_NEWADDR request for interface index with no attributes.
+AddrRequest NewAddrRequest(int family, int prefixlen, int index) {
+  AddrRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifa));
+  req.hdr.nlmsg_type = RTM_NEWADDR;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifa.ifa_family = family;
+  req.ifa.ifa_prefixlen = prefixlen;
+  req.ifa.ifa_flags = IFA_F_NODAD;
+  req.ifa.ifa_index = index;
+  return req;
+}
+
+// Returns copies of the messages of an RTM_GETADDR dump for family.
+PosixErrorOr<std::vector<std::vector<char>>> DumpAddrs(const FileDescriptor& fd,
+                                                       int family) {
+  struct {
+    struct nlmsghdr hdr;
+    struct ifaddrmsg ifa;
+  } req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETADDR;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifa.ifa_family = family;
+  std::vector<std::vector<char>> msgs;
+  RETURN_IF_ERRNO(NetlinkRequestResponse(
+      fd, &req, sizeof(req),
+      [&](const struct nlmsghdr* hdr) {
+        const char* p = reinterpret_cast<const char*>(hdr);
+        msgs.emplace_back(p, p + hdr->nlmsg_len);
+      },
+      /*expect_nlmsgerr=*/false));
+  return msgs;
+}
+
+// Returns whether the RTM_GETADDR dump has the local address addr/prefixlen
+// on interface index. The local address is in IFA_LOCAL, or in IFA_ADDRESS
+// when the message has no IFA_LOCAL.
+PosixErrorOr<bool> HasAddr(const FileDescriptor& fd, int family, int index,
+                           int prefixlen, const std::string& addr) {
+  ASSIGN_OR_RETURN_ERRNO(auto msgs, DumpAddrs(fd, family));
+  for (const auto& m : msgs) {
+    const struct nlmsghdr* hdr =
+        reinterpret_cast<const struct nlmsghdr*>(m.data());
+    if (hdr->nlmsg_type != RTM_NEWADDR ||
+        hdr->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifaddrmsg))) {
+      continue;
+    }
+    const struct ifaddrmsg* ifa =
+        reinterpret_cast<const struct ifaddrmsg*>(NLMSG_DATA(hdr));
+    if (ifa->ifa_family != family || ifa->ifa_prefixlen != prefixlen ||
+        static_cast<int>(ifa->ifa_index) != index) {
+      continue;
+    }
+    const struct rtattr* local =
+        FindAttr(IFA_RTA(ifa), IFA_PAYLOAD(hdr), IFA_LOCAL);
+    if (local == nullptr) {
+      local = FindAttr(IFA_RTA(ifa), IFA_PAYLOAD(hdr), IFA_ADDRESS);
+    }
+    if (AttrEquals(local, addr)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Returns a Cleanup that removes addr/prefixlen from interface index if it is
+// there.
+Cleanup ScopedAddrRemoval(FileDescriptor& fd, int family, int index,
+                          int prefixlen, const std::string& addr) {
+  return Cleanup([&fd, family, index, prefixlen, addr] {
+    LinkDelLocalAddr(fd, index, family, prefixlen, addr.data(), addr.size())
+        .IgnoreError();
+  });
+}
+
+// Returns addr in network byte order.
+std::string AddrBytes(int family, const char* addr) {
+  std::string b(family == AF_INET ? sizeof(in_addr) : sizeof(in6_addr), '\0');
+  TEST_CHECK(inet_pton(family, addr, b.data()) == 1);
+  return b;
+}
+
+// An RTM_NEWADDR request with an IFA_UNSPEC attribute and an IFA_LABEL that
+// names the interface adds the address.
+TEST_P(NetlinkRouteIpInvariantTest, NewAddrUnspecAndLabel) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const int family = GetParam();
+  const int prefixlen = family == AF_INET ? 24 : 64;
+  const std::string addr =
+      AddrBytes(family, family == AF_INET ? "192.0.2.1" : "2001:db8:1::1");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  AddrRequest req = NewAddrRequest(family, prefixlen, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_LOCAL, addr.data(), addr.size());
+  addattr(&req.hdr, sizeof(req), IFA_ADDRESS, addr.data(), addr.size());
+  // IFA_UNSPEC is ignored, whatever its payload.
+  addattr(&req.hdr, sizeof(req), IFA_UNSPEC, "lo", 3);
+  addattr(&req.hdr, sizeof(req), IFA_LABEL, lo.name.c_str(),
+          lo.name.size() + 1);
+  Cleanup cleanup = ScopedAddrRemoval(fd, family, lo.index, prefixlen, addr);
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(
+      HasAddr(fd, family, lo.index, prefixlen, addr)));
+}
+
+// A message from an RTM_GETADDR dump can be sent back as an RTM_NEWADDR
+// request. Before it is sent back, IFA_LABEL and IFA_CACHEINFO change to
+// IFA_UNSPEC and NLM_F_CREATE is added to its flags. The request adds the
+// address again.
+TEST_P(NetlinkRouteIpInvariantTest, NewAddrFromDumpMessage) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const int family = GetParam();
+  const int prefixlen = family == AF_INET ? 24 : 64;
+  const std::string addr =
+      AddrBytes(family, family == AF_INET ? "192.0.2.2" : "2001:db8:1::2");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  Cleanup cleanup = ScopedAddrRemoval(fd, family, lo.index, prefixlen, addr);
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(fd, lo.index, family, prefixlen, addr.data(),
+                                   addr.size()));
+  auto msgs = ASSERT_NO_ERRNO_AND_VALUE(DumpAddrs(fd, family));
+  const struct nlmsghdr* dumped =
+      FindAddrMessage(msgs, RTM_NEWADDR, family, lo.index, prefixlen, addr);
+  ASSERT_NE(dumped, nullptr);
+  AddrRequest req = {};
+  ASSERT_LE(dumped->nlmsg_len, sizeof(req));
+  memcpy(&req, dumped, dumped->nlmsg_len);
+  ASSERT_NO_ERRNO(LinkDelLocalAddr(fd, lo.index, family, prefixlen, addr.data(),
+                                   addr.size()));
+
+  int len = IFA_PAYLOAD(&req.hdr);
+  for (struct rtattr* rta = IFA_RTA(&req.ifa); RTA_OK(rta, len);
+       rta = RTA_NEXT(rta, len)) {
+    if (rta->rta_type == IFA_LABEL || rta->rta_type == IFA_CACHEINFO) {
+      rta->rta_type = IFA_UNSPEC;
+    }
+  }
+  req.ifa.ifa_flags |= IFA_F_NODAD;
+  req.hdr.nlmsg_flags = (req.hdr.nlmsg_flags & ~NLM_F_DUMP_FILTERED) |
+                        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+  req.hdr.nlmsg_seq = kSeq + 1;
+  ASSERT_NO_ERRNO(
+      NetlinkRequestAckOrError(fd, kSeq + 1, &req, req.hdr.nlmsg_len));
+
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(
+      HasAddr(fd, family, lo.index, prefixlen, addr)));
+}
+
+// An RTM_NEWADDR request with IFA_ADDRESS and no IFA_LOCAL adds the IPv6
+// address, and fails with EINVAL for IPv4.
+TEST_P(NetlinkRouteIpInvariantTest, NewAddrWithoutLocal) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const int family = GetParam();
+  const int prefixlen = family == AF_INET ? 24 : 64;
+  const std::string addr =
+      AddrBytes(family, family == AF_INET ? "192.0.2.3" : "2001:db8:1::3");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  AddrRequest req = NewAddrRequest(family, prefixlen, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_ADDRESS, addr.data(), addr.size());
+  Cleanup cleanup = ScopedAddrRemoval(fd, family, lo.index, prefixlen, addr);
+  if (family == AF_INET) {
+    EXPECT_THAT(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len),
+                PosixErrorIs(EINVAL, _));
+    EXPECT_FALSE(ASSERT_NO_ERRNO_AND_VALUE(
+        HasAddr(fd, family, lo.index, prefixlen, addr)));
+    return;
+  }
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(
+      HasAddr(fd, family, lo.index, prefixlen, addr)));
+}
+
+// An RTM_NEWADDR request with no address attribute fails with EINVAL.
+TEST_P(NetlinkRouteIpInvariantTest, NewAddrWithoutAddress) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  const int family = GetParam();
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  AddrRequest req =
+      NewAddrRequest(family, family == AF_INET ? 24 : 64, lo.index);
+  EXPECT_THAT(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len),
+              PosixErrorIs(EINVAL, _));
+}
+
+// An IPv4 label attribute that is empty, or that has IFNAMSIZ or more bytes
+// when one terminating NUL is not counted, fails with ERANGE. The request adds
+// no address.
+TEST(NetlinkRouteTest, NewAddrLabelLength) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const std::string addr = AddrBytes(AF_INET, "192.0.2.4");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  Cleanup cleanup = ScopedAddrRemoval(fd, AF_INET, lo.index, 24, addr);
+
+  // IFNAMSIZ characters, one more than an interface name can have.
+  const std::string too_long =
+      lo.name + std::string(IFNAMSIZ - lo.name.size(), 'x');
+  const std::string valid = lo.name + '\0';
+  struct {
+    const char* name;
+    std::vector<std::string> labels;
+  } cases[] = {
+      {"IFNAMSIZ characters and a NUL", {too_long + '\0'}},
+      {"IFNAMSIZ characters", {too_long}},
+      {"empty", {""}},
+      {"name and NULs, IFNAMSIZ + 1 bytes",
+       {lo.name + std::string(IFNAMSIZ + 1 - lo.name.size(), '\0')}},
+      {"too long, then valid", {too_long + '\0', valid}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    for (bool with_local : {true, false}) {
+      SCOPED_TRACE(with_local ? "IFA_LOCAL" : "IFA_ADDRESS");
+      AddrRequest req = NewAddrRequest(AF_INET, 24, lo.index);
+      addattr(&req.hdr, sizeof(req), with_local ? IFA_LOCAL : IFA_ADDRESS,
+              addr.data(), addr.size());
+      for (const std::string& label : c.labels) {
+        addattr(&req.hdr, sizeof(req), IFA_LABEL, label.data(), label.size());
+      }
+      EXPECT_THAT(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len),
+                  PosixErrorIs(ERANGE, _));
+      EXPECT_FALSE(
+          ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET, lo.index, 24, addr)));
+    }
+  }
+
+  // Only one terminating NUL is not counted.
+  const std::string padded =
+      lo.name + std::string(IFNAMSIZ - lo.name.size(), '\0');
+  AddrRequest req = NewAddrRequest(AF_INET, 24, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_LOCAL, addr.data(), addr.size());
+  addattr(&req.hdr, sizeof(req), IFA_LABEL, padded.data(), padded.size());
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+  EXPECT_TRUE(
+      ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET, lo.index, 24, addr)));
+}
+
+// An IPv4 label that is not the interface name adds the address on Linux.
+// gVisor keeps no label for each address, so it fails with EOPNOTSUPP and adds
+// nothing.
+TEST(NetlinkRouteTest, NewAddrOtherLabel) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const std::string addr = AddrBytes(AF_INET, "192.0.2.7");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  Cleanup cleanup = ScopedAddrRemoval(fd, AF_INET, lo.index, 24, addr);
+
+  const std::string label = lo.name + ":1";
+  AddrRequest req = NewAddrRequest(AF_INET, 24, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_LOCAL, addr.data(), addr.size());
+  addattr(&req.hdr, sizeof(req), IFA_LABEL, label.c_str(), label.size() + 1);
+  if (IsRunningOnGvisor()) {
+    EXPECT_THAT(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len),
+                PosixErrorIs(EOPNOTSUPP, _));
+    EXPECT_FALSE(
+        ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET, lo.index, 24, addr)));
+    return;
+  }
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+  EXPECT_TRUE(
+      ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET, lo.index, 24, addr)));
+}
+
+// An IPv6 request ignores IFA_LABEL, even one that is too long for IPv4.
+TEST(NetlinkRouteTest, NewAddrIPv6IgnoresLabel) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const std::string addr = AddrBytes(AF_INET6, "2001:db8:1::7");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  Cleanup cleanup = ScopedAddrRemoval(fd, AF_INET6, lo.index, 64, addr);
+
+  const std::string label(IFNAMSIZ, 'x');
+  AddrRequest req = NewAddrRequest(AF_INET6, 64, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_LOCAL, addr.data(), addr.size());
+  addattr(&req.hdr, sizeof(req), IFA_LABEL, label.c_str(), label.size() + 1);
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+  EXPECT_TRUE(
+      ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET6, lo.index, 64, addr)));
+}
+
+// An IPv6 request with an empty IFA_LOCAL fails, and does not use IFA_ADDRESS
+// instead.
+TEST(NetlinkRouteTest, NewAddrIPv6EmptyLocal) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const std::string addr = AddrBytes(AF_INET6, "2001:db8:1::8");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  Cleanup cleanup = ScopedAddrRemoval(fd, AF_INET6, lo.index, 64, addr);
+
+  AddrRequest req = NewAddrRequest(AF_INET6, 64, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_LOCAL, nullptr, 0);
+  addattr(&req.hdr, sizeof(req), IFA_ADDRESS, addr.data(), addr.size());
+  // Linux fails with ERANGE, gVisor with EINVAL.
+  EXPECT_FALSE(
+      NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len).ok());
+  EXPECT_FALSE(
+      ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET6, lo.index, 64, addr)));
+}
+
+// An IPv6 request with two IFA_ADDRESS attributes and no IFA_LOCAL adds only
+// the address in the last one.
+TEST(NetlinkRouteTest, NewAddrIPv6TwoAddresses) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const std::string first = AddrBytes(AF_INET6, "2001:db8:1::9");
+  const std::string last = AddrBytes(AF_INET6, "2001:db8:1::a");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  Cleanup remove_first = ScopedAddrRemoval(fd, AF_INET6, lo.index, 64, first);
+  Cleanup remove_last = ScopedAddrRemoval(fd, AF_INET6, lo.index, 64, last);
+
+  AddrRequest req = NewAddrRequest(AF_INET6, 64, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_ADDRESS, first.data(), first.size());
+  addattr(&req.hdr, sizeof(req), IFA_ADDRESS, last.data(), last.size());
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+  EXPECT_TRUE(
+      ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET6, lo.index, 64, last)));
+  EXPECT_FALSE(
+      ASSERT_NO_ERRNO_AND_VALUE(HasAddr(fd, AF_INET6, lo.index, 64, first)));
+}
+
+// When IFA_LOCAL and IFA_ADDRESS differ, the request adds the IFA_LOCAL
+// address, whatever the order of the attributes.
+TEST_P(NetlinkRouteIpInvariantTest, NewAddrLocalAndPeer) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const int family = GetParam();
+  const int prefixlen = family == AF_INET ? 24 : 64;
+  const std::string local =
+      AddrBytes(family, family == AF_INET ? "192.0.2.8" : "2001:db8:1::b");
+  const std::string peer =
+      AddrBytes(family, family == AF_INET ? "192.0.2.9" : "2001:db8:1::c");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  for (bool local_first : {true, false}) {
+    SCOPED_TRACE(local_first ? "IFA_LOCAL first" : "IFA_ADDRESS first");
+    Cleanup remove_local =
+        ScopedAddrRemoval(fd, family, lo.index, prefixlen, local);
+    Cleanup remove_peer =
+        ScopedAddrRemoval(fd, family, lo.index, prefixlen, peer);
+    AddrRequest req = NewAddrRequest(family, prefixlen, lo.index);
+    for (int type : local_first ? std::vector<int>{IFA_LOCAL, IFA_ADDRESS}
+                                : std::vector<int>{IFA_ADDRESS, IFA_LOCAL}) {
+      const std::string& a = type == IFA_LOCAL ? local : peer;
+      addattr(&req.hdr, sizeof(req), type, a.data(), a.size());
+    }
+    ASSERT_NO_ERRNO(
+        NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+    EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(
+        HasAddr(fd, family, lo.index, prefixlen, local)));
+    EXPECT_FALSE(ASSERT_NO_ERRNO_AND_VALUE(
+        HasAddr(fd, family, lo.index, prefixlen, peer)));
+  }
+}
+
+// An RTM_NEWADDR request with two IFA_LOCAL attributes adds only the address
+// in the last one.
+TEST_P(NetlinkRouteIpInvariantTest, NewAddrTwoLocals) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Netstack state is not restored.
+  const DisableSave ds;
+
+  const int family = GetParam();
+  const int prefixlen = family == AF_INET ? 24 : 64;
+  const std::string first =
+      AddrBytes(family, family == AF_INET ? "192.0.2.5" : "2001:db8:1::5");
+  const std::string last =
+      AddrBytes(family, family == AF_INET ? "192.0.2.6" : "2001:db8:1::6");
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  const Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  AddrRequest req = NewAddrRequest(family, prefixlen, lo.index);
+  addattr(&req.hdr, sizeof(req), IFA_LOCAL, first.data(), first.size());
+  addattr(&req.hdr, sizeof(req), IFA_LOCAL, last.data(), last.size());
+  Cleanup remove_first =
+      ScopedAddrRemoval(fd, family, lo.index, prefixlen, first);
+  Cleanup remove_last =
+      ScopedAddrRemoval(fd, family, lo.index, prefixlen, last);
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(
+      HasAddr(fd, family, lo.index, prefixlen, last)));
+  EXPECT_FALSE(ASSERT_NO_ERRNO_AND_VALUE(
+      HasAddr(fd, family, lo.index, prefixlen, first)));
+}
+
 // The prefix route that adding or removing an address implies is announced to
 // the route group with port ID 0 and sequence number 0, since the kernel adds
 // and removes it (fib_magic, addrconf_prefix_route) rather than the request.
