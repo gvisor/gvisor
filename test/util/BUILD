@@ -53,6 +53,19 @@ cc_library(
 )
 
 cc_library(
+    name = "fuse_util",
+    testonly = 1,
+    srcs = ["fuse_util.cc"],
+    hdrs = ["fuse_util.h"],
+    deps = select_gtest() + [
+        ":file_descriptor",
+        ":posix_error",
+        ":test_util",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_library(
     name = "io_uring_util",
     testonly = 1,
     srcs = ["io_uring_util.cc"],

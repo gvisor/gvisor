@@ -459,24 +459,36 @@ func (fd *FileDescription) ProcessSubmission(t *kernel.Task, sqe *linux.IOUringS
 		// For the NOP operation, we don't do anything special.
 	case linux.IORING_OP_READV:
 		retValue, cqeErr = fd.handleReadv(t, sqe, flags)
-		if cqeErr == io.EOF {
-			// Don't raise EOF as errno, error translation will fail. Short
-			// reads aren't failures.
-			cqeErr = nil
-		}
 	default: // Unsupported operation
 		retValue = -int32(linuxerr.EINVAL.Errno())
 	}
 
-	if cqeErr != nil {
-		retValue = -int32(kernel.ExtractErrno(cqeErr, -1))
-	}
-
 	return &linux.IOUringCqe{
 		UserData: sqe.UserData,
-		Res:      retValue,
+		Res:      completionResult(retValue, cqeErr),
 		Flags:    cqeFlags,
 	}
+}
+
+// completionResult returns the CQE result for an operation that transferred n
+// bytes and returned err.
+func completionResult(n int32, err error) int32 {
+	if n > 0 || err == nil || err == io.EOF {
+		// Linux reports bytes already transferred rather than the error
+		// that ended the transfer (->read_iter(), io_fixup_rw_res()). EOF
+		// indicates a short read, not an errno.
+		return n
+	}
+	errno := kernel.ExtractErrno(err, -1)
+	switch errno {
+	case int(linuxerr.ERESTARTSYS.Errno()), int(linuxerr.ERESTARTNOINTR.Errno()),
+		int(linuxerr.ERESTARTNOHAND.Errno()), int(linuxerr.ERESTART_RESTARTBLOCK.Errno()):
+		// A request can't be restarted like a syscall, since requests
+		// submitted earlier may already be in progress. As in Linux's
+		// io_fixup_restart_res(), complete it with EINTR instead.
+		errno = int(linuxerr.EINTR.Errno())
+	}
+	return -int32(errno)
 }
 
 // handleReadv handles IORING_OP_READV.
@@ -508,11 +520,7 @@ func (fd *FileDescription) handleReadv(t *kernel.Task, sqe *linux.IOUringSqe, fl
 	}
 	defer file.DecRef(t)
 	n, err := file.PRead(t, dst, 0, vfs.ReadOptions{})
-	if err != nil {
-		return 0, err
-	}
-
-	return int32(n), nil
+	return int32(n), err
 }
 
 // updateCq updates a completion queue by adding a given completion queue entry.

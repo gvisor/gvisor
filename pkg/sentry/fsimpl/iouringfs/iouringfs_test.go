@@ -16,10 +16,13 @@ package iouringfs
 
 import (
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"strings"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
@@ -138,6 +141,51 @@ func TestUint32PtrAtOffsetInvalidOffsets(t *testing.T) {
 			_ = atomicUint32AtOffset(buf, tt.offset)
 
 			t.Errorf("Didn't get expected panic")
+		})
+	}
+}
+
+func TestCompletionResult(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int32
+		err  error
+		want int32
+	}{
+		{name: "success", n: 4096, want: 4096},
+		{name: "empty", want: 0},
+		{name: "eof", err: io.EOF, want: 0},
+		{name: "short_read", n: 128, err: io.EOF, want: 128},
+		{name: "restart_sys", err: linuxerr.ERESTARTSYS, want: -4},
+		{name: "restart_nointr", err: linuxerr.ERESTARTNOINTR, want: -4},
+		{name: "restart_nohand", err: linuxerr.ERESTARTNOHAND, want: -4},
+		{name: "restart_block", err: linuxerr.ERESTART_RESTARTBLOCK, want: -4},
+		{name: "interrupted", err: linuxerr.EINTR, want: -4},
+		{name: "io_error", err: linuxerr.EIO, want: -5},
+		{name: "bad_fd", err: linuxerr.EBADF, want: -9},
+		{name: "bad_address", err: linuxerr.EFAULT, want: -14},
+		{name: "would_block", err: linuxerr.EAGAIN, want: -11},
+		{name: "partial_then_fault", n: 6, err: linuxerr.EFAULT, want: 6},
+		{name: "partial_then_restart", n: 6, err: linuxerr.ERESTARTSYS, want: 6},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := completionResult(test.n, test.err); got != test.want {
+				t.Errorf("completionResult(%d, %v) = %d, want %d", test.n, test.err, got, test.want)
+			}
+			if test.err == nil || test.err == io.EOF {
+				return
+			}
+			// File operations may wrap errno values. Normalize after extracting
+			// the errno so wrapped restart errors cannot escape into a CQE.
+			wrapped := &os.PathError{
+				Op:   "read",
+				Path: "file",
+				Err:  &os.SyscallError{Syscall: "pread", Err: test.err},
+			}
+			if got := completionResult(test.n, wrapped); got != test.want {
+				t.Errorf("completionResult(%d, %v) = %d, want %d", test.n, wrapped, got, test.want)
+			}
 		})
 	}
 }

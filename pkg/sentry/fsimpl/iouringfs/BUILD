@@ -36,5 +36,8 @@ go_test(
     size = "small",
     srcs = ["iouringfs_test.go"],
     embed = [":iouringfs"],
-    deps = ["//pkg/hostarch"],
+    deps = [
+        "//pkg/errors/linuxerr",
+        "//pkg/hostarch",
+    ],
 )
