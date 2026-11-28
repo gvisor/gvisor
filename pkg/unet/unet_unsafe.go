@@ -94,10 +94,6 @@ func (r *SocketReader) ReadVec(bufs [][]byte) (int, error) {
 	iovecs, length := buildIovec(bufs, make([]unix.Iovec, 0, 2))
 
 	var msg unix.Msghdr
-	if len(r.source) != 0 {
-		msg.Name = &r.source[0]
-		msg.Namelen = uint32(len(r.source))
-	}
 
 	if len(r.ControlMessage) != 0 {
 		msg.Control = &r.ControlMessage[0]
@@ -154,10 +150,6 @@ func (r *SocketReader) ReadVec(bufs [][]byte) (int, error) {
 		r.ControlMessage = r.ControlMessage[:msg.Controllen]
 	}
 
-	if msg.Namelen < uint32(len(r.source)) {
-		r.source = r.source[:msg.Namelen]
-	}
-
 	// All unet sockets are SOCK_STREAM or SOCK_SEQPACKET, both of which
 	// indicate that the other end is closed by returning a 0 length read
 	// with no error.
@@ -190,10 +182,6 @@ func (w *SocketWriter) WriteVec(bufs [][]byte) (int, error) {
 	}
 
 	var msg unix.Msghdr
-	if len(w.to) != 0 {
-		msg.Name = &w.to[0]
-		msg.Namelen = uint32(len(w.to))
-	}
 
 	if len(w.ControlMessage) != 0 {
 		msg.Control = &w.ControlMessage[0]
@@ -240,47 +228,4 @@ func (w *SocketWriter) WriteVec(bufs [][]byte) (int, error) {
 		}
 	}
 	// Unreachable, no s.gate.Leave needed.
-}
-
-// getsockopt issues a getsockopt unix.
-func getsockopt(fd int, level int, optname int, buf []byte) (uint32, error) {
-	l := uint32(len(buf))
-	_, _, e := unix.RawSyscall6(unix.SYS_GETSOCKOPT, uintptr(fd), uintptr(level), uintptr(optname), uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&l)), 0)
-	if e != 0 {
-		return 0, e
-	}
-
-	return l, nil
-}
-
-// setsockopt issues a setsockopt unix.
-func setsockopt(fd int, level int, optname int, buf []byte) error {
-	_, _, e := unix.RawSyscall6(unix.SYS_SETSOCKOPT, uintptr(fd), uintptr(level), uintptr(optname), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0)
-	if e != 0 {
-		return e
-	}
-
-	return nil
-}
-
-// getsockname issues a getsockname unix.
-func getsockname(fd int, buf []byte) (uint32, error) {
-	l := uint32(len(buf))
-	_, _, e := unix.RawSyscall(unix.SYS_GETSOCKNAME, uintptr(fd), uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&l)))
-	if e != 0 {
-		return 0, e
-	}
-
-	return l, nil
-}
-
-// getpeername issues a getpeername unix.
-func getpeername(fd int, buf []byte) (uint32, error) {
-	l := uint32(len(buf))
-	_, _, e := unix.RawSyscall(unix.SYS_GETPEERNAME, uintptr(fd), uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&l)))
-	if e != 0 {
-		return 0, e
-	}
-
-	return l, nil
 }
