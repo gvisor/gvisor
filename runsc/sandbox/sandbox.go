@@ -1591,7 +1591,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	if err != nil {
 		return err
 	}
-	cmd.Args = append(cmd.Args, "--total-host-memory", strconv.FormatUint(totalSysMem, 10))
 
 	mem := totalSysMem
 	if s.CgroupJSON.Cgroup != nil {

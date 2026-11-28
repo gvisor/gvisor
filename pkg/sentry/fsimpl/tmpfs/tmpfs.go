@@ -198,21 +198,22 @@ type FilesystemOpts struct {
 	SourceTarFSCheckpoint bool
 }
 
-// Amount of total physical RAM, in bytes. It is immutable after initialization.
-var totalHostMem uint64
+// Total memory, in bytes, as set by SetTotalMem. It is immutable after
+// initialization.
+var totalMem uint64
 
-// SetTotalHostMem tells the tmpfs implementation how much physical RAM is available,
-// which is used to calculate size limits for tmpfs mounts. For tmpfs mounts that do
-// not specify a size= mount option, the default is 50% of the available memory.
-// Userspace can also specify a percentage in terms of this value.
-func SetTotalHostMem(hostMem uint64) {
-	totalHostMem = hostMem
+// SetTotalMem sets the total memory, in bytes, that tmpfs uses to calculate
+// size limits. This must be the same value that the Sentry reports
+// as total memory in sysinfo(2) and /proc/meminfo. For tmpfs mounts that do not
+// specify a size= mount option, the default is 50% of this value. Userspace
+// can also specify a percentage of this value.
+func SetTotalMem(mem uint64) {
+	totalMem = mem
 }
 
 func getDefaultSizeLimit(disable bool) uint64 {
-	// As per tmpfs(5), the default size limit is 50% of total physical RAM.
-	// See mm/shmem.c:shmem_default_max_blocks().
-	defaultSizeLimit := totalHostMem / 2
+	// The default size limit is 50% of total memory.
+	defaultSizeLimit := totalMem / 2
 
 	if disable || defaultSizeLimit == 0 {
 		// The size limit is used to populate statfs(2) results. If Linux tmpfs is
@@ -230,7 +231,7 @@ func getDefaultInodeLimit(disable bool) uint64 {
 		return 0
 	}
 
-	return (totalHostMem >> hostarch.PageShift) / 2
+	return (totalMem >> hostarch.PageShift) / 2
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -1380,10 +1381,10 @@ func parseSize(s string) (uint64, bool, error) {
 		count = count << 10
 		s = s[:len(s)-1]
 	case '%':
-		if totalHostMem == 0 {
+		if totalMem == 0 {
 			return 0, false, fmt.Errorf("could not determine size limit as total system memory is unknown")
 		}
-		count *= totalHostMem / 100
+		count *= totalMem / 100
 		s = s[:len(s)-1]
 		percentageUsed = true
 	}

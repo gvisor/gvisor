@@ -541,8 +541,6 @@ type Args struct {
 	// TotalMem is the initial amount of total memory to report back to the
 	// container.
 	TotalMem uint64
-	// TotalHostMem is the total memory reported by host /proc/meminfo.
-	TotalHostMem uint64
 	// UserLogFD is the file descriptor to write user logs to.
 	UserLogFD int
 	// ProductName is the value to show in
@@ -905,16 +903,13 @@ func New(args Args) (*Loader, error) {
 	}
 	args.StartupTimer.Reached("network stack created")
 
-	if args.TotalHostMem > 0 {
-		// tmpfs needs to know the amount of total physical RAM to calculate size limits.
-		tmpfs.SetTotalHostMem(args.TotalHostMem)
-	}
-
 	if args.TotalMem > 0 {
 		// Adjust the total memory returned by the Sentry so that applications that
 		// use /proc/meminfo can make allocations based on this limit.
 		usage.MinimumTotalMemoryBytes = args.TotalMem
 		usage.MaximumTotalMemoryBytes = args.TotalMem
+		// tmpfs size limits derive from the same total memory.
+		tmpfs.SetTotalMem(args.TotalMem)
 		log.Infof("Setting total memory to %.2f GB", float64(args.TotalMem)/(1<<30))
 	}
 
