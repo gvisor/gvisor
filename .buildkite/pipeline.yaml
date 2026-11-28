@@ -90,17 +90,6 @@ steps:
     agents:
       queue: "default"
 
-  # Run ARM64 smoke tests alongside the other tests. Ideally, this would run
-  # in first-pass.yaml with the AMD64 smoke tests, but ARM64 agent capacity is
-  # severely limited.
-  - <<: *common
-    <<: *source_test
-    label: ":fire: Smoke tests (ARM64)"
-    command: make smoke-tests
-    agents:
-      arch: "arm64"
-      queue: "arm64"
-
   - <<: *common
     <<: *source_test
     label: ":speedboat: Compile runsc-plugin-stack (AMD64)"

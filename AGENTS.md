@@ -241,13 +241,17 @@ each commit and sign it off after your last change to it, including when you
 amend a commit that is already signed off. Do not push commits for review
 before then.
 
-### Buildkite CI results
+### CI results
 
-CI runs on Buildkite. The main pipeline is
+Some checks, such as `make lint` and the smoke tests, run in GitHub Actions.
+Use `gh pr checks` to read their results on a PR, and `gh run list` and
+`gh run view` for pushed branches.
+
+The other checks run on Buildkite. The main pipeline is
 `https://buildkite.com/gvisor/pipeline`; other pipelines, such as `release`, are
 in the same `gvisor` organization. The public pipelines need no Buildkite token.
-Use `tools/buildkite/buildkite.py` to read build results; do not scrape the
-Buildkite web pages.
+Use `tools/buildkite/buildkite.py` to read Buildkite build results; do not
+scrape the Buildkite web pages.
 
 `tools/buildkite/buildkite.py failed BUILD [REGEX]` prints the failed jobs of a
 build as JSON. `BUILD` is one of:
