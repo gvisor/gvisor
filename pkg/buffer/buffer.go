@@ -289,6 +289,26 @@ func (b *Buffer) Append(src *View) error {
 	return nil
 }
 
+// AppendCopy copies p to the end of b, filling the unused capacity of the last
+// chunk when b is its only owner. Any remaining bytes go in a new chunk of at
+// least minCap bytes, and AppendCopy returns that new chunk's capacity (0 if
+// no chunk was allocated).
+func (b *Buffer) AppendCopy(p []byte, minCap int) int {
+	if v := b.data.Back(); !v.Full() && !v.sharesChunk() {
+		n := copy(v.chunk.data[v.write:], p)
+		v.write += n
+		b.size += int64(n)
+		p = p[n:]
+	}
+	if len(p) == 0 {
+		return 0
+	}
+	v := NewView(max(len(p), minCap))
+	v.Write(p)
+	b.appendOwned(v)
+	return len(v.chunk.data)
+}
+
 func (b *Buffer) appendOwned(v *View) {
 	b.data.PushBack(v)
 	b.size += int64(v.Size())
@@ -441,7 +461,17 @@ func (b *Buffer) Apply(fn func(*View)) {
 
 // SubApply applies fn to a given range of data in b. Any part of the range
 // outside of b is ignored.
+// SubApply calls fn on a length-byte range of views starting at offset.
 func (b *Buffer) SubApply(offset, length int, fn func(*View)) {
+	b.SubApplyUntil(offset, length, func(v *View) bool {
+		fn(v)
+		return true
+	})
+}
+
+// SubApplyUntil calls fn on a length-byte range of views starting at offset,
+// stopping early if fn returns false.
+func (b *Buffer) SubApplyUntil(offset, length int, fn func(*View) bool) {
 	for v := b.data.Front(); length > 0 && v != nil; v = v.Next() {
 		if offset >= v.Size() {
 			offset -= v.Size()
@@ -455,9 +485,12 @@ func (b *Buffer) SubApply(offset, length int, fn func(*View)) {
 		if length < d.Size() {
 			d.write = d.read + length
 		}
-		fn(d)
+		cont := fn(d)
 		length -= d.Size()
 		d.Release()
+		if !cont {
+			return
+		}
 	}
 }
 

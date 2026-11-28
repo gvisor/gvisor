@@ -804,6 +804,114 @@ func TestSaveRestoreBuffer(t *testing.T) {
 	}
 }
 
+func TestAppendCopy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// initial is written to a view of baseChunkSize bytes; with no initial
+		// data the buffer starts empty, without a view.
+		initial []byte
+		// clone appends to a clone that shares the initial chunk.
+		clone     bool
+		p         []byte
+		minCap    int
+		wantViews int
+		// wantFree is the minimum unused capacity of the last view.
+		wantFree int
+		// wantAlloc reports whether AppendCopy must allocate a new chunk.
+		wantAlloc bool
+	}{
+		{
+			name:      "FillsLastChunk",
+			initial:   []byte("ab"),
+			p:         []byte("cd"),
+			minCap:    1024,
+			wantViews: 1,
+		},
+		{
+			name:      "SpillsIntoMinCapChunk",
+			initial:   make([]byte, baseChunkSize-1),
+			p:         []byte("xyz"),
+			minCap:    300,
+			wantViews: 2,
+			wantFree:  300 - 2,
+			wantAlloc: true,
+		},
+		{
+			name:      "DoesNotWriteSharedChunk",
+			initial:   []byte("ab"),
+			clone:     true,
+			p:         []byte("cd"),
+			wantViews: 2,
+			wantAlloc: true,
+		},
+		{
+			name:      "Empty",
+			p:         []byte("ab"),
+			wantViews: 1,
+			wantAlloc: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var original Buffer
+			if len(tc.initial) > 0 {
+				v := NewView(baseChunkSize)
+				v.Write(tc.initial)
+				original = MakeWithView(v)
+			}
+			defer original.Release()
+			b := &original
+			var sharedChunk []byte
+			if tc.clone {
+				clone := original.Clone()
+				defer clone.Release()
+				b = &clone
+				sharedChunk = bytes.Clone(original.data.Front().chunk.data)
+			}
+
+			gotAlloc := b.AppendCopy(tc.p, tc.minCap)
+			if tc.wantAlloc {
+				if wantMin := max(len(tc.p), tc.minCap); gotAlloc < wantMin {
+					t.Errorf("AppendCopy() allocated = %d, want >= %d", gotAlloc, wantMin)
+				}
+			} else if gotAlloc != 0 {
+				t.Errorf("AppendCopy() allocated = %d, want 0", gotAlloc)
+			}
+
+			if got, want := b.Flatten(), append(bytes.Clone(tc.initial), tc.p...); !bytes.Equal(got, want) {
+				t.Errorf("Flatten() = %q, want %q", got, want)
+			}
+			if got := b.data.Len(); got != tc.wantViews {
+				t.Errorf("got %d views, want %d", got, tc.wantViews)
+			}
+			if got := b.data.Back().AvailableSize(); got < tc.wantFree {
+				t.Errorf("last view has %d bytes free, want at least %d", got, tc.wantFree)
+			}
+			if tc.clone && !bytes.Equal(original.data.Front().chunk.data, sharedChunk) {
+				t.Error("AppendCopy wrote to a chunk shared with another buffer")
+			}
+		})
+	}
+}
+
+func TestSubApplyUntil(t *testing.T) {
+	var b Buffer
+	defer b.Release()
+	for _, s := range []string{"aaaa", "bbbb", "cccc"} {
+		v := NewView(len(s))
+		v.Write([]byte(s))
+		b.appendOwned(v)
+	}
+
+	var visited []string
+	b.SubApplyUntil(2, int(b.Size())-2, func(v *View) bool {
+		visited = append(visited, string(v.AsSlice()))
+		return len(visited) < 2
+	})
+	if want := []string{"aa", "bbbb"}; len(visited) != len(want) || visited[0] != want[0] || visited[1] != want[1] {
+		t.Errorf("visited = %q, want %q", visited, want)
+	}
+}
+
 func TestGrowBufferCloned(t *testing.T) {
 	original := MakeWithData([]byte("abcd"))
 	defer original.Release()

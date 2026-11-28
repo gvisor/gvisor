@@ -413,6 +413,13 @@ type Endpoint struct {
 	// +checklocks:mu
 	rcvQueue segmentList `state:"wait"`
 
+	// rcvCoalesceChunkCap is the minimum chunk capacity for the next spill in
+	// coalesceLocked. It resets when a new tail segment is pushed and doubles on
+	// each spill up to SegOverheadSize.
+	//
+	// +checklocks:rcvQueueMu
+	rcvCoalesceChunkCap int
+
 	// state must be read/set using the EndpointState()/setEndpointState()
 	// methods.
 	state atomicbitops.Uint32 `state:".(EndpointState)"`
@@ -3197,13 +3204,46 @@ func (e *Endpoint) readyToRead(s *segment) {
 	e.rcvQueueMu.Lock()
 	if s != nil {
 		e.RcvBufUsed += s.payloadSize()
-		s.IncRef()
-		e.rcvQueue.PushBack(s)
+		if !e.coalesceLocked(s) {
+			s.IncRef()
+			e.rcvQueue.PushBack(s)
+			e.rcvCoalesceChunkCap = 0
+		}
 	} else {
 		e.RcvClosed = true
 	}
 	e.rcvQueueMu.Unlock()
 	e.waiterQueue.Notify(waiter.ReadableEvents)
+}
+
+// coalesceLocked appends the payload of s to the last segment in the receive
+// queue when s is smaller than the per-segment overhead, charging only the
+// payload, like Linux's tcp_try_coalesce. It doesn't append to the front
+// segment, whose charge Read releases only once it is fully read. It reports
+// whether s was consumed.
+//
+// +checklocks:e.mu
+// +checklocks:e.rcvQueueMu
+func (e *Endpoint) coalesceLocked(s *segment) bool {
+	n := s.payloadSize()
+	if n >= SegOverheadSize {
+		return false
+	}
+	tail := e.rcvQueue.Back()
+	if tail == nil || tail == e.rcvQueue.Front() || tail.payloadSize()+n > int(e.amss) {
+		return false
+	}
+	// Copy rather than merge: s's chunk is sized for the arriving packet and
+	// may be shared with the sender. Start with the smallest chunk that fits s,
+	// then grow geometrically on subsequent spills up to SegOverheadSize so a
+	// single trailing delimiter after a large record does not retain a large
+	// empty chunk while a run of small segments shares chunks.
+	if allocated := tail.pkt.Data().AppendCopy(s.pkt.Data(), e.rcvCoalesceChunkCap); allocated > 0 {
+		e.rcvCoalesceChunkCap = min(allocated*2, SegOverheadSize)
+	}
+	tail.dataMemSize += n
+	e.updateReceiveMemUsed(n)
+	return true
 }
 
 // receiveBufferAvailableLocked calculates how many bytes are still available

@@ -654,19 +654,17 @@ func (d PacketData) ReadTo(dst io.Writer, peek bool) (int, error) {
 		done int
 	)
 	offset := d.pk.dataOffset()
-	d.pk.buf.SubApply(offset, int(d.pk.buf.Size())-offset, func(v *buffer.View) {
-		if err != nil {
-			return
-		}
+	d.pk.buf.SubApplyUntil(offset, int(d.pk.buf.Size())-offset, func(v *buffer.View) bool {
 		var n int
 		n, err = dst.Write(v.AsSlice())
 		done += n
 		if err != nil {
-			return
+			return false
 		}
 		if n != v.Size() {
 			panic(fmt.Sprintf("io.Writer.Write succeeded with incomplete write: %d != %d", n, v.Size()))
 		}
+		return true
 	})
 	if !peek && done != 0 {
 		d.TrimFront(done)
@@ -693,6 +691,17 @@ func (d PacketData) ToBuffer() buffer.Buffer {
 // AppendView appends v into d, taking the ownership of v.
 func (d PacketData) AppendView(v *buffer.View) {
 	d.pk.buf.Append(v)
+}
+
+// AppendCopy copies the data of src to the end of d without referencing src's
+// chunks. See buffer.Buffer.AppendCopy for minCap and the returned capacity.
+func (d PacketData) AppendCopy(src PacketData, minCap int) int {
+	offset := src.pk.dataOffset()
+	var allocated int
+	src.pk.buf.SubApply(offset, int(src.pk.buf.Size())-offset, func(v *buffer.View) {
+		allocated = max(allocated, d.pk.buf.AppendCopy(v.AsSlice(), minCap))
+	})
+	return allocated
 }
 
 // MergeBuffer merges b into d and clears b.
