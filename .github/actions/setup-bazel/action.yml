@@ -1,0 +1,23 @@
+name: Set up Bazel caches
+description: Restore Bazel caches for native and Docker-wrapped builds.
+runs:
+  using: composite
+  steps:
+  - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+    with:
+      path: |
+        ~/.cache/bazelisk
+        ~/.cache/bazel-disk
+        ~/.cache/bazel-repo
+      key: bazel-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+      restore-keys: bazel-${{ runner.os }}-${{ runner.arch }}-
+  - name: Configure native and Docker caches
+    shell: bash
+    run: |
+      mkdir -p "$HOME/.cache/bazel-disk" "$HOME/.cache/bazel-repo"
+      printf 'build --disk_cache="%s"\ncommon --repository_cache="%s"\n' \
+        "$HOME/.cache/bazel-disk" "$HOME/.cache/bazel-repo" >> "$HOME/.bazelrc"
+      {
+        echo "BAZEL_DISK_CACHE=$HOME/.cache/bazel-disk"
+        echo "BAZEL_REPOSITORY_CACHE=$HOME/.cache/bazel-repo"
+      } >> "$GITHUB_ENV"
