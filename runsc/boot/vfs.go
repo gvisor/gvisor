@@ -777,6 +777,7 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		// tmpfs size limit.
 		DisableDefaultSizeLimit: true,
 		TarNanosecondTimestamps: conf.TarTimestampResolution == config.TarTimestampNanoseconds,
+		OverlayUpper:            true,
 	}
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.

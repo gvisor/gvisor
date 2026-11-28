@@ -664,11 +664,11 @@ func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, e
 // TarUpperLayer implements vfs.TarSerializer.TarUpperLayer.
 func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 	upperFS := fs.opts.UpperRoot.Mount().Filesystem()
-	ts, ok := upperFS.Impl().(vfs.TarSerializer)
+	ts, ok := upperFS.Impl().(vfs.OverlayUpperTarSerializer)
 	if !ok {
-		return fmt.Errorf("upper layer is of type %q, which does not implement vfs.TarSerializer", upperFS.FilesystemType().Name())
+		return fmt.Errorf("upper layer is of type %q, which does not implement vfs.OverlayUpperTarSerializer", upperFS.FilesystemType().Name())
 	}
-	return ts.TarUpperLayer(ctx, outFD)
+	return ts.TarOverlayUpper(ctx, outFD)
 }
 
 // dentry implements vfs.DentryImpl.

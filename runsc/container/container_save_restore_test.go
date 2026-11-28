@@ -2034,6 +2034,104 @@ func copyCheckpointFiles(t *testing.T, srcDir, dstPrefix string, names []string)
 	return dstDir
 }
 
+// TestTarRootfsUpperLayerSocketHidesLower verifies that a unix socket bound at
+// the path of a deleted lower layer file keeps that file hidden after the
+// upper layer is serialized to tar and restored.
+func TestTarRootfsUpperLayerSocketHidesLower(t *testing.T) {
+	// guestOverlayInit pivots into an overlay of the root whose upper layer
+	// is a tmpfs that the container mounts itself, then creates /pivoted.
+	const guestOverlayInit = `set -e
+mkdir /ovl /ovl/upper /ovl/root
+mount -t tmpfs tmpfs /ovl/upper
+mount -t overlay overlay -o lowerdir=/,upperdir=/ovl/upper /ovl/root
+cd /ovl/root
+mkdir old
+/usr/sbin/pivot_root . old
+cd /
+touch /pivoted
+exec sleep 1000`
+	for _, tc := range []struct {
+		name string
+		args []string
+		// pivoted is true if args runs guestOverlayInit.
+		pivoted bool
+	}{
+		{
+			name: "RootfsOverlay",
+			args: []string{"sleep", "1000"},
+		},
+		{
+			name:    "GuestOverlay",
+			args:    []string{"/bin/sh", "-c", guestOverlayInit},
+			pivoted: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := testutil.TestConfig(t)
+			conf.Overlay2.Set("root:memory")
+
+			spec := testutil.NewSpecWithArgs(tc.args...)
+			spec.Root.Readonly = false
+
+			app, err := testutil.FindFile("test/cmd/test_app/test_app")
+			if err != nil {
+				t.Fatalf("error finding test_app: %v", err)
+			}
+
+			cont := startContainer(t, conf, spec, setupBundle(t, conf, spec), nil)
+			if tc.pivoted {
+				if err := testutil.Poll(func() error {
+					_, err := executeCombinedOutput(conf, cont, nil, "/bin/test", "-e", "/pivoted")
+					return err
+				}, 10*time.Second); err != nil {
+					t.Fatalf("container root never became the guest overlay: %v", err)
+				}
+			}
+
+			const path = "/usr/bin/true"
+			const check = `if [ -S "$1" ]; then echo socket; elif [ -e "$1" ] || [ -L "$1" ]; then echo file; else echo absent; fi`
+			stat := func(c *Container) string {
+				t.Helper()
+				out, err := executeCombinedOutput(conf, c, nil, "/bin/sh", "-c", check, "sh", path)
+				if err != nil {
+					t.Fatalf("error checking %s: %v, output: %s", path, err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			if got := stat(cont); got != "file" {
+				t.Fatalf("%s in lower layer is %q, want file", path, got)
+			}
+			if out, err := executeCombinedOutput(conf, cont, nil, "/bin/rm", path); err != nil {
+				t.Fatalf("error removing %s: %v, output: %s", path, err, out)
+			}
+			if out, err := executeCombinedOutput(conf, cont, nil, app, "uds-bind", path); err != nil {
+				t.Fatalf("error binding socket at %s: %v, output: %s", path, err, out)
+			}
+			if got := stat(cont); got != "socket" {
+				t.Fatalf("%s after bind is %q, want socket", path, got)
+			}
+
+			tarFile, err := os.CreateTemp(testutil.TmpDir(), "tarfile-socket-*.tar")
+			if err != nil {
+				t.Fatalf("error creating temp file: %v", err)
+			}
+			defer os.Remove(tarFile.Name())
+			defer tarFile.Close()
+			if err := cont.TarRootfsUpperLayer(tarFile); err != nil {
+				t.Fatalf("error serializing rootfs upper layer to tar: %v", err)
+			}
+			restoredSpec, _ := sleepSpecConf(t)
+			restoredSpec.Root.Readonly = false
+			restoredSpec.Annotations[specutils.AnnotationRootfsUpperTar] = tarFile.Name()
+			conf.AllowRootfsTarAnnotation = true
+			restored := startContainer(t, conf, restoredSpec, setupBundle(t, conf, restoredSpec), nil)
+			if got := stat(restored); got != "absent" {
+				t.Errorf("%s in restored container is %q, want absent", path, got)
+			}
+		})
+	}
+}
+
 // TestPartialSplitFSCheckpointRestore tests that only the mounts listed in
 // SplitFSCheckpointPaths are saved into the filesystem image, while the
 // remaining ones are saved with the Sentry state:

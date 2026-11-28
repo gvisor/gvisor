@@ -136,6 +136,9 @@ type filesystem struct {
 	// immutable.
 	tarNanosecondTimestamps bool
 
+	// overlayUpper is FilesystemOpts.OverlayUpper. It is immutable.
+	overlayUpper bool
+
 	// ovlWhiteout is the shared overlay whiteout device. It is protected by mu.
 	ovlWhiteout *deviceFile
 }
@@ -187,6 +190,12 @@ type FilesystemOpts struct {
 	// TarNanosecondTimestamps makes tar archives of this filesystem keep
 	// nanosecond modification times. Otherwise they are rounded to seconds.
 	TarNanosecondTimestamps bool
+
+	// OverlayUpper indicates that this filesystem is the upper layer of an
+	// overlay. Filesystem checkpoints of it then record sockets as
+	// whiteouts, since a socket cannot be archived but may hide a file in a
+	// lower layer.
+	OverlayUpper bool
 
 	// SourceTar is the source tar file to be untarred into the tmpfs.
 	// Ownership is transferred to GetFilesystem, whether or not it returns an
@@ -435,6 +444,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		allowXattrPrefix: allowXattrPrefix,
 	}
 	fs.tarNanosecondTimestamps = tmpfsOpts.TarNanosecondTimestamps
+	fs.overlayUpper = tmpfsOpts.OverlayUpper
 	fs.vfsfs.Init(vfsObj, newFSType, &fs)
 	if tmpfsOptsOk && tmpfsOpts.MaxFilenameLen > 0 {
 		fs.maxFilenameLen = tmpfsOpts.MaxFilenameLen

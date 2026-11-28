@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -41,7 +42,7 @@ func TestTarSubsecondMtimeRoundTrip(t *testing.T) {
 		fs.tarNanosecondTimestamps = nanos
 		fs.root.inode.impl.(*directory).childMap["file"].inode.mtime.Store(mtime.UnixNano())
 		var out bytes.Buffer
-		if err := fs.tarWrite(ctx, &out, tarDefaultWriterCallbacks{}); err != nil {
+		if err := fs.tarWrite(ctx, &out, false /* overlayUpper */, tarDefaultWriterCallbacks{}); err != nil {
 			t.Fatalf("tarWrite: %v", err)
 		}
 		want := mtime.Round(time.Second).UnixNano()
@@ -63,7 +64,7 @@ func TestTarXattrRoundTrip(t *testing.T) {
 	}
 	d := dentry{inode: &inode{fs: &filesystem{}, impl: &directory{}}}
 	d.inode.xattrs.SetRawXattrs(want)
-	hdr, err := d.createTarHeader("./", make(map[uint64]string), tarDefaultWriterCallbacks{})
+	hdr, err := d.createTarHeader("./", make(map[uint64]string), false /* overlayUpper */, tarDefaultWriterCallbacks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +235,7 @@ func TestTarRegularFileRoundTrip(t *testing.T) {
 			fs := mountFromTarTestOnly(t, ctx, tarWithFile(t, "./file", want))
 
 			var out bytes.Buffer
-			if err := fs.tarWrite(ctx, &out, tarDefaultWriterCallbacks{}); err != nil {
+			if err := fs.tarWrite(ctx, &out, false /* overlayUpper */, tarDefaultWriterCallbacks{}); err != nil {
 				t.Fatalf("tarWrite: %v", err)
 			}
 			if got := readFileFromTar(t, &out, "./file"); !bytes.Equal(got, want) {
@@ -294,7 +295,7 @@ func TestTarRegularFileSizeChange(t *testing.T) {
 				}
 				resized = true
 			}}
-			if err := fs.tarWrite(ctx, dst, tarDefaultWriterCallbacks{}); err != nil {
+			if err := fs.tarWrite(ctx, dst, false /* overlayUpper */, tarDefaultWriterCallbacks{}); err != nil {
 				t.Fatalf("tarWrite: %v", err)
 			}
 			if resized {
@@ -329,7 +330,7 @@ func TestTarRegularFileAllocation(t *testing.T) {
 
 	// Discard the archive so that only archiving is measured.
 	runtime.ReadMemStats(&before)
-	if err := fs.tarWrite(ctx, io.Discard, tarDefaultWriterCallbacks{}); err != nil {
+	if err := fs.tarWrite(ctx, io.Discard, false /* overlayUpper */, tarDefaultWriterCallbacks{}); err != nil {
 		t.Fatalf("tarWrite: %v", err)
 	}
 	runtime.ReadMemStats(&after)
@@ -407,7 +408,7 @@ func TestSourceTarDiscardsTrailingData(t *testing.T) {
 			}
 
 			var out bytes.Buffer
-			if err := fs.tarWrite(ctx, &out, tarDefaultWriterCallbacks{}); err != nil {
+			if err := fs.tarWrite(ctx, &out, false /* overlayUpper */, tarDefaultWriterCallbacks{}); err != nil {
 				t.Fatalf("tarWrite: %v", err)
 			}
 			if got := readFileFromTar(t, &out, "./f"); !bytes.Equal(got, want) {
@@ -467,5 +468,162 @@ func TestSourceTarRestoreFailureSkipsTrailingData(t *testing.T) {
 	}
 	if n := src.Len(); n != tailLen {
 		t.Errorf("SourceTar has %d unread bytes after the failed restore, want %d", n, tailLen)
+	}
+}
+
+// addSocketTestOnly adds a socket to fs's root under each of names, hard
+// linked, with an xattr set on it.
+func addSocketTestOnly(t *testing.T, fs *filesystem, names ...string) {
+	t.Helper()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	root := fs.root.inode.impl.(*directory)
+	ino, err := fs.newSocketFile(1000, 1000, linux.S_IFSOCK|0755, nil /* ep */, root)
+	if err != nil {
+		t.Fatalf("newSocketFile: %v", err)
+	}
+	ino.xattrs.SetRawXattrs(map[string]string{"user.sock": "x"})
+	for i, name := range names {
+		if i > 0 {
+			ino.incLinksLocked()
+		}
+		root.insertChildLocked(fs.newDentry(ino), name)
+	}
+}
+
+// writeTarFileTestOnly returns the tar archive that write writes to a file.
+func writeTarFileTestOnly(t *testing.T, write func(*os.File) error) []byte {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "tar")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer f.Close()
+	if err := write(f); err != nil {
+		t.Fatalf("writing tar archive: %v", err)
+	}
+	data, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	return data
+}
+
+// tarHeadersTestOnly returns the entries of the tar archive data by name.
+func tarHeadersTestOnly(t *testing.T, data []byte) map[string]*tar.Header {
+	t.Helper()
+	hdrs := make(map[string]*tar.Header)
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return hdrs
+		}
+		if err != nil {
+			t.Fatalf("tar.Reader.Next: %v", err)
+		}
+		hdrs[hdr.Name] = hdr
+	}
+}
+
+// socketTarWriter is a way of archiving a tmpfs that holds a socket.
+type socketTarWriter struct {
+	name string
+	// overlayUpper is FilesystemOpts.OverlayUpper.
+	overlayUpper bool
+	write        func(context.Context, *testing.T, *filesystem) []byte
+}
+
+func tarOverlayUpperTestOnly(ctx context.Context, t *testing.T, fs *filesystem) []byte {
+	return writeTarFileTestOnly(t, func(f *os.File) error { return fs.TarOverlayUpper(ctx, f) })
+}
+
+func tarUpperLayerTestOnly(ctx context.Context, t *testing.T, fs *filesystem) []byte {
+	return writeTarFileTestOnly(t, func(f *os.File) error { return fs.TarUpperLayer(ctx, f) })
+}
+
+func fsCheckpointWriteTestOnly(ctx context.Context, t *testing.T, fs *filesystem) []byte {
+	var out bytes.Buffer
+	if err := FSCheckpointWrite(ctx, &fs.vfsfs, &out); err != nil {
+		t.Fatalf("FSCheckpointWrite: %v", err)
+	}
+	return out.Bytes()
+}
+
+// TestTarOverlayUpperSocketIsWhiteout checks that an overlay upper's archive
+// records a socket, and each hard link to it, as a whiteout with no metadata
+// of its own, which a restore makes the shared whiteout. An overlay archives
+// its upper layer with TarOverlayUpper whether or not the upper was mounted
+// as one.
+func TestTarOverlayUpperSocketIsWhiteout(t *testing.T) {
+	for _, w := range []socketTarWriter{
+		{name: "TarOverlayUpper", write: tarOverlayUpperTestOnly},
+		{name: "FSCheckpointWrite", overlayUpper: true, write: fsCheckpointWriteTestOnly},
+	} {
+		t.Run(w.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			fs := mountFromTarTestOnly(t, ctx, tarWithEntries(t, nil, nil))
+			fs.overlayUpper = w.overlayUpper
+			addSocketTestOnly(t, fs, "sock", "sock2")
+
+			out := w.write(ctx, t, fs)
+			hdrs := tarHeadersTestOnly(t, out)
+			// Directory iteration order decides which name is written first.
+			whiteout, link := hdrs["./sock"], hdrs["./sock2"]
+			if whiteout == nil || link == nil {
+				t.Fatalf("archive entries = %v, want ./sock and ./sock2", hdrs)
+			}
+			if whiteout.Typeflag == tar.TypeLink {
+				whiteout, link = link, whiteout
+			}
+			if whiteout.Typeflag != tar.TypeChar || whiteout.Mode != linux.WHITEOUT_MODE || whiteout.Devmajor != 0 || whiteout.Devminor != 0 || whiteout.Uid != 0 || whiteout.Gid != 0 {
+				t.Errorf("socket entry = %+v, want a whiteout", whiteout)
+			}
+			if len(whiteout.PAXRecords) != 0 {
+				t.Errorf("socket entry PAXRecords = %v, want none", whiteout.PAXRecords)
+			}
+			// Extractors apply a hard link entry's owner and mode to the inode it
+			// links to, so the entry must carry the whiteout's.
+			if link.Typeflag != tar.TypeLink || link.Linkname != whiteout.Name || link.Mode != linux.WHITEOUT_MODE || link.Devmajor != 0 || link.Devminor != 0 || link.Uid != 0 || link.Gid != 0 {
+				t.Errorf("hard link entry = %+v, want a link to %s with the whiteout's owner and mode", link, whiteout.Name)
+			}
+			if len(link.PAXRecords) != 0 {
+				t.Errorf("hard link entry PAXRecords = %v, want none", link.PAXRecords)
+			}
+
+			restored := mountFromTarTestOnly(t, ctx, bytes.NewReader(out))
+			for _, name := range []string{"sock", "sock2"} {
+				child, ok := restored.root.inode.impl.(*directory).childMap[name]
+				if !ok {
+					t.Fatalf("restored filesystem has no %s", name)
+				}
+				if dev, ok := child.inode.impl.(*deviceFile); !ok || dev != restored.ovlWhiteout {
+					t.Errorf("restored %s is %T, want the shared whiteout", name, child.inode.impl)
+				}
+			}
+		})
+	}
+}
+
+// TestTarSocketIsSkipped checks that an archive of a tmpfs that is not an
+// overlay upper omits sockets, since a whiteout there would be a visible
+// device file.
+func TestTarSocketIsSkipped(t *testing.T) {
+	for _, w := range []socketTarWriter{
+		{name: "TarUpperLayer", write: tarUpperLayerTestOnly},
+		{name: "FSCheckpointWrite", write: fsCheckpointWriteTestOnly},
+	} {
+		t.Run(w.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			fs := mountFromTarTestOnly(t, ctx, tarWithEntries(t, nil, nil))
+			fs.overlayUpper = w.overlayUpper
+			addSocketTestOnly(t, fs, "sock")
+
+			for name := range tarHeadersTestOnly(t, w.write(ctx, t, fs)) {
+				if name != "./" {
+					t.Errorf("archive has entry %s, want only the root", name)
+				}
+			}
+		})
 	}
 }
