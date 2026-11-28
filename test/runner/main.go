@@ -963,7 +963,7 @@ func setupHostFifoTree(spec *specs.Spec) (cleanup func(), err error) {
 
 	// Individual attach points for each pipe to test mounts that attach
 	// directly to the pipe.
-	for _, name := range []string{"in", "out"} {
+	for _, name := range []string{"in", "out", "idle"} {
 		spec.Mounts = append(spec.Mounts, specs.Mount{
 			Destination: filepath.Join("/tmp/pipes-attach", name),
 			Source:      filepath.Join(fifoDir, name),

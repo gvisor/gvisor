@@ -417,10 +417,68 @@ func CreateSocketConnectors(baseDir string) (string, func(), error) {
 
 type pipeCreator func(path string) (cleanup func(), err error)
 
+// idlePipeReleaseDelay is how long createIdlePipe's pipe stays without a peer
+// on the host. It counts from when the pipe is created, before the sandbox
+// starts, so it must be longer than the sandbox start plus the longest wait
+// in a test that passes. A failing test waits at least this long per case.
+const idlePipeReleaseDelay = 8 * time.Second
+
+// createIdlePipe creates a pipe that no test helper opens for
+// idlePipeReleaseDelay. After that, until cleanup, the helper keeps opening
+// the pipe for reading and writing, drains it and writes one byte to it. This
+// ends an open, read or write that blocks on the pipe, so that a failing test
+// ends instead of timing out.
+func createIdlePipe(path string) (func(), error) {
+	if err := unix.Mkfifo(path, 0644); err != nil {
+		return nil, err
+	}
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-stop:
+			return
+		case <-time.After(idlePipeReleaseDelay):
+		}
+		buf := make([]byte, 1<<20)
+		for {
+			// Use unix calls: os.File would wait in the netpoller instead of
+			// returning EAGAIN.
+			fd, err := unix.Open(path, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+			if err != nil {
+				log.Warningf("Failed to open idle pipe %q: %v", path, err)
+			} else {
+				// Read and Write fail with EAGAIN when the pipe is empty or full.
+				if _, err := unix.Read(fd, buf); err != nil && err != unix.EAGAIN {
+					log.Warningf("Failed to drain idle pipe %q: %v", path, err)
+				}
+				if _, err := unix.Write(fd, buf[:1]); err != nil && err != unix.EAGAIN {
+					log.Warningf("Failed to write to idle pipe %q: %v", path, err)
+				}
+				// Keep the pipe open long enough for a peer check that polls,
+				// as the Sentry's does every 100 ms, to see it.
+				time.Sleep(150 * time.Millisecond)
+				_ = unix.Close(fd)
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-stopped
+	}, nil
+}
+
 // CreateFifoTree creates a local tree of fifo files for use in testing:
 //
 //   - /in
 //   - /out
+//   - /idle
 func CreateFifoTree(baseDir string) (string, func(), error) {
 	dir, err := os.MkdirTemp(baseDir, "pipes")
 	if err != nil {
@@ -440,6 +498,9 @@ func CreateFifoTree(baseDir string) (string, func(), error) {
 		},
 		{
 			name: "out", ctor: createPipeReader,
+		},
+		{
+			name: "idle", ctor: createIdlePipe,
 		},
 	} {
 		cleanup, err := pipe.ctor(filepath.Join(dir, pipe.name))

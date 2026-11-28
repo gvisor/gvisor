@@ -579,6 +579,9 @@ func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 			})
 			return nil, -1, unix.EPERM
 		}
+		// Open must never wait in open(2) for a peer, whatever flags the
+		// client sends: the Sentry emulates blocking opens of named pipes.
+		flags |= unix.O_NONBLOCK
 	case unix.S_IFSOCK:
 		if !impl.config.HostUDS.AllowOpen() {
 			logRejectedUdsOpenOnce.Do(func() {

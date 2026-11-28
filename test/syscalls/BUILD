@@ -178,6 +178,8 @@ syscall_test(
 )
 
 syscall_test(
+    # A failing case waits for the host to release the "idle" FIFO.
+    size = "large",
     add_host_fifo = True,
     one_sandbox = False,
     # Takes too long to run with S/R.
