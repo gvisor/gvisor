@@ -60,9 +60,6 @@ func dumpCheckpointText(t *testing.T, imgPath string) string {
 }
 
 func TestStatefile(t *testing.T) {
-	stop := testutil.StartReaper()
-	defer stop()
-
 	for _, tc := range []struct {
 		name   string
 		engine config.StateEnginePolicy
