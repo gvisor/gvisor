@@ -134,6 +134,39 @@ using ::testing::Pair;
 
 constexpr char kTmpfs[] = "tmpfs";
 
+PosixErrorOr<bool> IsMountPoint(const std::string& path) {
+  ASSIGN_OR_RETURN_ERRNO(std::vector<ProcMountInfoEntry> entries,
+                         ProcSelfMountInfoEntries());
+  for (const auto& e : entries) {
+    if (e.mount_point == path) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// IsUnbindable returns true if the last mount at path is unbindable.
+PosixErrorOr<bool> IsUnbindable(const std::string& path) {
+  ASSIGN_OR_RETURN_ERRNO(auto optionals, MountOptionals());
+  auto it = optionals.find(path);
+  if (it == optionals.end()) {
+    return PosixError(ENOENT, absl::StrCat("no mount at ", path));
+  }
+  return it->second.back().unbindable;
+}
+
+void ExpectUnbindableMountsArePrivate() {
+  auto optionals = ASSERT_NO_ERRNO_AND_VALUE(MountOptionals());
+  for (const auto& [path, opts] : optionals) {
+    for (const MountOptional& opt : opts) {
+      if (opt.unbindable) {
+        EXPECT_EQ(opt.shared, 0) << path;
+        EXPECT_EQ(opt.master, 0) << path;
+      }
+    }
+  }
+}
+
 TEST(MountTest, MountBadFilesystem) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
@@ -818,8 +851,98 @@ TEST(MountTest, MountMoveSuccess) {
               IsPosixErrorOkAndHolds(true));
 }
 
-// TODO(b/305893463): When support for MS_UNBINDABLE is added, moving a mount
-// tree with unbindable children to an MS_SHARED destination should EINVAL.
+TEST(MountTest, MountMoveUnbindableTree) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const parent_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", parent.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", parent.path().c_str(), "", MS_PRIVATE, nullptr),
+              SyscallSucceeds());
+
+  auto const tree =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent.path()));
+  auto tree_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", tree.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const child =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(tree.path()));
+  auto child_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", child.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", child.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+
+  auto const shared =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent.path()));
+  auto const shared_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", shared.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", shared.path().c_str(), "", MS_SHARED, nullptr),
+              SyscallSucceeds());
+  auto const shared_dst =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(shared.path()));
+
+  EXPECT_THAT(mount(tree.path().c_str(), shared_dst.path().c_str(), "", MS_MOVE,
+                    nullptr),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(mount(child.path().c_str(), shared_dst.path().c_str(), "",
+                    MS_MOVE, nullptr),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(IsMountPoint(shared_dst.path()), IsPosixErrorOkAndHolds(false));
+
+  auto const private_dst =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent.path()));
+  ASSERT_THAT(mount(tree.path().c_str(), private_dst.path().c_str(), "",
+                    MS_MOVE, nullptr),
+              SyscallSucceeds());
+  child_mnt.Release();
+  tree_mnt.Release();
+  auto const moved_mnt = Cleanup([&] {
+    EXPECT_THAT(umount2(private_dst.path().c_str(), MNT_DETACH),
+                SyscallSucceeds());
+  });
+  EXPECT_THAT(
+      IsUnbindable(JoinPath(private_dst.path(), Basename(child.path()))),
+      IsPosixErrorOkAndHolds(true));
+  ExpectUnbindableMountsArePrivate();
+}
+
+TEST(MountTest, MountMoveNestedUnbindableBeforeLoopCheck) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const parent_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", parent.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", parent.path().c_str(), "", MS_PRIVATE, nullptr),
+              SyscallSucceeds());
+  auto const tree =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent.path()));
+  auto const tree_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", tree.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", tree.path().c_str(), "", MS_SHARED, nullptr),
+              SyscallSucceeds());
+  auto const mid =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(tree.path()));
+  auto const mid_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", mid.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const leaf =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(mid.path()));
+  auto const leaf_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", leaf.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", leaf.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  auto const dst =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(tree.path()));
+
+  EXPECT_THAT(
+      mount(tree.path().c_str(), dst.path().c_str(), "", MS_MOVE, nullptr),
+      SyscallFailsWithErrno(EINVAL));
+
+  // Without the unbindable mount, the same move fails because dst is in tree.
+  ASSERT_THAT(mount("", leaf.path().c_str(), "", MS_PRIVATE, nullptr),
+              SyscallSucceeds());
+  EXPECT_THAT(
+      mount(tree.path().c_str(), dst.path().c_str(), "", MS_MOVE, nullptr),
+      SyscallFailsWithErrno(ELOOP));
+}
 
 TEST(MountTest, MountMoveSharedParent) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
@@ -2535,6 +2658,376 @@ TEST(MountTest, SetSlaveRecursive) {
             optionals[a_master.path()][0].shared);
   EXPECT_EQ(optionals[b.path()][0].master,
             optionals[b_master.path()][0].shared);
+}
+
+TEST(MountTest, MakeUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const child =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  auto const child_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", child.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", dir.path().c_str(), "", MS_SHARED, nullptr),
+              SyscallSucceeds());
+
+  ASSERT_THAT(mount("", dir.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+
+  EXPECT_THAT(IsUnbindable(dir.path()), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(IsUnbindable(child.path()), IsPosixErrorOkAndHolds(false));
+  auto optionals = ASSERT_NO_ERRNO_AND_VALUE(MountOptionals());
+  EXPECT_EQ(optionals[dir.path()][0].shared, 0);
+  EXPECT_EQ(optionals[dir.path()][0].master, 0);
+}
+
+TEST(MountTest, MakeUnbindableRecursive) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const child =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  auto const child_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", child.path(), kTmpfs, 0, "", MNT_DETACH));
+
+  ASSERT_THAT(
+      mount("", dir.path().c_str(), "", MS_UNBINDABLE | MS_REC, nullptr),
+      SyscallSucceeds());
+
+  EXPECT_THAT(IsUnbindable(dir.path()), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(IsUnbindable(child.path()), IsPosixErrorOkAndHolds(true));
+}
+
+// pasta(1) makes every mount unbindable in a new user and mount namespace
+// before it forks.
+TEST(MountTest, MakeRootUnbindableInUserNamespace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string src = JoinPath(dir.path(), "src");
+  const std::string dst = JoinPath(dir.path(), "dst");
+
+  const std::function<void()> child_fn = [&] {
+    TEST_CHECK_SUCCESS(mkdir(src.c_str(), 0700));
+    TEST_CHECK_SUCCESS(mkdir(dst.c_str(), 0700));
+    TEST_CHECK_SUCCESS(mount("", src.c_str(), kTmpfs, 0, nullptr));
+    // The bind succeeds before the tree is unbindable.
+    TEST_CHECK_SUCCESS(mount(src.c_str(), dst.c_str(), "", MS_BIND, nullptr));
+    TEST_CHECK_SUCCESS(umount2(dst.c_str(), MNT_DETACH));
+
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_UNBINDABLE | MS_REC, nullptr));
+
+    TEST_CHECK(TEST_CHECK_NO_ERRNO_AND_VALUE(IsUnbindable("/")));
+    TEST_CHECK(TEST_CHECK_NO_ERRNO_AND_VALUE(IsUnbindable(src)));
+    TEST_CHECK_ERRNO(mount(src.c_str(), dst.c_str(), "", MS_BIND, nullptr),
+                     EINVAL);
+
+    const std::string fresh = JoinPath(dir.path(), "fresh");
+    TEST_CHECK_SUCCESS(mkdir(fresh.c_str(), 0700));
+    TEST_CHECK_SUCCESS(mount("", fresh.c_str(), kTmpfs, 0, nullptr));
+    TEST_CHECK(!TEST_CHECK_NO_ERRNO_AND_VALUE(IsUnbindable(fresh)));
+    TEST_CHECK_SUCCESS(mount(fresh.c_str(), dst.c_str(), "", MS_BIND, nullptr));
+
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK(TEST_CHECK_NO_ERRNO_AND_VALUE(IsUnbindable("/")));
+    TEST_CHECK(TEST_CHECK_NO_ERRNO_AND_VALUE(IsUnbindable(src)));
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child_fn),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, BindUnbindableFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const subdir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  ASSERT_THAT(mount("", dir.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  EXPECT_THAT(
+      mount(dir.path().c_str(), dst.path().c_str(), "", MS_BIND, nullptr),
+      SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(mount(dir.path().c_str(), dst.path().c_str(), "",
+                    MS_BIND | MS_REC, nullptr),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(
+      mount(subdir.path().c_str(), dst.path().c_str(), "", MS_BIND, nullptr),
+      SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(IsMountPoint(dst.path()), IsPosixErrorOkAndHolds(false));
+}
+
+TEST(MountTest, RecursiveBindSkipsUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const a_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", a.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const b_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", b.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const u = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const u_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", u.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(u.path(), "file"), "u", 0666));
+  auto const g = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(u.path()));
+  auto const g_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", g.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", u.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  auto const nested =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(b.path()));
+  auto const nested_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", nested.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", nested.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+
+  auto const d = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const d_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(a.path(), d.path(), "", MS_BIND | MS_REC, "", MNT_DETACH));
+
+  const std::string d_u = JoinPath(d.path(), Basename(u.path()));
+  const std::string d_b = JoinPath(d.path(), Basename(b.path()));
+  EXPECT_THAT(IsMountPoint(d_b), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(IsMountPoint(JoinPath(d_b, Basename(nested.path()))),
+              IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(IsMountPoint(d_u), IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(IsMountPoint(JoinPath(d_u, Basename(g.path()))),
+              IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(Exists(JoinPath(d_u, "file")), IsPosixErrorOkAndHolds(false));
+
+  auto const g_dst = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const g_dst_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(g.path(), g_dst.path(), "", MS_BIND, "", MNT_DETACH));
+}
+
+// A recursive bind fails with EPERM if it would skip an unbindable mount that
+// is locked, since skipping it would reveal what the mount covers.
+TEST(MountTest, RecursiveBindLockedUnbindableFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const a_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", a.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const u = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const u_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", u.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", u.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  const std::string dst = JoinPath(a.path(), "dst");
+
+  // x/b/u is a locked unbindable mount two levels below x.
+  auto const x = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const x_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", x.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const xb = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(x.path()));
+  auto const xb_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", xb.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const xbu = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(xb.path()));
+  auto const xbu_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", xbu.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", xbu.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  const std::string xdst = JoinPath(a.path(), "xdst");
+
+  const std::function<void()> child_fn = [&] {
+    // The copy of u in the new mount namespace is locked and stays
+    // unbindable.
+    TEST_CHECK(TEST_CHECK_NO_ERRNO_AND_VALUE(IsUnbindable(u.path())));
+    TEST_CHECK_SUCCESS(mkdir(dst.c_str(), 0700));
+    TEST_CHECK_ERRNO(
+        mount(a.path().c_str(), dst.c_str(), "", MS_BIND | MS_REC, nullptr),
+        EPERM);
+    TEST_CHECK_SUCCESS(mkdir(xdst.c_str(), 0700));
+    TEST_CHECK_ERRNO(
+        mount(x.path().c_str(), xdst.c_str(), "", MS_BIND | MS_REC, nullptr),
+        EPERM);
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child_fn),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, RecursiveBindSubdirIgnoresLockedUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const a_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", a.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const u = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const u_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", u.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", u.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  auto const s = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(s.path()));
+  auto const b_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", b.path(), kTmpfs, 0, "", MNT_DETACH));
+  const std::string dst = JoinPath(a.path(), "dst");
+
+  const std::function<void()> child_fn = [&] {
+    // The copies of u and b in this mount namespace are locked.
+    TEST_CHECK_SUCCESS(mkdir(dst.c_str(), 0700));
+    TEST_CHECK_SUCCESS(
+        mount(s.path().c_str(), dst.c_str(), "", MS_BIND | MS_REC, nullptr));
+    TEST_CHECK(TEST_CHECK_NO_ERRNO_AND_VALUE(
+        IsMountPoint(JoinPath(dst, Basename(b.path())))));
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child_fn),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, RecursiveBindToSharedSkipsUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const a_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", a.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const b_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", b.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const u = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const u_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", u.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", u.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+
+  auto const shared = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const shared_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", shared.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", shared.path().c_str(), "", MS_SHARED, nullptr),
+              SyscallSucceeds());
+  auto const peer = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const peer_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(shared.path(), peer.path(), "", MS_BIND, "", MNT_DETACH));
+  auto const dst =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(shared.path()));
+  auto const dst_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(a.path(), dst.path(), "", MS_BIND | MS_REC, "", MNT_DETACH));
+
+  const std::string peer_dst = JoinPath(peer.path(), Basename(dst.path()));
+  EXPECT_THAT(IsMountPoint(JoinPath(peer_dst, Basename(b.path()))),
+              IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(IsMountPoint(JoinPath(peer_dst, Basename(u.path()))),
+              IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(IsMountPoint(JoinPath(dst.path(), Basename(u.path()))),
+              IsPosixErrorOkAndHolds(false));
+  ExpectUnbindableMountsArePrivate();
+}
+
+// MS_BIND takes precedence over MS_UNBINDABLE: the call is a plain bind.
+TEST(MountTest, BindWithUnbindableFlag) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const dst_mnt = ASSERT_NO_ERRNO_AND_VALUE(Mount(
+      dir.path(), dst.path(), "", MS_BIND | MS_UNBINDABLE, "", MNT_DETACH));
+
+  EXPECT_THAT(IsUnbindable(dir.path()), IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(IsUnbindable(dst.path()), IsPosixErrorOkAndHolds(false));
+}
+
+TEST(MountTest, UnshareKeepsUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", dir.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  pid_t child = fork();
+  if (child == 0) {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_CHECK(TEST_CHECK_NO_ERRNO_AND_VALUE(IsUnbindable(dir.path())));
+    TEST_CHECK_ERRNO(
+        mount(dir.path().c_str(), dst.path().c_str(), "", MS_BIND, nullptr),
+        EINVAL);
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "status = " << status;
+}
+
+TEST(MountTest, SharedAndPrivateClearUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  for (const uint64_t flag : {MS_SHARED, MS_PRIVATE}) {
+    SCOPED_TRACE(flag == MS_SHARED ? "MS_SHARED" : "MS_PRIVATE");
+    auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+    auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+    ASSERT_THAT(mount("", dir.path().c_str(), "", MS_UNBINDABLE, nullptr),
+                SyscallSucceeds());
+    ASSERT_THAT(mount("", dir.path().c_str(), "", flag, nullptr),
+                SyscallSucceeds());
+
+    EXPECT_THAT(IsUnbindable(dir.path()), IsPosixErrorOkAndHolds(false));
+    auto optionals = ASSERT_NO_ERRNO_AND_VALUE(MountOptionals());
+    EXPECT_EQ(optionals[dir.path()][0].shared != 0, flag == MS_SHARED);
+    auto const dst = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+    auto const dst_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount(dir.path(), dst.path(), "", MS_BIND, "", MNT_DETACH));
+  }
+}
+
+// MS_SLAVE keeps the unbindable type.
+TEST(MountTest, SlaveKeepsUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", dir.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  ASSERT_THAT(mount("", dir.path().c_str(), "", MS_SLAVE, nullptr),
+              SyscallSucceeds());
+
+  EXPECT_THAT(IsUnbindable(dir.path()), IsPosixErrorOkAndHolds(true));
+  auto const dst = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  EXPECT_THAT(
+      mount(dir.path().c_str(), dst.path().c_str(), "", MS_BIND, nullptr),
+      SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(MountTest, UnbindableLeavesPeerGroup) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const a_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", a.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", a.path().c_str(), "", MS_SHARED, nullptr),
+              SyscallSucceeds());
+  auto const sub = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(a.path()));
+  auto const b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const b_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(a.path(), b.path(), "", MS_BIND, "", MNT_DETACH));
+
+  ASSERT_THAT(mount("", b.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  auto const sub_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", sub.path(), kTmpfs, 0, "", MNT_DETACH));
+
+  const std::string b_sub = JoinPath(b.path(), Basename(sub.path()));
+  EXPECT_THAT(IsMountPoint(b_sub), IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(IsUnbindable(b.path()), IsPosixErrorOkAndHolds(true));
+  auto optionals = ASSERT_NO_ERRNO_AND_VALUE(MountOptionals());
+  EXPECT_NE(optionals[a.path()][0].shared, 0);
+  EXPECT_EQ(optionals[b.path()][0].shared, 0);
+  ExpectUnbindableMountsArePrivate();
 }
 
 TEST(MountTest, RecursiveBind) {

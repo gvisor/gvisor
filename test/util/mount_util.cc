@@ -201,6 +201,7 @@ MountOptionals() {
     opt.shared = 0;
     opt.master = 0;
     opt.propagate_from = 0;
+    opt.unbindable = false;
     std::vector<std::string_view> tags = absl::StrSplit(e.optional, ' ');
 
     for (std::string_view tag : tags) {
@@ -219,6 +220,10 @@ MountOptionals() {
 PosixError ParseOptionalTag(std::string_view tag, MountOptional* opt) {
   std::vector<absl::string_view> key_value =
       absl::StrSplit(absl::string_view(tag.data(), tag.size()), ':');
+  if (key_value.size() == 1 && key_value[0] == "unbindable") {
+    opt->unbindable = true;
+    return PosixError(0);
+  }
   if (key_value.size() != 2) return PosixError(0);
   if (key_value[0] == "shared") {
     if (!absl::SimpleAtoi(key_value[1], &opt->shared))

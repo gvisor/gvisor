@@ -37,6 +37,7 @@
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
+#include "test/util/mount_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
@@ -916,6 +917,74 @@ TEST(OpenTreeTest, OpenTreeCloneRecursiveOnAttached) {
   EXPECT_THAT(umount(JoinPath(dst_dir.path(), "sub").c_str()),
               SyscallSucceeds());
   EXPECT_THAT(umount(dst_dir.path().c_str()), SyscallSucceeds());
+}
+
+TEST(OpenTreeTest, OpenTreeCloneUnbindableFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", dir.path().c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+
+  EXPECT_THAT(open_tree(AT_FDCWD, dir.path().c_str(), OPEN_TREE_CLONE),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(
+      open_tree(AT_FDCWD, dir.path().c_str(), OPEN_TREE_CLONE | AT_RECURSIVE),
+      SyscallFailsWithErrno(EINVAL));
+
+  // Without OPEN_TREE_CLONE, open_tree(2) only opens the path.
+  int fd = open_tree(AT_FDCWD, dir.path().c_str(), 0);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  EXPECT_THAT(close(fd), SyscallSucceeds());
+}
+
+TEST(OpenTreeTest, OpenTreeCloneRecursiveSkipsUnbindable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  const std::string sub_path = JoinPath(dir.path(), "sub");
+  ASSERT_THAT(mkdir(sub_path.c_str(), 0755), SyscallSucceeds());
+  auto const sub_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", sub_path, kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(sub_path, "marker"), "", 0644));
+  ASSERT_THAT(mount("", sub_path.c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+
+  int treefd =
+      open_tree(AT_FDCWD, dir.path().c_str(), OPEN_TREE_CLONE | AT_RECURSIVE);
+  ASSERT_THAT(treefd, SyscallSucceeds());
+  auto cleanup_tree = Cleanup([&]() { close(treefd); });
+
+  EXPECT_THAT(faccessat(treefd, "sub", F_OK, 0), SyscallSucceeds());
+  EXPECT_THAT(faccessat(treefd, "sub/marker", F_OK, 0),
+              SyscallFailsWithErrno(ENOENT));
+}
+
+TEST(OpenTreeTest, OpenTreeCloneRecursiveLockedUnbindableFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  const std::string sub_path = JoinPath(dir.path(), "sub");
+  ASSERT_THAT(mkdir(sub_path.c_str(), 0755), SyscallSucceeds());
+  auto const sub_mnt =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", sub_path, kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mount("", sub_path.c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+
+  const std::function<void()> child_fn = [&] {
+    // The copy of sub in this mount namespace is locked.
+    TEST_CHECK_ERRNO(
+        open_tree(AT_FDCWD, dir.path().c_str(), OPEN_TREE_CLONE | AT_RECURSIVE),
+        EPERM);
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child_fn),
+              IsPosixErrorOkAndHolds(0));
 }
 
 TEST(OpenTreeTest, OpenTreeCloneRecursiveOnDetached) {

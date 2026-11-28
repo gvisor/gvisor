@@ -49,6 +49,24 @@ TEST(ParseMounts, MountInfo) {
   EXPECT_EQ(entries.size(), 3);
 }
 
+TEST(ParseMounts, OptionalTags) {
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ProcSelfMountInfoEntriesFrom(
+      R"proc(2007 8844 0:278 / /mnt rw,noexec unbindable - tmpfs none rw
+)proc"));
+  ASSERT_EQ(entries.size(), 1);
+  EXPECT_EQ(entries[0].optional, "unbindable");
+
+  MountOptional opt = {};
+  ASSERT_NO_ERRNO(ParseOptionalTag(entries[0].optional, &opt));
+  EXPECT_TRUE(opt.unbindable);
+  EXPECT_EQ(opt.shared, 0);
+
+  MountOptional shared = {};
+  ASSERT_NO_ERRNO(ParseOptionalTag("shared:7", &shared));
+  EXPECT_EQ(shared.shared, 7);
+  EXPECT_FALSE(shared.unbindable);
+}
+
 }  // namespace
 
 }  // namespace testing
