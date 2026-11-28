@@ -326,6 +326,9 @@ type Config struct {
 	// for the duration of the container execution.
 	TraceFile string `flag:"trace"`
 
+	// GCTrace sets GODEBUG=gctrace=<N> for the sandbox process when > 0.
+	GCTrace int `flag:"gctrace"`
+
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
 	// to the same underlying network device. This allows netstack to better
 	// scale for high throughput use cases.
@@ -678,6 +681,9 @@ func (c *Config) Validate() error {
 	}
 	if c.ProfileMutex != "" && !c.ProfileEnable {
 		return fmt.Errorf("profile-mutex flag requires enabling profiling with profile flag")
+	}
+	if c.GCTrace < 0 || c.GCTrace > math.MaxInt32 {
+		return fmt.Errorf("gctrace must be in [0, %d], got: %d", math.MaxInt32, c.GCTrace)
 	}
 	if c.FSGoferHostUDS && c.HostUDS != HostUDSNone {
 		// Deprecated flag was used together with flag that replaced it.

@@ -17,6 +17,7 @@ package proc
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"runtime"
 	"strconv"
 
@@ -476,15 +477,37 @@ var _ dynamicInode = (*sentryMeminfoData)(nil)
 func (*sentryMeminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	var sentryMeminfo runtime.MemStats
 	runtime.ReadMemStats(&sentryMeminfo)
-
-	fmt.Fprintf(buf, "Alloc:          %8d kB\n", sentryMeminfo.Alloc/1024)
-	fmt.Fprintf(buf, "TotalAlloc:     %8d kB\n", sentryMeminfo.TotalAlloc/1024)
-	fmt.Fprintf(buf, "Sys:            %8d kB\n", sentryMeminfo.Sys/1024)
-	fmt.Fprintf(buf, "Mallocs:        %8d\n", sentryMeminfo.Mallocs)
-	fmt.Fprintf(buf, "Frees:          %8d\n", sentryMeminfo.Frees)
-	fmt.Fprintf(buf, "Live Objects:   %8d\n", sentryMeminfo.Mallocs-sentryMeminfo.Frees)
-	fmt.Fprintf(buf, "HeapAlloc:      %8d kB\n", sentryMeminfo.HeapAlloc/1024)
-	fmt.Fprintf(buf, "HeapSys:        %8d kB\n", sentryMeminfo.HeapSys/1024)
-	fmt.Fprintf(buf, "HeapObjects:    %8d\n", sentryMeminfo.HeapObjects)
+	writeSentryMeminfo(buf, &sentryMeminfo)
 	return nil
+}
+
+func writeSentryMeminfo(buf *bytes.Buffer, m *runtime.MemStats) {
+	var lastPauseNs uint64
+	if m.NumGC > 0 {
+		lastPauseNs = m.PauseNs[(m.NumGC+255)%256]
+	}
+	var gcCPUPPM uint64
+	if m.GCCPUFraction > 0 && !math.IsInf(m.GCCPUFraction, 1) {
+		gcCPUPPM = uint64(min(1, m.GCCPUFraction)*1e6 + 0.5)
+	}
+
+	fmt.Fprintf(buf, "Alloc:          %8d kB\n", m.Alloc/1024)
+	fmt.Fprintf(buf, "TotalAlloc:     %8d kB\n", m.TotalAlloc/1024)
+	fmt.Fprintf(buf, "Sys:            %8d kB\n", m.Sys/1024)
+	fmt.Fprintf(buf, "Mallocs:        %8d\n", m.Mallocs)
+	fmt.Fprintf(buf, "Frees:          %8d\n", m.Frees)
+	fmt.Fprintf(buf, "Live Objects:   %8d\n", m.Mallocs-m.Frees)
+	fmt.Fprintf(buf, "HeapAlloc:      %8d kB\n", m.HeapAlloc/1024)
+	fmt.Fprintf(buf, "HeapSys:        %8d kB\n", m.HeapSys/1024)
+	fmt.Fprintf(buf, "HeapObjects:    %8d\n", m.HeapObjects)
+	fmt.Fprintf(buf, "HeapIdle:       %12d B\n", m.HeapIdle)
+	fmt.Fprintf(buf, "HeapInuse:      %12d B\n", m.HeapInuse)
+	fmt.Fprintf(buf, "HeapReleased:   %12d B\n", m.HeapReleased)
+	fmt.Fprintf(buf, "NextGC:         %12d B\n", m.NextGC)
+	fmt.Fprintf(buf, "LastGC:         %12d ns\n", m.LastGC)
+	fmt.Fprintf(buf, "PauseTotalNs:   %12d ns\n", m.PauseTotalNs)
+	fmt.Fprintf(buf, "LastPauseNs:    %12d ns\n", lastPauseNs)
+	fmt.Fprintf(buf, "NumGC:          %12d\n", m.NumGC)
+	fmt.Fprintf(buf, "NumForcedGC:    %12d\n", m.NumForcedGC)
+	fmt.Fprintf(buf, "GCCPUPPM:       %12d ppm\n", gcCPUPPM)
 }

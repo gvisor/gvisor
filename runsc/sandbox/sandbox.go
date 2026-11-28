@@ -1130,7 +1130,24 @@ func sentryGODEBUG(conf *config.Config) []string {
 	} else if conf.ProfileHeapRate != 0 {
 		godebug = append(godebug, "memprofilerate="+strconv.Itoa(conf.ProfileHeapRate))
 	}
+	if conf.GCTrace > 0 {
+		godebug = append(godebug, fmt.Sprintf("gctrace=%d", conf.GCTrace))
+	}
 	return godebug
+}
+
+// configurePanicLog donates --panic-log-fd (owned by donations) and returns it
+// for initial cmd.Stderr before boot dups --panic-log-fd onto FD 2.
+func configurePanicLog(donations *donation.Agency, conf *config.Config, lfOpts *specutils.LogFileOpts) (*os.File, error) {
+	if conf.PanicLog == "" {
+		return nil, nil
+	}
+	f, err := specutils.OpenDebugLogFile(conf.PanicLog, lfOpts)
+	if err != nil {
+		return nil, err
+	}
+	donations.DonateAndClose("panic-log-fd", f)
+	return f, nil
 }
 
 // sentryExeFD is the FD at which the prewarmer inherits the Sentry binary.
@@ -1194,7 +1211,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		}
 	}
 	lfOpts.Command = "panic"
-	if err := donations.DonateDebugLogFile("panic-log-fd", conf.PanicLog, lfOpts); err != nil {
+	panicLogStderr, err := configurePanicLog(&donations, conf, lfOpts)
+	if err != nil {
 		return fmt.Errorf("donating panic log file: %w", err)
 	}
 	covFilename := conf.CoverageReport
@@ -1513,11 +1531,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	// The current process' stdio must be passed to the application via the
 	// --stdio-fds flag. The stdio of the sandbox process itself must not
 	// be connected to the same FDs, otherwise we risk leaking sandbox
-	// errors to the application, so we set the sandbox stdio to nil,
-	// causing them to read/write from the null device.
+	// errors to the application, so set stdin/stdout to nil (the null
+	// device) and stderr to panicLogStderr (nil unless --panic-log is set).
 	cmd.Stdin = nil
 	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stderr = panicLogStderr
 	var stdios [3]*os.File
 
 	// If the console control socket file is provided, then create a new
@@ -1552,7 +1570,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 			// TTY, so that it is easier to find.
 			cmd.Stdin = tty
 			cmd.Stdout = tty
-			cmd.Stderr = tty
+			if cmd.Stderr == nil {
+				cmd.Stderr = tty
+			}
 		}
 	} else {
 		// If not using a console, pass our current stdio as the
@@ -1566,7 +1586,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 			// this process' stdio, so that is is easier to find.
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
+			if cmd.Stderr == nil {
+				cmd.Stderr = os.Stderr
+			}
 		}
 	}
 	if err := s.configureStdios(conf, stdios[:]); err != nil {
