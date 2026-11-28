@@ -221,6 +221,44 @@ func TestBrkDataLimitUpdates(t *testing.T) {
 }
 
 // TestIOAfterUnmap ensures that IO fails after unmap.
+func TestIgnoredMadviseValidatesRange(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   2 * pageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+	if err := mm.MUnmap(ctx, addr+pageSizeAddr, pageSize); err != nil {
+		t.Fatalf("MUnmap got err %v want nil", err)
+	}
+
+	if err := mm.CheckIgnoredMadvise(addr, pageSize); err != nil {
+		t.Errorf("mapped page: got %v want nil", err)
+	}
+	if err := mm.CheckIgnoredMadvise(addr, 0); err != nil {
+		t.Errorf("zero length: got %v want nil", err)
+	}
+	if !linuxerr.Equals(linuxerr.EINVAL, mm.CheckIgnoredMadvise(addr+1, pageSize)) {
+		t.Errorf("unaligned addr: got %v want EINVAL", mm.CheckIgnoredMadvise(addr+1, pageSize))
+	}
+	if !linuxerr.Equals(linuxerr.EINVAL, mm.CheckIgnoredMadvise(addr, ^uint64(0))) {
+		t.Errorf("overflowing length: got %v want EINVAL", mm.CheckIgnoredMadvise(addr, ^uint64(0)))
+	}
+	if !linuxerr.Equals(linuxerr.ENOMEM, mm.CheckIgnoredMadvise(addr+pageSizeAddr, pageSize)) {
+		t.Errorf("unmapped page: got %v want ENOMEM", mm.CheckIgnoredMadvise(addr+pageSizeAddr, pageSize))
+	}
+	if !linuxerr.Equals(linuxerr.ENOMEM, mm.CheckIgnoredMadvise(addr, 2*pageSize)) {
+		t.Errorf("range with a hole: got %v want ENOMEM", mm.CheckIgnoredMadvise(addr, 2*pageSize))
+	}
+}
+
 func TestIOAfterUnmap(t *testing.T) {
 	ctx := contexttest.Context(t)
 	mm := testMemoryManager(ctx, t)

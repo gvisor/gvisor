@@ -229,8 +229,9 @@ func Madvise(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	case linux.MADV_MERGEABLE, linux.MADV_UNMERGEABLE:
 		fallthrough
 	case linux.MADV_NORMAL, linux.MADV_RANDOM, linux.MADV_SEQUENTIAL, linux.MADV_WILLNEED:
-		// Do nothing, we totally ignore the suggestions above.
-		return 0, nil, nil
+		// The advice itself is ignored, but Linux still validates the range
+		// (EINVAL for a bad address or length, ENOMEM for unmapped memory).
+		return 0, nil, t.MemoryManager().CheckIgnoredMadvise(addr, length)
 	case linux.MADV_REMOVE:
 		// These "suggestions" have application-visible side effects, so we
 		// have to indicate that we don't support them.

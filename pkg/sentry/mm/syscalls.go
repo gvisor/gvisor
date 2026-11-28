@@ -1166,6 +1166,28 @@ func (mm *MemoryManager) SetNumaPolicy(addr hostarch.Addr, length uint64, policy
 	}
 }
 
+// CheckIgnoredMadvise validates arguments for madvise(2) advice values that
+// gVisor does not act on. Linux still checks those arguments: EINVAL when
+// addr is not page-aligned or the rounded length overflows, and ENOMEM when
+// the range is not fully mapped. A zero length succeeds after the alignment
+// check, matching madvise(2).
+//
+// +checklocksexclude:mm.mappingMu
+func (mm *MemoryManager) CheckIgnoredMadvise(addr hostarch.Addr, length uint64) error {
+	addr = hostarch.UntaggedUserAddr(addr)
+	ar, err := madviseAddrRange(addr, length)
+	if err != nil {
+		return err
+	}
+	if length == 0 {
+		return nil
+	}
+	if mm.VirtualMemorySizeRange(ar) != uint64(ar.Length()) {
+		return linuxerr.ENOMEM
+	}
+	return nil
+}
+
 // madviseAddrRange converts addr and length to an AddrRange as for madvise(2)
 // (and prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME) =>
 // mm/madvise.c:madvise_vma_anon_name().)
