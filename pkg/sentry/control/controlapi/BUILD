@@ -37,4 +37,5 @@ go_test(
     size = "small",
     srcs = ["proc_test.go"],
     embed = [":controlapi"],
+    deps = ["@com_github_google_go_cmp//cmp:go_default_library"],
 )
