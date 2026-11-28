@@ -28,10 +28,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/mount"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/sandboxposture"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -72,12 +74,82 @@ func TestSandboxPostureDocker(t *testing.T) {
 		t.Skipf("This kernel cannot report %s, so a collected posture would not be exhaustive", strings.Join(missing, ", "))
 	}
 	conf := postureConfig(t)
+	testSandboxPostureDocker(t, conf, dockerutil.RunOpts{
+		Image: "basic/alpine",
+	}, false /* noDirectFSMounts */)
+}
+
+// TestSandboxPostureDockerSuppressedDirectFS checks that a Docker sandbox with
+// --directfs enabled but directfs suppressed on every mount closes
+// /proc/self/fd and holds no host directory FDs.
+func TestSandboxPostureDockerSuppressedDirectFS(t *testing.T) {
+	if missing := sandboxposture.UnsupportedFeatures(); len(missing) > 0 {
+		t.Skipf("This kernel cannot report %s, so a collected posture would not be exhaustive", strings.Join(missing, ", "))
+	}
+	conf := postureConfig(t)
+	if !conf.DirectFS {
+		t.Skip("DirectFS is disabled; suppressing directfs per mount is redundant")
+	}
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "posture-suppressed-directfs")
+	if err != nil {
+		t.Fatalf("Creating temp directory: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("Chmod(%q): %v", dir, err)
+	}
+	dir, err = filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", dir, err)
+	}
+	annotations := map[string]string{
+		sentryapi.RootfsPrefix + "source":   "/",
+		sentryapi.RootfsPrefix + "type":     "bind",
+		sentryapi.RootfsPrefix + "directfs": "off",
+	}
+	// Docker automatically bind-mounts /etc/hostname, /etc/hosts, and
+	// /etc/resolv.conf from container-specific host paths that are not known
+	// until container creation. Override them with known paths so directfs can
+	// be suppressed on every mount.
+	var mounts []mount.Mount
+	for _, f := range []struct {
+		name    string
+		target  string
+		content string
+	}{
+		{name: "hostname", target: "/etc/hostname", content: "gvisor-posture\n"},
+		{name: "hosts", target: "/etc/hosts", content: "127.0.0.1 localhost\n"},
+		{name: "resolv", target: "/etc/resolv.conf", content: "nameserver 8.8.8.8\n"},
+	} {
+		src := filepath.Join(dir, f.name)
+		if err := os.WriteFile(src, []byte(f.content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", src, err)
+		}
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   src,
+			Target:   f.target,
+			ReadOnly: true,
+		})
+		prefix := sentryapi.MountPrefix + f.name + "."
+		annotations[prefix+"source"] = src
+		annotations[prefix+"type"] = "bind"
+		annotations[prefix+"share"] = "shared"
+		annotations[prefix+"directfs"] = "off"
+	}
+	testSandboxPostureDocker(t, conf, dockerutil.RunOpts{
+		Image:       "basic/alpine",
+		Mounts:      mounts,
+		Annotations: annotations,
+	}, true /* noDirectFSMounts */)
+}
+
+func testSandboxPostureDocker(t *testing.T, conf *config.Config, runOpts dockerutil.RunOpts, noDirectFSMounts bool) {
+	t.Helper()
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
-	if err := d.Spawn(ctx, dockerutil.RunOpts{
-		Image: "basic/alpine",
-	}, "sleep", "10000"); err != nil {
+	if err := d.Spawn(ctx, runOpts, "sleep", "10000"); err != nil {
 		t.Fatalf("docker run failed: %v", err)
 	}
 	pid, err := d.SandboxPid(ctx)
@@ -106,6 +178,7 @@ func TestSandboxPostureDocker(t *testing.T) {
 
 	want := sandboxposture.Expected(sandboxposture.ExpectedOpts{
 		DirectFS:             conf.DirectFS,
+		NoDirectFSMounts:     noDirectFSMounts,
 		NetworkMode:          conf.Network.String(),
 		EnableRaw:            conf.EnableRaw,
 		RequiresCapSysPtrace: sandboxposture.PlatformCapSysPtrace[conf.Platform],
