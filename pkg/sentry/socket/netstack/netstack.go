@@ -2466,7 +2466,7 @@ func (s *sock) setSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, optVa
 		return syserr.ErrUnknownProtocolOption
 	}
 
-	family, _, _ := s.Type()
+	family, skType, _ := s.Type()
 	if family != linux.AF_INET6 {
 		return syserr.ErrUnknownProtocolOption
 	}
@@ -2501,6 +2501,9 @@ func (s *sock) setSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, optVa
 		if err != nil {
 			return err
 		}
+		if skType == linux.SOCK_STREAM {
+			return syserr.ErrProtocol
+		}
 
 		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.AddMembershipOption{
 			NIC:           tcpip.NICID(req.InterfaceIndex),
@@ -2511,6 +2514,9 @@ func (s *sock) setSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, optVa
 		req, err := copyInMulticastV6Request(optVal)
 		if err != nil {
 			return err
+		}
+		if skType == linux.SOCK_STREAM {
+			return syserr.ErrProtocol
 		}
 
 		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.RemoveMembershipOption{
