@@ -157,11 +157,6 @@ func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQu
 	return raw.NewEndpoint(p.stack, netProto, header.TCPProtocolNumber, waiterQueue)
 }
 
-// MinimumPacketSize returns the minimum valid tcp packet size.
-func (*protocol) MinimumPacketSize() int {
-	return header.TCPMinimumSize
-}
-
 // ParsePorts returns the source and destination ports stored in the given tcp
 // packet.
 func (*protocol) ParsePorts(v []byte) (src, dst uint16, err tcpip.Error) {

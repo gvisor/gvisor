@@ -328,10 +328,6 @@ func (*fakeNetworkProtocol) Number() tcpip.NetworkProtocolNumber {
 	return fakeNetNumber
 }
 
-func (*fakeNetworkProtocol) MinimumPacketSize() int {
-	return fakeNetHeaderLen
-}
-
 func (f *fakeNetworkProtocol) PacketCount(intfAddr byte) int {
 	return f.packetCount[int(intfAddr)%len(f.packetCount)]
 }

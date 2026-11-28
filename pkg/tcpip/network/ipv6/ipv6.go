@@ -2564,11 +2564,6 @@ func (p *protocol) Number() tcpip.NetworkProtocolNumber {
 	return ProtocolNumber
 }
 
-// MinimumPacketSize returns the minimum valid ipv6 packet size.
-func (p *protocol) MinimumPacketSize() int {
-	return header.IPv6MinimumSize
-}
-
 // ParseAddresses implements stack.NetworkProtocol.
 func (*protocol) ParseAddresses(b []byte) (src, dst tcpip.Address) {
 	h := header.IPv6(b)

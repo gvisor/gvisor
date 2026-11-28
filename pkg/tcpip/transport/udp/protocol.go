@@ -64,11 +64,6 @@ func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQu
 	return raw.NewEndpoint(p.stack, netProto, header.UDPProtocolNumber, waiterQueue)
 }
 
-// MinimumPacketSize returns the minimum valid udp packet size.
-func (*protocol) MinimumPacketSize() int {
-	return header.UDPMinimumSize
-}
-
 // ParsePorts returns the source and destination ports stored in the given udp
 // packet.
 func (*protocol) ParsePorts(v []byte) (src, dst uint16, err tcpip.Error) {

@@ -76,17 +76,6 @@ func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQu
 	return raw.NewEndpoint(p.stack, netProto, p.number, waiterQueue)
 }
 
-// MinimumPacketSize returns the minimum valid icmp packet size.
-func (p *protocol) MinimumPacketSize() int {
-	switch p.number {
-	case ProtocolNumber4:
-		return header.ICMPv4MinimumSize
-	case ProtocolNumber6:
-		return header.ICMPv6MinimumSize
-	}
-	panic(fmt.Sprint("unknown protocol number: ", p.number))
-}
-
 // ParsePorts in case of ICMP sets src to 0, dst to ICMP ID, and err to nil.
 func (p *protocol) ParsePorts(v []byte) (src, dst uint16, err tcpip.Error) {
 	switch p.number {

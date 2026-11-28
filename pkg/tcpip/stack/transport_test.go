@@ -290,10 +290,6 @@ func (*fakeTransportProtocol) NewRawEndpoint(tcpip.NetworkProtocolNumber, *waite
 	return nil, &tcpip.ErrUnknownProtocol{}
 }
 
-func (*fakeTransportProtocol) MinimumPacketSize() int {
-	return fakeTransHeaderLen
-}
-
 func (*fakeTransportProtocol) ParsePorts([]byte) (src, dst uint16, err tcpip.Error) {
 	return 0, 0, nil
 }
