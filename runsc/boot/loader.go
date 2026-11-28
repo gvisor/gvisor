@@ -1355,7 +1355,16 @@ func (l *Loader) rootHostFSAccess() filter.HostFSAccess {
 	if !l.root.conf.DirectFS {
 		return filter.HostFSNone
 	}
-	return filter.HostFSReadWrite
+	// The seccomp filters cannot change after the sandbox starts, and the
+	// mounts of the containers that start later are not known yet.
+	if l.noRootContainer.enabled || specutils.SpecContainerType(l.root.spec) != specutils.ContainerTypeUnspecified {
+		return filter.HostFSReadWrite
+	}
+	need, err := containerHostFSAccess(l.root.conf, l.root.spec, l.root.goferMountConfs, l.mountHints, l.root.devGoferFD != nil)
+	if err != nil || need > filter.HostFSNone {
+		return filter.HostFSReadWrite
+	}
+	return filter.HostFSNone
 }
 
 func (l *Loader) restoreHostFSAccess() filter.HostFSAccess {
@@ -1377,7 +1386,9 @@ func (l *Loader) checkDirectFSMount() error {
 	return nil
 }
 
-func subcontainerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []specutils.GoferMountConf, mountHints *sentryapi.PodMountHints, hasDevGofer bool) (filter.HostFSAccess, error) {
+// containerHostFSAccess returns the access to the host filesystem that the
+// Sentry needs for the gofer mounts and the device gofer of a container.
+func containerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []specutils.GoferMountConf, mountHints *sentryapi.PodMountHints, hasDevGofer bool) (filter.HostFSAccess, error) {
 	if !conf.DirectFS {
 		return filter.HostFSNone, nil
 	}
@@ -1457,7 +1468,7 @@ func (l *Loader) checkSubcontainerHostFSAccess(conf *config.Config, spec *specs.
 	if l.root.conf.DisableSeccomp {
 		return nil
 	}
-	need, err := subcontainerHostFSAccess(conf, spec, mountConfs, l.mountHints, hasDevGofer)
+	need, err := containerHostFSAccess(conf, spec, mountConfs, l.mountHints, hasDevGofer)
 	if err != nil {
 		return err
 	}
