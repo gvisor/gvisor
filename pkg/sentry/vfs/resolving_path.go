@@ -97,6 +97,7 @@ const (
 	rpflagsNoMagicLinks                   // same as RESOLVE_NO_MAGICLINKS
 	rpflagsNoSymlinks                     // same as RESOLVE_NO_SYMLINKS
 	rpflagsNoXDev                         // same as RESOLVE_NO_XDEV
+	rpflagsLandlockChecked                // see ResolvingPath.CheckLandlock
 )
 
 func init() {

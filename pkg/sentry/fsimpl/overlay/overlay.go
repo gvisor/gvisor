@@ -101,8 +101,9 @@ type filesystem struct {
 	// Immutable options.
 	opts FilesystemOptions
 
-	// creds is a copy of the filesystem's creator's credentials, which are
-	// used for accesses to the filesystem's layers. creds is immutable.
+	// creds is a copy of the filesystem's creator's credentials, without a
+	// Landlock domain, which are used for accesses to the filesystem's
+	// layers. creds is immutable.
 	creds *auth.Credentials
 
 	// xattrPrefix is the xattr key prefix for overlay metadata
@@ -160,6 +161,26 @@ type filesystem struct {
 	// follow to the overlay files' Landlock objects. See
 	// dentry.LandlockSlot.
 	landlock vfs.LandlockKeyMap
+
+	// creatorLandlock is the Landlock domain that the filesystem's creator
+	// had when it created the filesystem, or nil if it had none. The
+	// filesystem checks it whenever it opens a layer file; see
+	// checkLayerAccess. The filesystem holds a reference on creatorLandlock.
+	// creatorLandlock is immutable.
+	creatorLandlock *vfs.LandlockDomain
+
+	// landlockWorkDir is the "work" directory that the filesystem created in
+	// its workdir, reached through the upper layer's private mount, if
+	// creatorLandlock is not nil and the workdir is on the upper layer's
+	// filesystem. The check of a copy-up's new upper file starts there; see
+	// copyUpWriteDir. The filesystem holds a reference on landlockWorkDir if
+	// landlockWorkDir.Ok(). landlockWorkDir is immutable.
+	landlockWorkDir vfs.VirtualDentry
+
+	// landlockDetachDeleted is the result of LandlockDetachDeletedOnSave: true
+	// if the filesystem of any layer detaches the LandlockObjects of deleted
+	// files before a checkpoint. landlockDetachDeleted is immutable.
+	landlockDetachDeleted bool
 }
 
 func layerStackDepth(vd vfs.VirtualDentry) int {
@@ -226,12 +247,15 @@ type createCredsKey struct {
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
+//
+// The filesystem records the Landlock domain of the task in ctx, which creates
+// the filesystem, and checks it whenever it opens a layer file. For
+// fsconfig(FSCONFIG_CMD_CREATE), creds are those of the task that called
+// fsopen(2), which may have had another domain. All other layer operations,
+// including the creation of the work directory, use creds without a domain.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	// The layers of an overlay that a task restricted by Landlock creates
-	// would escape its domain, so such a task may not create overlays.
-	if vfs.LandlockDomainOf(creds) != nil {
-		return nil, nil, linuxerr.EPERM
-	}
+	creatorLandlock := vfs.LandlockDomainOf(auth.CredentialsFromContext(ctx))
+	creds = creds.WithoutLandlockDomain()
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsoptsRaw := opts.InternalData
 	fsopts, ok := fsoptsRaw.(FilesystemOptions)
@@ -257,6 +281,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	delete(mopts, "userxattr")
 
+	// workDir is the work directory in workdir, if creatorLandlock is not nil
+	// and the work directory could be resolved.
+	var workDir vfs.VirtualDentry
+	defer func() {
+		if workDir.Ok() {
+			workDir.DecRef(ctx)
+		}
+	}()
 	if upperPathname, ok := mopts["upperdir"]; ok {
 		if fsopts.UpperRoot.Ok() {
 			ctx.Infof("overlay.FilesystemType.GetFilesystem: both upperdir and FilesystemOptions.UpperRoot are specified")
@@ -290,6 +322,11 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			if err := vfsObj.MkdirAt(ctx, creds, &pop, &mode); err != nil && err != linuxerr.EEXIST {
 				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to create %s/work: %v", workdir, err)
+			}
+			if creatorLandlock != nil {
+				if vd, err := vfsObj.GetDentryAt(ctx, creds, &pop, &vfs.GetDentryOptions{}); err == nil {
+					workDir = vd
+				}
 			}
 			delete(mopts, "workdir")
 		}
@@ -432,15 +469,29 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 
 	fs := &filesystem{
-		opts:           fsopts,
-		creds:          creds.Fork(),
-		xattrPrefix:    xattrPrefix,
-		xattrOpaque:    xattrPrefix + "opaque",
-		dirDevMinor:    dirDevMinor,
-		lowerDevMinors: make(map[layerDevNumber]uint32),
-		dirInoCache:    make(map[layerDevNoAndIno]uint64),
-		maxFilenameLen: linux.NAME_MAX,
-		stackDepth:     stackDepth,
+		opts:            fsopts,
+		creds:           creds.Fork(),
+		xattrPrefix:     xattrPrefix,
+		xattrOpaque:     xattrPrefix + "opaque",
+		dirDevMinor:     dirDevMinor,
+		lowerDevMinors:  make(map[layerDevNumber]uint32),
+		dirInoCache:     make(map[layerDevNoAndIno]uint64),
+		maxFilenameLen:  linux.NAME_MAX,
+		stackDepth:      stackDepth,
+		creatorLandlock: creatorLandlock,
+	}
+	if fsopts.UpperRoot.Ok() {
+		fs.landlockDetachDeleted = layerDetachesDeleted(fsopts.UpperRoot)
+	}
+	for _, lowerRoot := range fsopts.LowerRoots {
+		fs.landlockDetachDeleted = fs.landlockDetachDeleted || layerDetachesDeleted(lowerRoot)
+	}
+	if creatorLandlock != nil {
+		creatorLandlock.IncRef()
+		if workDir.Ok() && fsopts.UpperRoot.Ok() && workDir.Mount().Filesystem() == fsopts.UpperRoot.Mount().Filesystem() {
+			fs.landlockWorkDir = vfs.MakeVirtualDentry(fsopts.UpperRoot.Mount(), workDir.Dentry())
+			fs.landlockWorkDir.IncRef()
+		}
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
@@ -591,6 +642,10 @@ func (fs *filesystem) Release(ctx context.Context) {
 	for _, lowerRoot := range fs.opts.LowerRoots {
 		lowerRoot.DecRef(ctx)
 	}
+	if fs.landlockWorkDir.Ok() {
+		fs.landlockWorkDir.DecRef(ctx)
+	}
+	fs.creatorLandlock.DecRef(ctx)
 }
 
 // updateMaxNameLen is analogous to fs/overlayfs/super.c:ovl_check_namelen().
@@ -1042,6 +1097,56 @@ func layerIdentifiesFilesByInode(layer vfs.VirtualDentry) bool {
 	default:
 		return false
 	}
+}
+
+// layerDetachesDeleted returns true if the filesystem of layer detaches the
+// LandlockObjects of deleted files before a checkpoint; see
+// vfs.LandlockDetachingFilesystemImpl.
+func layerDetachesDeleted(layer vfs.VirtualDentry) bool {
+	ext, ok := layer.Mount().Filesystem().Impl().(vfs.LandlockDetachingFilesystemImpl)
+	return ok && ext.LandlockDetachDeletedOnSave()
+}
+
+// checkLayerAccess returns nil if fs.creatorLandlock allows the filesystem
+// rights in accessFS on the layer file at vd, and EACCES otherwise. A nil
+// fs.creatorLandlock allows all access. fs makes this check whenever it opens
+// a layer file, whichever task causes the open, so that the layers give a
+// task no access that its domain denies. For example, an overlay created by a
+// task whose domain denies LANDLOCK_ACCESS_FS_READ_FILE on the lower layer
+// cannot open a lower file to read it, for any task.
+//
+// The ancestor walk starts at vd and ends at the root of vd's layer, since a
+// layer's private mount has no parent mount. So rules on ancestors of a layer
+// directory do not apply, and the walk takes no references, which lets
+// callers hold fs's locks.
+//
+// Preconditions: vd is a file reached through one of fs's layers. The caller
+// holds a reference on vd.
+func (fs *filesystem) checkLayerAccess(ctx context.Context, vd vfs.VirtualDentry, accessFS uint64) error {
+	return fs.creatorLandlock.CheckAccessFS(ctx, vd, accessFS, nil /* deferred */)
+}
+
+// checkLayerOpen is checkLayerAccess for an open with opts of the regular
+// layer file at vd. The open needs the rights of vfs.LandlockDomain.CheckOpenAccessFS;
+// for example, O_RDWR needs LANDLOCK_ACCESS_FS_READ_FILE and
+// LANDLOCK_ACCESS_FS_WRITE_FILE.
+//
+// Preconditions: As for checkLayerAccess.
+func (fs *filesystem) checkLayerOpen(ctx context.Context, vd vfs.VirtualDentry, opts *vfs.OpenOptions) error {
+	return fs.creatorLandlock.CheckOpenAccessFS(ctx, vd, false /* isDir */, opts, nil /* deferred */)
+}
+
+// copyUpWriteDir returns the directory from which the check of a copy-up's
+// new upper file in the copied-up directory parent starts: fs.landlockWorkDir
+// if fs has one, since Linux creates the new file in the work directory and
+// moves it into place, and parent's upper layer directory otherwise.
+//
+// Preconditions: parent has been copied up.
+func (fs *filesystem) copyUpWriteDir(parent *dentry) vfs.VirtualDentry {
+	if fs.landlockWorkDir.Ok() {
+		return fs.landlockWorkDir
+	}
+	return parent.upperVD
 }
 
 // contextID is this package's type for context.Context.Value keys.

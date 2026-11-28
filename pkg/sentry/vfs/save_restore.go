@@ -63,18 +63,38 @@ type FilesystemImplSaveRestoreExtension interface {
 	CompleteRestore(ctx context.Context, opts CompleteRestoreOptions) error
 }
 
+// LandlockDetachingFilesystemImpl is an optional extension to FilesystemImpl
+// for filesystems that cannot save a deleted file while only a LandlockObject
+// keeps it alive.
+type LandlockDetachingFilesystemImpl interface {
+	// LandlockDetachDeletedOnSave returns true if VFS must detach the
+	// LandlockObjects of the filesystem's deleted files before a checkpoint,
+	// so that the checkpoint does not fail on them. A file counts as deleted
+	// once the dentry through which the first rule named it is dead, even if
+	// another hard link or an open file description keeps the file alive.
+	// The rules on such a file then match nothing, also if the sandbox
+	// continues after the checkpoint. For example, gofer filesystems return
+	// true: they can save a deleted file only while an open file description
+	// keeps it alive.
+	LandlockDetachDeletedOnSave() bool
+}
+
 // PrepareSave prepares all filesystems for serialization.
 func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context, opts PrepareSaveOptions) error {
-	// Landlock rulesets and domains cannot be saved yet.
-	if n := vfs.landlockLive.Load(); n != 0 {
-		return fmt.Errorf("cannot save %d Landlock rulesets and domains", n)
-	}
 	fss := vfs.GetFilesystems()
 	defer func() {
 		for _, fs := range fss {
 			fs.DecRef(ctx)
 		}
 	}()
+	// Detach first, so that no LandlockObject keeps a deleted file of a
+	// filesystem that cannot save it alive when any filesystem prepares, as
+	// overlays keep files of their layers.
+	for _, fs := range fss {
+		if ext, ok := fs.impl.(LandlockDetachingFilesystemImpl); ok && ext.LandlockDetachDeletedOnSave() {
+			fs.detachDeletedLandlockObjects(ctx)
+		}
+	}
 	for _, fs := range fss {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
 			if err := ext.PrepareSave(ctx, opts); err != nil {
@@ -185,6 +205,43 @@ func (mnt *Mount) loadKey(_ goContext.Context, vd VirtualDentry) { mnt.setKey(vd
 func (vfs *VirtualFilesystem) loadMountPromises(_ goContext.Context, mps map[VirtualDentry]*mountPromise) {
 	for vd, mp := range mps {
 		vfs.mountPromises.Store(vd, mp)
+	}
+}
+
+// saveAtt is called by stateify.
+func (o *LandlockObject) saveAtt() *landlockAttachment {
+	return o.att.Load()
+}
+
+// loadAtt is called by stateify.
+func (o *LandlockObject) loadAtt(_ goContext.Context, att *landlockAttachment) {
+	o.att.Store(att)
+}
+
+// savePtr is called by stateify.
+func (s *LandlockFileSlot) savePtr() *LandlockObject {
+	return s.ptr.Load()
+}
+
+// loadPtr is called by stateify.
+func (s *LandlockFileSlot) loadPtr(_ goContext.Context, obj *LandlockObject) {
+	s.ptr.Store(obj)
+}
+
+// saveObjs is called by stateify.
+func (m *LandlockKeyMap) saveObjs() []landlockKeyEntry {
+	var entries []landlockKeyEntry
+	m.objs.Range(func(key any, obj *LandlockObject) bool {
+		entries = append(entries, landlockKeyEntry{key: key, obj: obj})
+		return true
+	})
+	return entries
+}
+
+// loadObjs is called by stateify.
+func (m *LandlockKeyMap) loadObjs(_ goContext.Context, entries []landlockKeyEntry) {
+	for _, e := range entries {
+		m.objs.Store(e.key, e.obj)
 	}
 }
 

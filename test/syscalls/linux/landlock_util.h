@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -33,6 +34,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+#include "test/util/save_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -136,6 +139,15 @@ inline int LandlockAbiVersion() {
   return landlock_create_ruleset(nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
 }
 
+inline bool LandlockErratumFixed(int number) {
+  int errata =
+      landlock_create_ruleset(nullptr, 0, LANDLOCK_CREATE_RULESET_ERRATA);
+  if (errata < 0) {
+    return false;
+  }
+  return (errata & (1 << (number - 1))) != 0;
+}
+
 inline int CreateRuleset(uint64_t handled_fs, uint64_t handled_net = 0,
                          uint64_t scoped = 0) {
   landlock_ruleset_attr attr = {};
@@ -182,6 +194,7 @@ inline void EnforceOrDie(int ruleset_fd) {
     _exit(kSetup);
   }
   close(ruleset_fd);
+  MaybeSave();
 }
 
 inline void ApplyFsPolicy(uint64_t handled_access,
@@ -229,9 +242,164 @@ inline ChildResult TryReadOpen(const std::string& path) {
   return errno == EACCES ? kDenied : kOther;
 }
 
+inline int OpenErrno(const std::string& path, int flags) {
+  int fd = open(path.c_str(), flags | O_CLOEXEC);
+  if (fd < 0) {
+    return errno;
+  }
+  close(fd);
+  return 0;
+}
+
+inline void ExpectOpen(const std::string& path, int flags, int want) {
+  int got = OpenErrno(path, flags);
+  if (got != want) {
+    fprintf(stderr, "open(%s, %#x): got errno %d, want %d\n", path.c_str(),
+            flags, got, want);
+    _exit(kOther);
+  }
+}
+
+constexpr int kExdev = 103;
+constexpr int kEperm = 104;
+
+inline int ClassifyRefer(int rc) {
+  if (rc == 0) {
+    return kAllowed;
+  }
+  if (errno == EACCES) {
+    return kDenied;
+  }
+  if (errno == EXDEV) {
+    return kExdev;
+  }
+  return kOther;
+}
+
+inline int ClassifyMount(int rc) {
+  if (rc == 0) {
+    return kAllowed;
+  }
+  return errno == EPERM ? kEperm : kOther;
+}
+
+enum ErrnoResult {
+  kErrOk = 0,
+  kErrRofs = 110,
+  kErrNoent = 111,
+  kErrAcces = 112,
+  kErrPerm = 113,
+  kErrIsdir = 114,
+  kErrNotdir = 115,
+  kErrNotempty = 116,
+  kErrInval = 117,
+  kErrExist = 118,
+  kErrUnexpected = 119,
+  kErrExdev = 120,
+};
+
+inline int ClassifyErrno(int rc) {
+  if (rc >= 0) {
+    return kErrOk;
+  }
+  switch (errno) {
+    case EROFS:
+      return kErrRofs;
+    case ENOENT:
+      return kErrNoent;
+    case EACCES:
+      return kErrAcces;
+    case EPERM:
+      return kErrPerm;
+    case EISDIR:
+      return kErrIsdir;
+    case ENOTDIR:
+      return kErrNotdir;
+    case ENOTEMPTY:
+      return kErrNotempty;
+    case EINVAL:
+      return kErrInval;
+    case EEXIST:
+      return kErrExist;
+    case EXDEV:
+      return kErrExdev;
+    default:
+      return kErrUnexpected;
+  }
+}
+
+inline void ApplyTwoDirPolicy(uint64_t handled_access, const std::string& dir1,
+                              uint64_t access1, const std::string& dir2,
+                              uint64_t access2) {
+  int fd = CreateRuleset(handled_access);
+  if (access1 != 0) {
+    AddPathRule(fd, dir1, access1);
+  }
+  if (access2 != 0) {
+    AddPathRule(fd, dir2, access2);
+  }
+  EnforceOrDie(fd);
+}
+
 #ifndef SYS_move_mount
 #define SYS_move_mount 429
 #endif
+
+inline int PivotRoot(const std::string& new_root, const std::string& put_old) {
+  return syscall(SYS_pivot_root, new_root.c_str(), put_old.c_str());
+}
+
+inline int MoveMount(int from_dirfd, const std::string& from, int to_dirfd,
+                     const std::string& to, uint32_t flags) {
+  return syscall(SYS_move_mount, from_dirfd, from.c_str(), to_dirfd, to.c_str(),
+                 flags);
+}
+
+inline pid_t ForkTracee(bool extra_layer, int* stop_fd) {
+  int stop[2], ready[2];
+  if (pipe(stop) != 0 || pipe(ready) != 0) {
+    _exit(kSetup);
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    _exit(kSetup);
+  }
+  if (pid == 0) {
+    close(stop[1]);
+    close(ready[0]);
+    if (extra_layer) {
+      EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_REG));
+    }
+    close(ready[1]);
+    char c;
+    while (read(stop[0], &c, 1) == -1 && errno == EINTR) {
+    }
+    _exit(0);
+  }
+  close(stop[0]);
+  close(ready[1]);
+  char c;
+  while (read(ready[0], &c, 1) == -1 && errno == EINTR) {
+  }
+  close(ready[0]);
+  *stop_fd = stop[1];
+  return pid;
+}
+
+inline ChildResult TryAttach(pid_t tracee, int stop_fd) {
+  int rc = ptrace(PTRACE_ATTACH, tracee, nullptr, nullptr);
+  int err = errno;
+  if (rc == 0) {
+    waitpid(tracee, nullptr, 0);
+    ptrace(PTRACE_DETACH, tracee, nullptr, nullptr);
+  }
+  close(stop_fd);
+  waitpid(tracee, nullptr, 0);
+  if (rc == 0) {
+    return kAllowed;
+  }
+  return err == EPERM ? kDenied : kOther;
+}
 
 inline sockaddr_in LoopbackAddr(uint16_t port) {
   sockaddr_in addr = {};

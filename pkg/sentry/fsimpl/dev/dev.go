@@ -60,7 +60,9 @@ func (fst FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virtual
 
 	iopts, _ := opts.InternalData.(InternalData) // If not provided, zero value is OK.
 
-	// Initialize contents.
+	// Initialize contents. This is the sentry's own work, not the caller's, so
+	// the caller's Landlock domain does not restrict it.
+	creds = creds.WithoutLandlockDomain()
 	if err := userspaceInit(ctx, vfsObj, creds, root, iopts.ShmMode); err != nil {
 		return nil, nil, err
 	}

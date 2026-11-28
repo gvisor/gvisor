@@ -23,6 +23,8 @@ import (
 )
 
 // landlockAttachment ties a live LandlockObject to its file.
+//
+// +stateify savable
 type landlockAttachment struct {
 	// fs is the filesystem of the file. fs is immutable.
 	fs *Filesystem
@@ -51,7 +53,12 @@ type landlockAttachment struct {
 // A file gets an object when the first rule naming it is created. The object
 // is reachable from the file only while a slot holds it. Slots stop holding
 // it when its last reference is dropped, or when its filesystem is destroyed;
-// a later rule for the file gets a new object.
+// a later rule for the file gets a new object. Before a checkpoint, VFS also
+// detaches the objects of deleted files on filesystems that cannot save them;
+// see LandlockDetachDeletedOnSave.
+//
+// Objects, their attachments and the slots that hold them are saved and
+// restored, so that every rule names the same files after a restore.
 //
 // +stateify savable
 type LandlockObject struct {
@@ -62,9 +69,10 @@ type LandlockObject struct {
 	refs atomicbitops.Int64
 
 	// att ties the object to its file. att is nil once the object has been
-	// released or its filesystem has been destroyed. att is set when the
-	// object is created, and cleared with its filesystem's landlockMu locked.
-	att atomic.Pointer[landlockAttachment] `state:"nosave"`
+	// released or detached from its file, so a checkpoint never refers to the
+	// file or filesystem of such an object. att is set when the object is
+	// created, and cleared with its filesystem's landlockMu locked.
+	att atomic.Pointer[landlockAttachment] `state:".(*landlockAttachment)"`
 }
 
 // IncRef increments o's reference count. The caller must already hold a
@@ -206,19 +214,48 @@ func (fs *Filesystem) ShareLandlockObject(from, to LandlockSlot, publish func())
 func (fs *Filesystem) detachLandlockObjects(ctx context.Context) {
 	fs.landlockMu.Lock()
 	fs.landlockDetached = true
-	var dentries []*Dentry
-	for obj := range fs.landlockObjects {
-		if att := obj.att.Swap(nil); att != nil {
-			att.removeFromSlotsLocked(obj)
-			dentries = append(dentries, att.dentry)
-		}
-	}
-	fs.landlockObjects = nil
+	dentries := fs.detachLandlockObjectsLocked(func(*landlockAttachment) bool { return true })
 	fs.landlockMu.Unlock()
 
 	for _, d := range dentries {
 		d.DecRef(ctx)
 	}
+}
+
+// detachDeletedLandlockObjects detaches each LandlockObject belonging to fs
+// whose file is deleted, that is, whose dentry, the one through which the
+// first rule named the file, is dead, and drops its dentry reference. Like
+// an object detached by detachLandlockObjects, a detached object stays in the
+// rulesets and domains that refer to it, and matches nothing. For example,
+// after /a/f is unlinked, a rule added through /a/f, or through another hard
+// link of the file once /a/f named it, no longer matches any file.
+func (fs *Filesystem) detachDeletedLandlockObjects(ctx context.Context) {
+	fs.landlockMu.Lock()
+	dentries := fs.detachLandlockObjectsLocked(func(att *landlockAttachment) bool { return att.dentry.IsDead() })
+	fs.landlockMu.Unlock()
+
+	for _, d := range dentries {
+		d.DecRef(ctx)
+	}
+}
+
+// detachLandlockObjectsLocked detaches each LandlockObject belonging to fs
+// whose attachment satisfies detach: it removes the object from its slots and
+// from fs.landlockObjects. It returns the dentries of the detached objects,
+// whose references the caller must drop after it unlocks fs.landlockMu.
+//
+// Preconditions: fs.landlockMu must be locked.
+func (fs *Filesystem) detachLandlockObjectsLocked(detach func(att *landlockAttachment) bool) []*Dentry {
+	var dentries []*Dentry
+	for obj := range fs.landlockObjects {
+		if att := obj.att.Load(); att != nil && detach(att) {
+			obj.att.Store(nil)
+			att.removeFromSlotsLocked(obj)
+			delete(fs.landlockObjects, obj)
+			dentries = append(dentries, att.dentry)
+		}
+	}
+	return dentries
 }
 
 // LandlockObject returns the LandlockObject of the file that d represents,
@@ -276,7 +313,7 @@ type LandlockSlot interface {
 //
 // +stateify savable
 type LandlockFileSlot struct {
-	ptr atomic.Pointer[LandlockObject] `state:"nosave"`
+	ptr atomic.Pointer[LandlockObject] `state:".(*LandlockObject)"`
 }
 
 // lookup implements LandlockSlot.lookup.
@@ -305,7 +342,16 @@ func (s *LandlockFileSlot) removeLocked(obj *LandlockObject) {
 //
 // +stateify savable
 type LandlockKeyMap struct {
-	objs landlockKeyAtomicPtrMap `state:"nosave"`
+	// objs is saved as a list of entries and rebuilt from it on restore.
+	objs landlockKeyAtomicPtrMap `state:".([]landlockKeyEntry)"`
+}
+
+// landlockKeyEntry is an entry of a saved LandlockKeyMap.
+//
+// +stateify savable
+type landlockKeyEntry struct {
+	key any
+	obj *LandlockObject
 }
 
 // Slot returns a LandlockKeySlot that locates the LandlockObject for key in

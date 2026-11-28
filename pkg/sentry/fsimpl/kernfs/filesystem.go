@@ -288,10 +288,28 @@ func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string
 	return parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite)
 }
 
-// checkDeleteLocked checks that the file represented by vfsd may be deleted.
+// checkDeleteLocked checks that the file represented by d may be deleted. It
+// makes the checks of checkDeletableLocked, then calls checkLandlock(parent),
+// which makes the Landlock check of the removal, and then makes the checks of
+// checkDeletePermissionsLocked.
 //
 // Preconditions: Filesystem.mu must be locked for at least reading.
-func checkDeleteLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry) error {
+func checkDeleteLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry, checkLandlock func(parent *Dentry) error) error {
+	if err := checkDeletableLocked(d); err != nil {
+		return err
+	}
+	if err := checkLandlock(d.parent.Load()); err != nil {
+		return err
+	}
+	return checkDeletePermissionsLocked(ctx, rp.Credentials(), d)
+}
+
+// checkDeletableLocked checks that the file represented by d can be removed
+// from its parent directory, without regard to permissions. For example, it
+// returns EBUSY if d is the root of its filesystem.
+//
+// Preconditions: Filesystem.mu must be locked for at least reading.
+func checkDeletableLocked(d *Dentry) error {
 	parent := d.parent.Load()
 	if parent == nil {
 		return linuxerr.EBUSY
@@ -308,19 +326,30 @@ func checkDeleteLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry) er
 		// node). See Linux, fs/namei.c:do_rmdir().
 		return linuxerr.EINVAL
 	}
-	if err := parent.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	return nil
+}
+
+// checkDeletePermissionsLocked checks that creds may remove the file
+// represented by d from its parent directory: creds needs write and search
+// permission on the parent, and, if the parent is sticky, must own the parent
+// or d. For example, it returns EPERM if another user's file is removed from
+// /tmp.
+//
+// Preconditions:
+//   - Filesystem.mu must be locked for at least reading.
+//   - checkDeletableLocked(d) has succeeded.
+func checkDeletePermissionsLocked(ctx context.Context, creds *auth.Credentials, d *Dentry) error {
+	parent := d.parent.Load()
+	if err := parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	if err := vfs.CheckDeleteSticky(
-		rp.Credentials(),
+	return vfs.CheckDeleteSticky(
+		creds,
 		linux.FileMode(parent.inode.Mode()),
 		auth.KUID(parent.inode.UID()),
 		auth.KUID(d.inode.UID()),
 		auth.KGID(d.inode.GID()),
-	); err != nil {
-		return err
-	}
-	return nil
+	)
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -487,10 +516,8 @@ func (fs *Filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 	if rp.Mount() != vd.Mount() {
 		return linuxerr.EXDEV
 	}
-	inode := vd.Dentry().Impl().(*Dentry).Inode()
-	if inode.Mode().IsDir() {
-		return linuxerr.EPERM
-	}
+	d := vd.Dentry().Impl().(*Dentry)
+	inode := d.Inode()
 	if err := vfs.MayLink(rp.Credentials(), inode.Mode(), nil, inode.UID(), inode.GID()); err != nil {
 		return err
 	}
@@ -507,6 +534,12 @@ func (fs *Filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	if err := rp.CheckLandlockLink(ctx, parent.VFSDentry(), inode.Mode(), d.parent.Load() == parent); err != nil {
+		return err
+	}
+	if inode.Mode().IsDir() {
+		return linuxerr.EPERM
+	}
 
 	childI, err := parent.inode.NewLink(ctx, pc, inode)
 	if err != nil {
@@ -543,6 +576,9 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	if err := rp.CheckLandlockCreate(ctx, parent.VFSDentry(), linux.ModeDirectory); err != nil {
+		return err
+	}
 	childI, err := parent.inode.NewDir(ctx, pc, opts)
 	if err != nil {
 		if !opts.ForSyntheticMountpoint || linuxerr.Equals(linuxerr.EEXIST, err) {
@@ -583,6 +619,9 @@ func (fs *Filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	if err := rp.CheckLandlockMknod(ctx, parent.VFSDentry(), &opts); err != nil {
+		return err
+	}
 	newI, err := parent.inode.NewNode(ctx, pc, opts)
 	if err != nil {
 		return err
@@ -630,6 +669,10 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			fs.mu.RUnlock()
 			return nil, err
 		}
+		if err := rp.CheckOpenExistingFile(ctx, d.VFSDentry(), d.inode.Mode(), false /* copiesUpForWrite */, &opts); err != nil {
+			fs.mu.RUnlock()
+			return nil, err
+		}
 		if trunc && d.isRegular() {
 			if err := mnt.CheckBeginWrite(); err != nil {
 				fs.mu.RUnlock()
@@ -670,6 +713,9 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			return nil, linuxerr.EEXIST
 		}
 		if err := start.mayOpen(ctx, rp.Credentials(), opts); err != nil {
+			return nil, err
+		}
+		if err := rp.CheckOpenExistingFile(ctx, start.VFSDentry(), start.inode.Mode(), false /* copiesUpForWrite */, &opts); err != nil {
 			return nil, err
 		}
 		if trunc && start.isRegular() {
@@ -733,6 +779,9 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		defer mnt.EndWrite()
+		if err := rp.CheckLandlockCreateOpen(ctx, parent.VFSDentry(), &opts); err != nil {
+			return nil, err
+		}
 		// Create and open the child.
 		childI, err := parent.inode.NewFile(ctx, pc, opts)
 		if err != nil {
@@ -765,6 +814,9 @@ afterTrailingSymlink:
 		return nil, linuxerr.ENOTDIR
 	}
 	if err := child.mayOpen(ctx, rp.Credentials(), opts); err != nil {
+		return nil, err
+	}
+	if err := rp.CheckOpenExistingFile(ctx, child.VFSDentry(), child.inode.Mode(), false /* copiesUpForWrite */, &opts); err != nil {
 		return nil, err
 	}
 	if trunc && child.isRegular() {
@@ -818,9 +870,8 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	// Only RENAME_NOREPLACE is supported.
-	if opts.Flags&^linux.RENAME_NOREPLACE != 0 {
-		return linuxerr.EINVAL
+	if err := vfs.CheckRenameFlags(opts.Flags); err != nil {
+		return err
 	}
 	noReplace := opts.Flags&linux.RENAME_NOREPLACE != 0
 
@@ -857,7 +908,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	if !fs.NoNegativeDentries {
-		if err := checkDeleteLocked(ctx, rp, src); err != nil {
+		if err := checkDeletableLocked(src); err != nil {
 			return err
 		}
 	}
@@ -887,7 +938,11 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}()
 	switch {
 	case err == nil:
-		// Ok, continue with rename as replacement.
+		// Ok, continue with rename to a new name.
+		if opts.Flags&linux.RENAME_EXCHANGE != 0 {
+			// RENAME_EXCHANGE requires that the target file exist.
+			return linuxerr.ENOENT
+		}
 	case linuxerr.Equals(linuxerr.EEXIST, err):
 		if noReplace {
 			// Won't overwrite existing node since RENAME_NOREPLACE was requested.
@@ -896,14 +951,38 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if dst == nil {
 			panic(fmt.Sprintf("Child %q for parent Dentry %+v disappeared inside atomic section?", newName, dstDir))
 		}
+	default:
+		return err
+	}
+
+	var dstType linux.FileMode
+	if dst != nil {
+		dstType = dst.inode.Mode()
+	}
+	if err := rp.CheckLandlockRename(ctx, srcDirVFSD, dstDir.VFSDentry(), src.inode.Mode(), dstType, opts.Flags); err != nil {
+		return err
+	}
+	if opts.Flags&(linux.RENAME_EXCHANGE|linux.RENAME_WHITEOUT) != 0 {
+		// Only RENAME_NOREPLACE is supported.
+		return linuxerr.EINVAL
+	}
+
+	if fs.NoNegativeDentries {
+		// checkCreateLocked found dst, since it returns EEXIST for an existing
+		// name and the lookup's error otherwise. vfs_rename succeeds for the
+		// same inode before may_delete.
+		if src.inode == dst.inode {
+			return nil
+		}
+		if err := checkDeletableLocked(src); err != nil {
+			return err
+		}
+	}
+	if err := checkDeletePermissionsLocked(ctx, rp.Credentials(), src); err != nil {
+		return err
+	}
+	if dst != nil {
 		if fs.NoNegativeDentries {
-			// vfs_rename succeeds for the same inode before may_delete.
-			if src.inode == dst.inode {
-				return nil
-			}
-			if err := checkDeleteLocked(ctx, rp, src); err != nil {
-				return err
-			}
 			if err := dstDir.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
 				return err
 			}
@@ -917,8 +996,6 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		); err != nil {
 			return err
 		}
-	default:
-		return err
 	}
 
 	if srcDir == dstDir && oldName == newName {
@@ -1003,7 +1080,9 @@ func (fs *Filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if err != nil {
 		return err
 	}
-	if err := checkDeleteLocked(ctx, rp, child); err != nil {
+	if err := checkDeleteLocked(ctx, rp, child, func(parent *Dentry) error {
+		return rp.CheckLandlock(ctx, parent.VFSDentry(), linux.LANDLOCK_ACCESS_FS_REMOVE_DIR)
+	}); err != nil {
 		return err
 	}
 	if !child.isDir() {
@@ -1135,6 +1214,9 @@ func (fs *Filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 		return err
 	}
 	defer rp.Mount().EndWrite()
+	if err := rp.CheckLandlockCreate(ctx, parent.VFSDentry(), linux.ModeSymlink); err != nil {
+		return err
+	}
 	childI, err := parent.inode.NewSymlink(ctx, pc, target)
 	if err != nil {
 		return err
@@ -1152,7 +1234,7 @@ func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	defer fs.processDeferredDecRefs(ctx)
 	defer fs.mu.Unlock()
 
-	d, err := fs.walkExistingLocked(ctx, rp)
+	parent, err := fs.walkParentDirLocked(ctx, rp, rp.Start().Impl().(*Dentry))
 	if err != nil {
 		return err
 	}
@@ -1160,7 +1242,32 @@ func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 	defer rp.Mount().EndWrite()
-	if err := checkDeleteLocked(ctx, rp, d); err != nil {
+	pc := rp.Component()
+	if pc == "." || pc == ".." {
+		return linuxerr.EISDIR
+	}
+	if err := parent.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayExec); err != nil {
+		return err
+	}
+	if len(pc) > linux.NAME_MAX && !fs.NoNegativeDentries {
+		return linuxerr.ENAMETOOLONG
+	}
+	// Look the child up in parent, without crossing into a filesystem mounted
+	// on it, so that a mount point fails with EBUSY below.
+	d, err := fs.revalidateChildLocked(ctx, rp.VirtualFilesystem(), parent, pc)
+	if err != nil {
+		return err
+	}
+	if rp.MustBeDir() {
+		// A trailing slash makes the unlink fail whatever the child is.
+		if d.isDir() {
+			return linuxerr.EISDIR
+		}
+		return linuxerr.ENOTDIR
+	}
+	if err := checkDeleteLocked(ctx, rp, d, func(parent *Dentry) error {
+		return rp.CheckLandlock(ctx, parent.VFSDentry(), linux.LANDLOCK_ACCESS_FS_REMOVE_FILE)
+	}); err != nil {
 		return err
 	}
 	if d.isDir() {
@@ -1353,6 +1460,12 @@ func (fs *Filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *Filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*Dentry))
+}
+
+// LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+func (*Filesystem) LandlockCheckedOps() vfs.LandlockOps {
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink | vfs.LandlockOpRename
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

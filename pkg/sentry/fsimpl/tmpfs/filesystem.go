@@ -280,11 +280,14 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		}
 		d := vd.Dentry().Impl().(*dentry)
 		i := d.inode
-		if i.isDir() {
-			return linuxerr.EPERM
-		}
 		if err := vfs.MayLink(auth.CredentialsFromContext(ctx), linux.FileMode(i.mode.Load()), i.accessACL.Load(), auth.KUID(i.uid.Load()), auth.KGID(i.gid.Load())); err != nil {
 			return err
+		}
+		if err := rp.CheckLandlockLink(ctx, &parentDir.dentry.vfsd, linux.FileMode(i.mode.Load()), d.parent.Load() == &parentDir.dentry); err != nil {
+			return err
+		}
+		if i.isDir() {
+			return linuxerr.EPERM
 		}
 		if i.nlink.Load() == 0 {
 			return linuxerr.ENOENT
@@ -302,6 +305,9 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 // MkdirAt implements vfs.FilesystemImpl.MkdirAt.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	return fs.doCreateAt(ctx, rp, true /* dir */, func(parentDir *directory, name string) error {
+		if err := rp.CheckLandlockCreate(ctx, &parentDir.dentry.vfsd, linux.ModeDirectory); err != nil {
+			return err
+		}
 		creds := rp.Credentials()
 		if parentDir.inode.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
@@ -320,6 +326,9 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 // MknodAt implements vfs.FilesystemImpl.MknodAt.
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
 	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
+		if err := rp.CheckLandlockMknod(ctx, &parentDir.dentry.vfsd, &opts); err != nil {
+			return err
+		}
 		creds := rp.Credentials()
 		var childInode *inode
 		var err error
@@ -432,6 +441,9 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		defer rp.Mount().EndWrite()
+		if err := rp.CheckLandlockCreateOpen(ctx, &parentDir.dentry.vfsd, &opts); err != nil {
+			return nil, err
+		}
 		// Create and open the child.
 		creds := rp.Credentials()
 		childInode, err := fs.newRegularFile(creds.FilesystemKUID, creds.FilesystemKGID, opts.Mode, parentDir)
@@ -486,14 +498,8 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {
 			return nil, err
 		}
-		if ats.MayWrite() {
-			// Reject writes to a file that is currently being executed, as
-			// Linux does in fs/namei.c:may_open() and
-			// fs/open.c:handle_truncate(). This covers O_TRUNC, which
-			// AccessTypesForOpenFlags folds into MayWrite.
-			if err := d.inode.writeCount.CheckWrite(); err != nil {
-				return nil, err
-			}
+		if err := rp.CheckOpenExistingFile(ctx, &d.vfsd, linux.FileMode(d.inode.mode.Load()), false /* copiesUpForWrite */, opts); err != nil {
+			return nil, err
 		}
 	}
 	switch impl := d.inode.impl.(type) {
@@ -524,14 +530,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		}
 		return &fd.vfsfd, nil
 	case *directory:
-		// Can't open directories with O_CREAT.
-		if opts.Flags&linux.O_CREAT != 0 {
-			return nil, linuxerr.EISDIR
-		}
-		// Can't open directories writably.
-		if ats&vfs.MayWrite != 0 {
-			return nil, linuxerr.EISDIR
-		}
 		if opts.Flags&linux.O_DIRECT != 0 {
 			return nil, linuxerr.EINVAL
 		}
@@ -589,12 +587,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	if opts.Flags&^(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) != 0 {
-		// TODO(b/145974740): Support RENAME_WHITEOUT.
-		return linuxerr.EINVAL
-	}
-	if opts.Flags&(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) == linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE {
-		return linuxerr.EINVAL
+	if err := vfs.CheckRenameFlags(opts.Flags); err != nil {
+		return err
 	}
 	exchange := opts.Flags&linux.RENAME_EXCHANGE != 0
 
@@ -621,12 +615,17 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := oldParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
+	if oldParentDir != newParentDir {
+		// Check search permission before either name is looked up, so that a
+		// rename into a directory that the caller cannot search reveals
+		// nothing about the names in it.
+		if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+			return err
+		}
+	}
 	renamed, ok := oldParentDir.childMap[oldName]
 	if !ok {
 		return linuxerr.ENOENT
-	}
-	if err := oldParentDir.mayDelete(rp.Credentials(), renamed); err != nil {
-		return err
 	}
 	// Note that we don't need to call rp.CheckMount(), since if renamed is a
 	// mount point then we want to rename the mount point, not anything in the
@@ -635,42 +634,67 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if renamed == &newParentDir.dentry || genericIsAncestorDentry(fs, renamed, &newParentDir.dentry) {
 			return linuxerr.EINVAL
 		}
-		if oldParentDir != newParentDir {
-			// Writability is needed to change renamed's "..".
-			if err := renamed.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
-				return err
-			}
-		}
 	} else {
 		if !exchange && (opts.MustBeDir || rp.MustBeDir()) {
 			return linuxerr.ENOTDIR
 		}
 	}
 
-	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
-		return err
-	}
 	replaced, ok := newParentDir.childMap[newName]
+	if ok && opts.Flags&linux.RENAME_NOREPLACE != 0 {
+		return linuxerr.EEXIST
+	}
+	if !ok && exchange {
+		// RENAME_EXCHANGE requires that the target file exist.
+		return linuxerr.ENOENT
+	}
+	var replacedType linux.FileMode
 	if ok {
-		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
-			return linuxerr.EEXIST
-		}
-		if err := newParentDir.mayDelete(rp.Credentials(), replaced); err != nil {
-			return err
-		}
-		if exchange {
-			// The exchanged files may differ in type, and a directory being
-			// exchanged may be non-empty; but exchanging a file with an
-			// ancestor directory would disconnect the latter from the tree.
-			if genericIsAncestorDentry(fs, replaced, renamed) {
+		// Exchanging a file with an ancestor directory would disconnect the
+		// latter from the tree, and replacing an ancestor directory would
+		// replace a directory that is not empty.
+		if genericIsAncestorDentry(fs, replaced, renamed) {
+			if exchange {
 				return linuxerr.EINVAL
 			}
+			return linuxerr.ENOTEMPTY
+		}
+		if exchange {
+			// The exchanged files may differ in type, but a trailing slash
+			// on either name requires a directory on that side.
 			if rp.MustBeDir() && !replaced.inode.isDir() {
 				return linuxerr.ENOTDIR
 			}
 			if opts.MustBeDir && !renamed.inode.isDir() {
 				return linuxerr.ENOTDIR
 			}
+		}
+		replacedType = linux.FileMode(replaced.inode.mode.Load())
+	}
+	if err := rp.CheckLandlockRename(ctx, &oldParentDir.dentry.vfsd, &newParentDir.dentry.vfsd, linux.FileMode(renamed.inode.mode.Load()), replacedType, opts.Flags); err != nil {
+		return err
+	}
+	if opts.Flags&linux.RENAME_WHITEOUT != 0 {
+		// TODO(b/145974740): Support RENAME_WHITEOUT.
+		return linuxerr.EINVAL
+	}
+	if err := oldParentDir.mayDelete(rp.Credentials(), renamed); err != nil {
+		return err
+	}
+	if renamed.inode.isDir() && oldParentDir != newParentDir {
+		// Writability is needed to change renamed's "..".
+		if err := renamed.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+			return err
+		}
+	}
+	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
+	if ok {
+		if err := newParentDir.mayDelete(rp.Credentials(), replaced); err != nil {
+			return err
+		}
+		if exchange {
 			if oldParentDir != newParentDir {
 				if replaced.inode.isDir() {
 					// Writability is needed to change replaced's "..".
@@ -699,14 +723,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 				return linuxerr.ENOTDIR
 			}
 		}
-	} else {
-		if exchange {
-			// RENAME_EXCHANGE requires that the target file exist.
-			return linuxerr.ENOENT
-		}
-		if renamed.inode.isDir() && newParentDir.inode.nlink.Load() == maxLinks {
-			return linuxerr.EMLINK
-		}
+	} else if renamed.inode.isDir() && newParentDir.inode.nlink.Load() == maxLinks {
+		return linuxerr.EMLINK
 	}
 	// tmpfs never calls VFS.InvalidateDentry(), so oldParentDir.dentry and
 	// newParentDir.dentry can only be dead if they were deleted.
@@ -819,9 +837,17 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if name == ".." {
 		return linuxerr.ENOTEMPTY
 	}
+	mnt := rp.Mount()
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
 	child, ok := parentDir.childMap[name]
 	if !ok {
 		return linuxerr.ENOENT
+	}
+	if err := rp.CheckLandlock(ctx, &parentDir.dentry.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR); err != nil {
+		return err
 	}
 	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
 		return err
@@ -833,11 +859,6 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if len(childDir.childMap) != 0 {
 		return linuxerr.ENOTEMPTY
 	}
-	mnt := rp.Mount()
-	if err := mnt.CheckBeginWrite(); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
@@ -911,6 +932,9 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
 	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
+		if err := rp.CheckLandlockCreate(ctx, &parentDir.dentry.vfsd, linux.ModeSymlink); err != nil {
+			return err
+		}
 		// Linux allocates a page to store symlink targets that have length larger
 		// than shortSymlinkLen. Targets are just stored as string here, but simulate
 		// the page accounting for it. See mm/shmem.c:shmem_symlink().
@@ -953,9 +977,24 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if name == "." || name == ".." {
 		return linuxerr.EISDIR
 	}
+	mnt := rp.Mount()
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
 	child, ok := parentDir.childMap[name]
 	if !ok {
 		return linuxerr.ENOENT
+	}
+	if rp.MustBeDir() {
+		// A trailing slash makes the unlink fail whatever the child is.
+		if child.inode.isDir() {
+			return linuxerr.EISDIR
+		}
+		return linuxerr.ENOTDIR
+	}
+	if err := rp.CheckLandlock(ctx, &parentDir.dentry.vfsd, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
+		return err
 	}
 	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
 		return err
@@ -963,14 +1002,6 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if child.inode.isDir() {
 		return linuxerr.EISDIR
 	}
-	if rp.MustBeDir() {
-		return linuxerr.ENOTDIR
-	}
-	mnt := rp.Mount()
-	if err := mnt.CheckBeginWrite(); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
@@ -1126,6 +1157,12 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
+// LandlockCheckedOps implements vfs.LandlockCheckingFilesystemImpl.LandlockCheckedOps.
+func (*filesystem) LandlockCheckedOps() vfs.LandlockOps {
+	return vfs.LandlockOpOpen | vfs.LandlockOpMkdir | vfs.LandlockOpMknod | vfs.LandlockOpSymlink |
+		vfs.LandlockOpUnlink | vfs.LandlockOpRmdir | vfs.LandlockOpLink | vfs.LandlockOpRename
 }
 
 // WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.

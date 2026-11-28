@@ -15,6 +15,8 @@
 package vfs
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -46,11 +48,6 @@ type LandlockDomain struct {
 	// zero, the domain drops its references on its objects; refs never
 	// increases again after that.
 	refs atomicbitops.Int64
-
-	// vfs is the VirtualFilesystem that counts the domain among its live
-	// Landlock rulesets and domains (see VirtualFilesystem.landlockLive),
-	// until refs reaches zero. vfs is immutable.
-	vfs *VirtualFilesystem
 
 	// parent is the domain that this domain was stacked onto, or nil. Only
 	// parent's identity is used, for ptrace scoping (CanPtrace); parent may
@@ -120,10 +117,8 @@ func StackLandlockDomain(parent *LandlockDomain, ruleset *LandlockRuleset) (*Lan
 		})
 	}
 
-	ruleset.vfs.landlockLive.Add(1)
 	return &LandlockDomain{
 		refs:            atomicbitops.FromInt64(1),
-		vfs:             ruleset.vfs,
 		parent:          parent,
 		handledAccessFS: handled,
 		rules:           rules,
@@ -172,7 +167,6 @@ func (d *LandlockDomain) DecRef(ctx context.Context) {
 	for obj := range d.rules {
 		obj.DecRef(ctx)
 	}
-	d.vfs.landlockLive.Add(-1)
 }
 
 // CheckMountChange returns EPERM if d does not allow its task to change the
@@ -185,6 +179,28 @@ func (d *LandlockDomain) CheckMountChange() error {
 		return linuxerr.EPERM
 	}
 	return nil
+}
+
+// CheckLandlockMountChangeAt returns nil if creds has no Landlock domain.
+// Otherwise it resolves the paths in pops, in order, and returns the error of
+// the first that fails to resolve, or EPERM, as LandlockDomain.CheckMountChange
+// does, if all of them resolve. It resolves the paths only so that their
+// errors come before the EPERM, and does not act on the resolved files. For
+// example, a bind mount onto a missing target by a task with a domain fails
+// with ENOENT, and a bind mount onto an existing target fails with EPERM.
+func (vfs *VirtualFilesystem) CheckLandlockMountChangeAt(ctx context.Context, creds *auth.Credentials, pops ...*PathOperation) error {
+	dom := LandlockDomainOf(creds)
+	if dom == nil {
+		return nil
+	}
+	for _, pop := range pops {
+		vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
+		if err != nil {
+			return err
+		}
+		vd.DecRef(ctx)
+	}
+	return dom.CheckMountChange()
 }
 
 // CanPtrace implements auth.LandlockDomain.CanPtrace.
@@ -322,10 +338,174 @@ func (d *LandlockDomain) CheckParentlessFileAccessFS(ctx context.Context, file *
 // walk takes, and drops them in rp.Release, so FilesystemImpl methods may call
 // CheckLandlock with filesystem locks held.
 //
+// If rp's credentials have a Landlock domain, CheckLandlock also records in rp
+// that the FilesystemImpl made a Landlock check, whatever its result. VFS
+// refuses an open that succeeds without such a check (see
+// VirtualFilesystem.OpenAt), and warns about a checked mutation, such as
+// mkdir, that succeeds without one (see warnIfLandlockUnchecked).
+//
 // Preconditions: d is a dentry of rp.Mount()'s filesystem. The caller holds a
 // reference on d.
 func (rp *ResolvingPath) CheckLandlock(ctx context.Context, d *Dentry, reqAccessFS uint64) error {
-	return LandlockDomainOf(rp.creds).CheckAccessFS(ctx, VirtualDentry{mount: rp.mount, dentry: d}, reqAccessFS, &rp.deferred)
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	return rp.checkLandlock(ctx, dom, d, reqAccessFS)
+}
+
+// CheckLandlockCreate checks the creation of a file of ftype's type in
+// directory parent against the Landlock domain of rp's credentials, as
+// ResolvingPath.CheckLandlock does. The creation needs the right for the new
+// file's type on parent: for example, LANDLOCK_ACCESS_FS_MAKE_DIR for a
+// directory. It returns EACCES if the domain denies the creation.
+//
+// The check must pass before the file is created, while the name is known to
+// be free, so that a denied creation creates nothing.
+//
+// Preconditions: parent is a dentry of rp.Mount()'s filesystem. The caller
+// holds a reference on parent.
+func (rp *ResolvingPath) CheckLandlockCreate(ctx context.Context, parent *Dentry, ftype linux.FileMode) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	return rp.checkLandlock(ctx, dom, parent, landlockAccessFSForCreate(ftype))
+}
+
+// CheckLandlockLink checks the creation, in directory newParent, of a hard link
+// to an existing file of ftype's type against the Landlock domain of rp's
+// credentials, and returns EACCES if the domain denies it. The link needs the
+// right to create a file of ftype's type on newParent, as
+// ResolvingPath.CheckLandlockCreate checks. sameDir is true if the existing
+// file is in newParent; the root of a filesystem is in no directory.
+//
+// Landlock ABI v1 has no right that allows a file to gain a parent directory,
+// so a link into another directory fails with EXDEV for every caller with a
+// domain, once newParent grants the right; EACCES takes priority, so that the
+// caller falls back to copying the file only if the copy could succeed. For
+// example, linking a regular file within one directory needs
+// LANDLOCK_ACCESS_FS_MAKE_REG on it, while linking it into another directory
+// fails with EACCES without MAKE_REG there, and with EXDEV otherwise.
+//
+// Preconditions: newParent is a dentry of rp.Mount()'s filesystem. The caller
+// holds a reference on newParent.
+func (rp *ResolvingPath) CheckLandlockLink(ctx context.Context, newParent *Dentry, ftype linux.FileMode, sameDir bool) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	if err := rp.checkLandlock(ctx, dom, newParent, landlockAccessFSForCreate(ftype)); err != nil {
+		return err
+	}
+	if !sameDir {
+		return linuxerr.EXDEV
+	}
+	return nil
+}
+
+// CheckLandlockRename checks the rename of a file of renamedType's type from
+// directory oldParent to directory newParent against the Landlock domain of
+// rp's credentials, and returns EACCES if the domain denies it. replacedType
+// is the type of the file at the new name, which the rename replaces, or
+// exchanges with if flags contains RENAME_EXCHANGE; it is 0 if the new name is
+// free.
+//
+// Without RENAME_EXCHANGE, oldParent needs the right to remove the renamed
+// file, and newParent needs the right to create it and, if a file is replaced,
+// the right to remove that file. With RENAME_EXCHANGE, each parent needs the
+// rights to remove the file that leaves it and to create the file that enters
+// it. If oldParent is newParent, the union of these rights is checked on it.
+//
+// As for CheckLandlockLink, Landlock ABI v1 has no right that allows a file to
+// change its parent directory: if oldParent is not newParent, the rename fails
+// with EXDEV for every caller with a domain, once both parents grant their
+// rights. For example, renaming a regular file within one directory needs
+// LANDLOCK_ACCESS_FS_REMOVE_FILE and LANDLOCK_ACCESS_FS_MAKE_REG on it, while
+// moving it into another directory fails with EACCES if either right is
+// denied, and with EXDEV otherwise.
+//
+// Preconditions: oldParent and newParent are dentries of rp.Mount()'s
+// filesystem. The caller holds references on them. flags does not contain
+// RENAME_EXCHANGE if replacedType is 0.
+func (rp *ResolvingPath) CheckLandlockRename(ctx context.Context, oldParent, newParent *Dentry, renamedType, replacedType linux.FileMode, flags uint32) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	oldAccessFS := landlockAccessFSForRemove(renamedType)
+	newAccessFS := landlockAccessFSForCreate(renamedType)
+	if replacedType != 0 {
+		newAccessFS |= landlockAccessFSForRemove(replacedType)
+		if flags&linux.RENAME_EXCHANGE != 0 {
+			oldAccessFS |= landlockAccessFSForCreate(replacedType)
+		}
+	}
+	if oldParent == newParent {
+		return rp.checkLandlock(ctx, dom, oldParent, oldAccessFS|newAccessFS)
+	}
+	if err := rp.checkLandlock(ctx, dom, oldParent, oldAccessFS); err != nil {
+		return err
+	}
+	if err := rp.checkLandlock(ctx, dom, newParent, newAccessFS); err != nil {
+		return err
+	}
+	return linuxerr.EXDEV
+}
+
+// CheckLandlockMknod makes the checks of mknod(2) with opts in directory
+// parent that a caller with a Landlock domain gets from the filesystem, in
+// this order, and returns the error of the first that fails:
+//
+//  1. The Landlock check of CheckLandlockCreate for the type of the new file,
+//     which fails with EACCES. For example, a socket file needs
+//     LANDLOCK_ACCESS_FS_MAKE_SOCK.
+//  2. The capability check of CheckMknodCapability, which fails with EPERM.
+//
+// A caller without a Landlock domain gets the capability check before path
+// resolution instead, and CheckLandlockMknod makes no check for it. So a
+// caller with a domain that may not create a device node gets EACCES if its
+// domain or the permissions of parent deny it, and EPERM only otherwise.
+//
+// Preconditions: parent is a dentry of rp.Mount()'s filesystem. The caller
+// holds a reference on parent.
+func (rp *ResolvingPath) CheckLandlockMknod(ctx context.Context, parent *Dentry, opts *MknodOptions) error {
+	dom := LandlockDomainOf(rp.creds)
+	if dom == nil {
+		return nil
+	}
+	if err := rp.checkLandlock(ctx, dom, parent, landlockAccessFSForCreate(opts.Mode)); err != nil {
+		return err
+	}
+	return CheckMknodCapability(rp.creds, opts)
+}
+
+// warnIfLandlockUnchecked logs a warning, or panics if invariant checking is
+// enabled, if rp's credentials have a Landlock domain and the FilesystemImpl
+// made no Landlock check while it performed the mutation op through rp.
+func (rp *ResolvingPath) warnIfLandlockUnchecked(ctx context.Context, op string) {
+	if rp.flags&rpflagsLandlockChecked != 0 || LandlockDomainOf(rp.creds) == nil {
+		return
+	}
+	rp.warnLandlock(ctx, fmt.Sprintf("%T.%s succeeded without checking the caller's Landlock domain", rp.mount.fs.impl, op))
+}
+
+// warnLandlock logs msg as a warning, or panics with msg if invariant checking
+// is enabled.
+func (rp *ResolvingPath) warnLandlock(ctx context.Context, msg string) {
+	if checkInvariants {
+		panic(msg)
+	}
+	ctx.Warningf("%s", msg)
+}
+
+// checkLandlock is CheckLandlock for rp's Landlock domain dom.
+//
+// Preconditions: dom == LandlockDomainOf(rp.Credentials()) != nil. d is a
+// dentry of rp.Mount()'s filesystem. The caller holds a reference on d.
+func (rp *ResolvingPath) checkLandlock(ctx context.Context, dom *LandlockDomain, d *Dentry, reqAccessFS uint64) error {
+	rp.flags |= rpflagsLandlockChecked
+	return dom.CheckAccessFS(ctx, VirtualDentry{mount: rp.mount, dentry: d}, reqAccessFS, &rp.deferred)
 }
 
 // walkLandlockMounts runs the ancestor walk from d reached through mnt and

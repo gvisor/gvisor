@@ -17,7 +17,6 @@ package mqfs
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/mq"
@@ -85,7 +84,7 @@ func NewRegistryImpl(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *
 }
 
 // Get implements mq.RegistryImpl.Get.
-func (r *RegistryImpl) Get(ctx context.Context, name string, access mq.AccessType, block bool, flags uint32) (*vfs.FileDescription, bool, error) {
+func (r *RegistryImpl) Get(ctx context.Context, name string, access mq.AccessType, block bool, flags uint32, open bool) (*vfs.FileDescription, bool, error) {
 	inode, err := r.root.Inode().(*rootInode).Lookup(ctx, name)
 	if err != nil {
 		return nil, false, nil
@@ -94,6 +93,9 @@ func (r *RegistryImpl) Get(ctx context.Context, name string, access mq.AccessTyp
 	qInode := inode.(*queueInode)
 	if err := qInode.CheckPermissions(ctx, auth.CredentialsFromContext(ctx), perm(access)); err != nil {
 		return nil, false, err
+	}
+	if !open {
+		return nil, true, nil
 	}
 
 	fd, err := r.newFD(ctx, qInode.queue, qInode, access, block, flags)
@@ -139,28 +141,47 @@ func (r *RegistryImpl) Destroy(ctx context.Context) {
 	r.mount.DecRef(ctx)
 }
 
-// newFD returns a new file description created using the given queue and inode.
+// newFD returns a new file description created using the given queue and
+// inode, after it checks the open against the caller's Landlock domain.
 func (r *RegistryImpl) newFD(ctx context.Context, q *mq.Queue, inode *queueInode, access mq.AccessType, block bool, flags uint32) (*vfs.FileDescription, error) {
-	// Landlock does not check access to queues opened by name, so a task
-	// restricted by Landlock may not open them.
-	if vfs.LandlockDomainOf(auth.CredentialsFromContext(ctx)) != nil {
-		return nil, linuxerr.EACCES
+	creds := auth.CredentialsFromContext(ctx)
+	var dentry kernfs.Dentry
+	dentry.Init(&r.fs.Filesystem, inode)
+	defer dentry.DecRef(ctx)
+
+	// The queue's dentry has no parent, so the check applies the rules on the
+	// queue and then those on the root of the filesystem. It stops there,
+	// since r.mount has no parent. Rules can name these files only through a
+	// mount of the filesystem at a path.
+	root := vfs.MakeVirtualDentry(r.mount, r.root.VFSDentry())
+	if err := vfs.LandlockDomainOf(creds).CheckParentlessFileAccessFS(ctx, dentry.VFSDentry(), root, landlockAccessFS(access), nil /* deferred */); err != nil {
+		return nil, err
 	}
+
 	view, err := mq.NewView(q, access, block)
 	if err != nil {
 		return nil, err
 	}
 
-	var dentry kernfs.Dentry
-	dentry.Init(&r.fs.Filesystem, inode)
-	defer dentry.DecRef(ctx)
-
 	fd := &queueFD{queue: view}
-	err = fd.Init(r.mount, &dentry, inode.queue, inode.Locks(), flags, auth.CredentialsFromContext(ctx))
+	err = fd.Init(r.mount, &dentry, inode.queue, inode.Locks(), flags, creds)
 	if err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
+}
+
+// landlockAccessFS returns the Landlock filesystem rights that opening a queue
+// with access needs.
+func landlockAccessFS(access mq.AccessType) uint64 {
+	switch access {
+	case mq.ReadWrite:
+		return linux.LANDLOCK_ACCESS_FS_READ_FILE | linux.LANDLOCK_ACCESS_FS_WRITE_FILE
+	case mq.WriteOnly:
+		return linux.LANDLOCK_ACCESS_FS_WRITE_FILE
+	default:
+		return linux.LANDLOCK_ACCESS_FS_READ_FILE
+	}
 }
 
 // perm returns a permission mask created using given flags.

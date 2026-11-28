@@ -805,12 +805,18 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		// ELOOP, also per may_open().
 		return nil, linuxerr.EACCES
 	}
+	if err := vfs.CheckOpenFileType(linux.FileMode(d.inode.fileType()), opts); err != nil {
+		return nil, err
+	}
+	if d.inode.fileType() == linux.S_IFREG && ats.MayWrite() {
+		return nil, linuxerr.EROFS
+	}
+	if err := rp.CheckLandlockOpen(ctx, &d.vfsd, d.inode.IsDir(), opts); err != nil {
+		return nil, err
+	}
 
 	switch d.inode.fileType() {
 	case linux.S_IFREG:
-		if ats&vfs.MayWrite != 0 {
-			return nil, linuxerr.EROFS
-		}
 		var fd regularFileFD
 		fd.LockFD.Init(&d.inode.locks)
 		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Credentials(), rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{AllowDirectIO: true}); err != nil {
@@ -819,14 +825,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		return &fd.vfsfd, nil
 
 	case linux.S_IFDIR:
-		// Can't open directories with O_CREAT.
-		if opts.Flags&linux.O_CREAT != 0 {
-			return nil, linuxerr.EISDIR
-		}
-		// Can't open directories writably.
-		if ats&vfs.MayWrite != 0 {
-			return nil, linuxerr.EISDIR
-		}
 		if opts.Flags&linux.O_DIRECT != 0 {
 			return nil, linuxerr.EINVAL
 		}

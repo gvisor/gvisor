@@ -83,10 +83,10 @@ const (
 		linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
 )
 
-// landlockMknodAccessFS returns the filesystem right that creating a file of
-// mode's type needs. A type that is not a creatable file type needs
+// landlockAccessFSForCreate returns the filesystem right that creating a file
+// of mode's type needs. A type that is not a creatable file type needs
 // LANDLOCK_ACCESS_FS_MAKE_REG, like a regular file.
-func landlockMknodAccessFS(mode linux.FileMode) uint64 {
+func landlockAccessFSForCreate(mode linux.FileMode) uint64 {
 	switch mode.FileType() {
 	case linux.ModeDirectory:
 		return linux.LANDLOCK_ACCESS_FS_MAKE_DIR
@@ -105,6 +105,16 @@ func landlockMknodAccessFS(mode linux.FileMode) uint64 {
 	}
 }
 
+// landlockAccessFSForRemove returns the filesystem right that removing a file
+// of mode's type from its directory needs: LANDLOCK_ACCESS_FS_REMOVE_DIR for a
+// directory, and LANDLOCK_ACCESS_FS_REMOVE_FILE for any other file.
+func landlockAccessFSForRemove(mode linux.FileMode) uint64 {
+	if mode.FileType() == linux.ModeDirectory {
+		return linux.LANDLOCK_ACCESS_FS_REMOVE_DIR
+	}
+	return linux.LANDLOCK_ACCESS_FS_REMOVE_FILE
+}
+
 // checkLandlockGate returns EACCES if VFS must refuse to hand path operation
 // op, which may need the filesystem rights in accessFS, to the filesystem of
 // rp.Mount(), and nil otherwise. VFS refuses it if rp's Landlock domain
@@ -120,11 +130,16 @@ func landlockMknodAccessFS(mode linux.FileMode) uint64 {
 // does not check opens itself, even beneath a rule that allows reading it.
 func (rp *ResolvingPath) checkLandlockGate(op LandlockOps, accessFS uint64) error {
 	dom := LandlockDomainOf(rp.creds)
-	if dom == nil || dom.HandledAccessFS()&accessFS == 0 || rp.mount.IsInternal() {
-		return nil
-	}
-	if c, ok := rp.mount.fs.impl.(LandlockCheckingFilesystemImpl); ok && c.LandlockCheckedOps()&op != 0 {
+	if dom == nil || dom.HandledAccessFS()&accessFS == 0 || rp.mount.IsInternal() || rp.landlockChecksOp(op) {
 		return nil
 	}
 	return linuxerr.EACCES
+}
+
+// landlockChecksOp returns true if the filesystem of rp.Mount() checks the
+// access of path operation op against Landlock domains itself (see
+// LandlockCheckingFilesystemImpl).
+func (rp *ResolvingPath) landlockChecksOp(op LandlockOps) bool {
+	c, ok := rp.mount.fs.impl.(LandlockCheckingFilesystemImpl)
+	return ok && c.LandlockCheckedOps()&op != 0
 }

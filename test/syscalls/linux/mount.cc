@@ -2937,6 +2937,51 @@ TEST(MountTest, BindMountNamespaceFileInTree) {
   EXPECT_EQ(st.st_ino, uts_st.st_ino);
 }
 
+TEST(MountTest, DevtmpfsWithoutCapMknod) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(InInitialUserNamespace()));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string null_path = JoinPath(dir.path(), "null");
+  const auto rest = [&] {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_REC | MS_PRIVATE, nullptr));
+    TEST_CHECK_NO_ERRNO(SetCapability(CAP_MKNOD, false));
+    TEST_CHECK_SUCCESS(
+        mount("none", dir.path().c_str(), "devtmpfs", 0, nullptr));
+    struct stat st;
+    TEST_CHECK_SUCCESS(stat(null_path.c_str(), &st));
+    TEST_CHECK(S_ISCHR(st.st_mode));
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, ReadOnlyBindMountAllowsIoctlOnlyOpen) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string file = JoinPath(dir.path(), "file");
+  const std::string target = JoinPath(mnt.path(), "file");
+  const auto rest = [&] {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_REC | MS_PRIVATE, nullptr));
+    TEST_CHECK_SUCCESS(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, nullptr));
+    int created = open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    TEST_PCHECK(created >= 0);
+    TEST_CHECK_SUCCESS(close(created));
+    TEST_CHECK_SUCCESS(mount(dir.path().c_str(), mnt.path().c_str(), nullptr,
+                             MS_BIND, nullptr));
+    TEST_CHECK_SUCCESS(mount(nullptr, mnt.path().c_str(), nullptr,
+                             MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr));
+    int fd = open(target.c_str(), 3);
+    TEST_PCHECK(fd >= 0);
+    TEST_CHECK_SUCCESS(close(fd));
+    TEST_CHECK(open(target.c_str(), O_WRONLY) < 0 && errno == EROFS);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
 TEST(MountTest, MountNamespacePropagation) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
@@ -3743,6 +3788,72 @@ TEST(MountTest, MountInfoAfterUnshare) {
     ASSERT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
     ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
+}
+
+TEST(MountTest, OverlayFailedRemovalDoesNotCopyUpParent) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const auto rest = [&] {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_REC | MS_PRIVATE, nullptr));
+    TEST_CHECK_SUCCESS(
+        mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr));
+    const std::string lower = JoinPath(root.path(), "lower");
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    const std::string merged = JoinPath(root.path(), "merged");
+    for (const std::string& dir :
+         {lower, upper, work, merged, JoinPath(lower, "d")}) {
+      TEST_CHECK_SUCCESS(mkdir(dir.c_str(), 0755));
+    }
+    const std::string opts = absl::StrCat(
+        "lowerdir=", lower, ",upperdir=", upper, ",workdir=", work);
+    TEST_CHECK_SUCCESS(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
+    const std::string missing = JoinPath(merged, "d/missing");
+    TEST_CHECK(unlink(missing.c_str()) < 0 && errno == ENOENT);
+    TEST_CHECK(rmdir(missing.c_str()) < 0 && errno == ENOENT);
+    struct stat st;
+    TEST_CHECK(lstat(JoinPath(upper, "d").c_str(), &st) < 0 && errno == ENOENT);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, OverlayOpenFailingFileTypeCheckDoesNotCopyUp) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const auto rest = [&] {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    TEST_CHECK_SUCCESS(mount("", "/", "", MS_REC | MS_PRIVATE, nullptr));
+    TEST_CHECK_SUCCESS(
+        mount("tmpfs", root.path().c_str(), "tmpfs", 0, nullptr));
+    const std::string lower = JoinPath(root.path(), "lower");
+    const std::string upper = JoinPath(root.path(), "upper");
+    const std::string work = JoinPath(root.path(), "work");
+    const std::string merged = JoinPath(root.path(), "merged");
+    for (const std::string& dir :
+         {lower, upper, work, merged, JoinPath(lower, "d")}) {
+      TEST_CHECK_SUCCESS(mkdir(dir.c_str(), 0755));
+    }
+    int fd = open(JoinPath(lower, "f").c_str(), O_WRONLY | O_CREAT, 0644);
+    TEST_PCHECK(fd >= 0);
+    TEST_CHECK_SUCCESS(close(fd));
+    TEST_CHECK_SUCCESS(symlink("f", JoinPath(lower, "s").c_str()));
+    const std::string opts = absl::StrCat(
+        "lowerdir=", lower, ",upperdir=", upper, ",workdir=", work);
+    TEST_CHECK_SUCCESS(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
+    TEST_CHECK(open(JoinPath(merged, "s").c_str(), O_WRONLY | O_NOFOLLOW) < 0 &&
+               errno == ELOOP);
+    TEST_CHECK(open(JoinPath(merged, "d").c_str(), O_WRONLY) < 0 &&
+               errno == EISDIR);
+    struct stat st;
+    TEST_CHECK(lstat(JoinPath(upper, "s").c_str(), &st) < 0 && errno == ENOENT);
+    TEST_CHECK(lstat(JoinPath(upper, "d").c_str(), &st) < 0 && errno == ENOENT);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
 }
 
 }  // namespace

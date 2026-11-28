@@ -174,11 +174,6 @@ type VirtualFilesystem struct {
 	// The low 32 bits store the number of currently in-progress renames
 	// VFS-wide.
 	renameState atomicbitops.Uint64
-
-	// landlockLive is the number of Landlock rulesets and domains that have
-	// not been released. Checkpoints fail while it is not zero, since their
-	// state cannot be saved.
-	landlockLive atomicbitops.Int64 `state:"nosave"`
 }
 
 const renameInProgressMask = 1<<32 - 1
@@ -333,8 +328,13 @@ func (vfs *VirtualFilesystem) GetDentryAt(ctx context.Context, creds *auth.Crede
 	}
 }
 
+// GetParentDirAndName resolves the parent directory of the file at the given
+// path, and returns the directory, with a reference taken on it, and the last
+// component of the path. For example, for "a/b/c", it returns the directory
+// "a/b" and "c". The last component itself is not resolved.
+//
 // Preconditions: pop.Path.Begin.Ok().
-func (vfs *VirtualFilesystem) getParentDirAndName(ctx context.Context, creds *auth.Credentials, pop *PathOperation) (VirtualDentry, string, error) {
+func (vfs *VirtualFilesystem) GetParentDirAndName(ctx context.Context, creds *auth.Credentials, pop *PathOperation) (VirtualDentry, string, error) {
 	if pop.scoped() {
 		// This method does not support scoped path resolution.
 		return VirtualDentry{}, "", linuxerr.EINVAL
@@ -403,8 +403,10 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
 			oldVD.DecRef(ctx)
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.LinkAt(ctx, rp, oldVD)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "LinkAt")
 			oldVD.DecRef(ctx)
 			return nil
 		}
@@ -452,8 +454,10 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 		if err := rp.checkLandlockGate(LandlockOpMkdir, linux.LANDLOCK_ACCESS_FS_MAKE_DIR); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.MkdirAt(ctx, rp, *opts)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "MkdirAt")
 			return nil
 		}
 		if checkInvariants {
@@ -469,6 +473,11 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 
 // MknodAt creates a file of the given mode at the given path. It returns an
 // error from the linuxerr package.
+//
+// The caller checks CheckMknodCapability for creds without a Landlock domain.
+// For creds with a domain, the FilesystemImpl checks it, in
+// ResolvingPath.CheckLandlockMknod; MknodAt fails with EPERM, without calling
+// a FilesystemImpl that makes no such check, if creds lack the capability.
 func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *MknodOptions) error {
 	if pop.scoped() {
 		// This method does not support scoped path resolution.
@@ -488,17 +497,31 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 		return linuxerr.EINVAL
 	}
 
+	// capErr is the capability error of a caller with a Landlock domain, which
+	// the FilesystemImpl reports in ResolvingPath.CheckLandlockMknod.
+	var capErr error
+	if LandlockDomainOf(creds) != nil {
+		capErr = CheckMknodCapability(creds, opts)
+	}
 	rp := vfs.getResolvingPath(creds, pop)
 	defer rp.Release(ctx)
 	for {
 		if err := vfs.maybeBlockOnMountPromise(ctx, rp); err != nil {
 			return err
 		}
-		if err := rp.checkLandlockGate(LandlockOpMknod, landlockMknodAccessFS(opts.Mode)); err != nil {
+		if err := rp.checkLandlockGate(LandlockOpMknod, landlockAccessFSForCreate(opts.Mode)); err != nil {
 			return err
 		}
+		if capErr != nil && !rp.landlockChecksOp(LandlockOpMknod) {
+			return capErr
+		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.MknodAt(ctx, rp, *opts)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "MknodAt")
+			if capErr != nil {
+				rp.warnLandlock(ctx, fmt.Sprintf("%T.MknodAt created a file without the caller's capability: %v", rp.mount.fs.impl, capErr))
+			}
 			return nil
 		}
 		if checkInvariants {
@@ -514,6 +537,11 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 
 // OpenAt returns a FileDescription providing access to the file at the given
 // path. A reference is taken on the returned FileDescription.
+//
+// If creds have a Landlock domain, OpenAt fails with EACCES, and closes the
+// new file, when the FilesystemImpl opens a file without checking the open
+// against the domain (see ResolvingPath.CheckLandlockOpen and
+// ResolvingPath.CheckLandlockCreateOpen).
 func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *OpenOptions) (*FileDescription, error) {
 	fsmetric.Opens.Increment()
 
@@ -569,8 +597,14 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 		if err := rp.checkLandlockGate(LandlockOpOpen, landlockOpenAccessFS); err != nil {
 			return nil, err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		fd, err := rp.mount.fs.impl.OpenAt(ctx, rp, *opts)
 		if err == nil {
+			if rp.flags&rpflagsLandlockChecked == 0 && LandlockDomainOf(creds) != nil {
+				ctx.Warningf("%T.OpenAt opened a file without checking it against the caller's Landlock domain", rp.mount.fs.impl)
+				fd.DecRef(ctx)
+				return nil, linuxerr.EACCES
+			}
 			fdCleanup := cleanup.Make(func() {
 				fd.DecRef(ctx)
 			})
@@ -654,7 +688,7 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 		return linuxerr.EINVAL
 	}
 
-	oldParentVD, oldName, err := vfs.getParentDirAndName(ctx, creds, oldpop)
+	oldParentVD, oldName, err := vfs.GetParentDirAndName(ctx, creds, oldpop)
 	if err != nil {
 		return err
 	}
@@ -690,8 +724,10 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 			oldParentVD.DecRef(ctx)
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.RenameAt(ctx, rp, oldParentVD, oldName, renameOpts)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "RenameAt")
 			oldParentVD.DecRef(ctx)
 			return nil
 		}
@@ -736,8 +772,10 @@ func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentia
 		if err := rp.checkLandlockGate(LandlockOpRmdir, linux.LANDLOCK_ACCESS_FS_REMOVE_DIR); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.RmdirAt(ctx, rp)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "RmdirAt")
 			return nil
 		}
 		if checkInvariants {
@@ -855,8 +893,10 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
 		if err := rp.checkLandlockGate(LandlockOpSymlink, linux.LANDLOCK_ACCESS_FS_MAKE_SYM); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.SymlinkAt(ctx, rp, target)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "SymlinkAt")
 			return nil
 		}
 		if checkInvariants {
@@ -899,8 +939,10 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
 		if err := rp.checkLandlockGate(LandlockOpUnlink, linux.LANDLOCK_ACCESS_FS_REMOVE_FILE); err != nil {
 			return err
 		}
+		rp.flags &^= rpflagsLandlockChecked
 		err := rp.mount.fs.impl.UnlinkAt(ctx, rp)
 		if err == nil {
+			rp.warnIfLandlockUnchecked(ctx, "UnlinkAt")
 			return nil
 		}
 		if checkInvariants {

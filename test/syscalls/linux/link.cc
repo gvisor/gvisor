@@ -18,8 +18,10 @@
 #include <sched.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -560,6 +562,39 @@ TEST(LinkTest, LinkAtWithEmptyPathNeedsNoCapForAtFcwd) {
         TEST_CHECK_SUCCESS(res);
       }),
       IsPosixErrorOkAndHolds(0));
+}
+
+TEST(LinkTest, ExistingNewnameIsEexistBeforeProtectedHardlinkEperm) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn("/tmp"));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0777), SyscallSucceeds());
+  const TempPath src =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  ASSERT_THAT(chmod(src.path().c_str(), 0644), SyscallSucceeds());
+  const TempPath existing =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  const std::string fresh = JoinPath(dir.path(), "fresh");
+  constexpr uid_t kNobody = 65534;
+  struct statfs sfs;
+  ASSERT_THAT(statfs(dir.path().c_str(), &sfs), SyscallSucceeds());
+  constexpr int64_t kFuseSuperMagic = 0x65735546;
+  SKIP_IF(static_cast<int64_t>(sfs.f_type) == kFuseSuperMagic);
+
+  const auto rest = [&] {
+    if (syscall(SYS_setresuid, kNobody, kNobody, kNobody) != 0) {
+      _exit(2);
+    }
+    if (link(src.path().c_str(), fresh.c_str()) == 0 || errno != EPERM) {
+      _exit(3);
+    }
+    TEST_CHECK(link(src.path().c_str(), existing.path().c_str()) < 0 &&
+               errno == EEXIST);
+  };
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess(rest));
+  SKIP_IF(WIFEXITED(status) &&
+          (WEXITSTATUS(status) == 2 || WEXITSTATUS(status) == 3));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "exit status " << status;
 }
 
 }  // namespace

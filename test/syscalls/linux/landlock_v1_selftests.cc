@@ -53,6 +53,16 @@ namespace testing {
 
 namespace {
 
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
+
+void CreateFile(const std::string& path) {
+  int fd = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  ASSERT_THAT(close(fd), SyscallSucceeds());
+}
+
 TEST(LandlockV1Test, AbiVersionIsSupported) {
   int version = LandlockAbiVersion();
   SKIP_IF(version < 0 && errno == ENOSYS);
@@ -350,6 +360,31 @@ TEST(LandlockV1Test, RestrictSelfRejectsBadFd) {
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied);
 }
 
+TEST(LandlockV1Test, RestrictSelfWithCapSysAdminWithoutNoNewPrivs) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  static std::string target;
+  target = file.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    landlock_ruleset_attr attr = {};
+    attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+    int fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    if (landlock_restrict_self(fd, 0) != 0) {
+      _exit(kSetup);
+    }
+    close(fd);
+    _exit(TryReadOpen(target));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, RulesetFdRejectsIO) {
   SKIP_IF(LandlockAbiVersion() < 1);
   landlock_ruleset_attr attr = {};
@@ -525,6 +560,17 @@ TEST(LandlockV1Test, AddPathBeneathRejectsInternalMountFd) {
   close(sv[1]);
 }
 
+TEST(LandlockV1Test, NamespaceFileIsOpenableUnderDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_READ_FILE |
+                               LANDLOCK_ACCESS_FS_WRITE_FILE));
+    _exit(TryReadOpen("/proc/self/ns/net"));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
 TEST(LandlockV1Test, MaxSixteenStackedLayers) {
   SKIP_IF(LandlockAbiVersion() < 1);
 
@@ -545,6 +591,1695 @@ TEST(LandlockV1Test, MaxSixteenStackedLayers) {
     _exit(rc < 0 && errno == E2BIG ? kDenied : kOther);
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ReadInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath inside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed_dir.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    _exit(TryReadOpen(target));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ReadOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    _exit(TryReadOpen(target));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, WriteFileInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath inside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed_dir.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_WRITE_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_WRITE_FILE);
+    int fd = open(target.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      close(fd);
+    }
+    _exit(ClassifyFs(fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, WriteFileOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_WRITE_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_WRITE_FILE);
+    int fd = open(target.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      close(fd);
+    }
+    _exit(ClassifyFs(fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ReadDirOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_READ_DIR);
+    int fd = open(target.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+      close(fd);
+    }
+    _exit(ClassifyFs(fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, OPathOpenNeedsNoRights) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  static std::string target;
+  target = file.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicyDenyingAll(kFsAccessV1);
+    int fd = open(target.c_str(), O_PATH | O_CLOEXEC);
+    _exit(fd >= 0 ? kAllowed : (errno == EACCES ? kDenied : kOther));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, UnhandledOpenModesRemainAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath outside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  static std::string allowed;
+  allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    int wo = open(target.c_str(), O_WRONLY);
+    if (wo < 0) {
+      _exit(ClassifyFs(wo));
+    }
+    close(wo);
+    _exit(ClassifyFs(open(target.c_str(), O_RDWR)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, SameFileRulesInTwoLayersIntersect) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  static std::string target;
+  target = file.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    constexpr uint64_t kHandled =
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
+    ApplyFsPolicy(kHandled, target, LANDLOCK_ACCESS_FS_READ_FILE);
+    if (TryReadOpen(target) != kAllowed) {
+      _exit(kSetup);
+    }
+    ApplyFsPolicy(kHandled, target, LANDLOCK_ACCESS_FS_WRITE_FILE);
+    if (TryReadOpen(target) != kDenied) {
+      _exit(kOther);
+    }
+    int fd = open(target.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      close(fd);
+      _exit(kOther);
+    }
+    _exit(errno == EACCES ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RulesInOneLayerUnionAcrossAncestry) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath parent_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath child_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent_dir.path()));
+  TempPath child_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(child_dir.path()));
+  TempPath parent_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(parent_dir.path()));
+  static std::string parent;
+  parent = parent_dir.path();
+  static std::string child;
+  child = child_dir.path();
+  static std::string in_child;
+  in_child = child_file.path();
+  static std::string in_parent;
+  in_parent = parent_file.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fd = CreateRuleset(LANDLOCK_ACCESS_FS_READ_FILE |
+                           LANDLOCK_ACCESS_FS_WRITE_FILE);
+    AddPathRule(fd, parent, LANDLOCK_ACCESS_FS_READ_FILE);
+    AddPathRule(fd, child, LANDLOCK_ACCESS_FS_WRITE_FILE);
+    EnforceOrDie(fd);
+    int rw = open(in_child.c_str(), O_RDWR);
+    if (rw < 0) {
+      _exit(ClassifyFs(rw));
+    }
+    close(rw);
+    int denied = open(in_parent.c_str(), O_RDWR);
+    if (denied >= 0 || errno != EACCES) {
+      _exit(kOther);
+    }
+    _exit(TryReadOpen(in_parent));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+constexpr uint64_t kAccessRO = LANDLOCK_ACCESS_FS_EXECUTE |
+                               LANDLOCK_ACCESS_FS_READ_FILE |
+                               LANDLOCK_ACCESS_FS_READ_DIR;
+
+constexpr uint64_t kAccessRW = kAccessRO | LANDLOCK_ACCESS_FS_WRITE_FILE;
+
+struct Layout1 {
+  std::string dir_s1d1;
+  std::string dir_s1d2;
+  std::string dir_s1d3;
+  std::string file1_s1d1;
+  std::string file1_s1d2;
+  std::string file1_s1d3;
+};
+
+void MakeLayout1(const std::string& root, Layout1* l) {
+  l->dir_s1d1 = JoinPath(root, "s1d1");
+  l->dir_s1d2 = JoinPath(l->dir_s1d1, "s1d2");
+  l->dir_s1d3 = JoinPath(l->dir_s1d2, "s1d3");
+  ASSERT_THAT(mkdir(l->dir_s1d1.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(l->dir_s1d2.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(l->dir_s1d3.c_str(), 0755), SyscallSucceeds());
+  l->file1_s1d1 = JoinPath(l->dir_s1d1, "f1");
+  l->file1_s1d2 = JoinPath(l->dir_s1d2, "f1");
+  l->file1_s1d3 = JoinPath(l->dir_s1d3, "f1");
+  ASSERT_NO_FATAL_FAILURE(CreateFile(l->file1_s1d1));
+  ASSERT_NO_FATAL_FAILURE(CreateFile(l->file1_s1d2));
+  ASSERT_NO_FATAL_FAILURE(CreateFile(l->file1_s1d3));
+}
+
+TEST(LandlockV1Test, RulesOnSameDirectoryInOneRulesetUnion) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  Layout1 l;
+  ASSERT_NO_FATAL_FAILURE(MakeLayout1(root.path(), &l));
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    int fd = CreateRuleset(kAccessRW);
+    AddPathRule(fd, l.dir_s1d2,
+                LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE);
+    AddPathRule(fd, l.dir_s1d2,
+                LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR);
+    EnforceOrDie(fd);
+
+    ExpectOpen(l.file1_s1d1, O_RDONLY, EACCES);
+    ExpectOpen(l.file1_s1d1, O_WRONLY, EACCES);
+    ExpectOpen(l.file1_s1d1, O_RDWR, EACCES);
+    ExpectOpen(l.dir_s1d1, O_RDONLY | O_DIRECTORY, EACCES);
+
+    ExpectOpen(l.file1_s1d2, O_RDONLY, 0);
+    ExpectOpen(l.file1_s1d2, O_WRONLY, 0);
+    ExpectOpen(l.file1_s1d2, O_RDWR, 0);
+    ExpectOpen(l.dir_s1d2, O_RDONLY | O_DIRECTORY, 0);
+
+    ExpectOpen(l.file1_s1d3, O_RDONLY, 0);
+    ExpectOpen(l.file1_s1d3, O_WRONLY, 0);
+    ExpectOpen(l.file1_s1d3, O_RDWR, 0);
+    ExpectOpen(l.dir_s1d3, O_RDONLY | O_DIRECTORY, 0);
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RulesAddedAfterEnforcementNeverWiden) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  Layout1 l;
+  ASSERT_NO_FATAL_FAILURE(MakeLayout1(root.path(), &l));
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    int fd = CreateRuleset(kAccessRW);
+    AddPathRule(fd, l.dir_s1d2,
+                LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR);
+    auto enforce = [fd] {
+      if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+          landlock_restrict_self(fd, 0) != 0) {
+        _exit(kSetup);
+      }
+      MaybeSave();
+    };
+    auto check = [&l] {
+      ExpectOpen(l.file1_s1d1, O_WRONLY, EACCES);
+      ExpectOpen(l.dir_s1d1, O_RDONLY | O_DIRECTORY, EACCES);
+      ExpectOpen(l.file1_s1d2, O_WRONLY, EACCES);
+      ExpectOpen(l.dir_s1d2, O_RDONLY | O_DIRECTORY, 0);
+      ExpectOpen(l.file1_s1d3, O_WRONLY, EACCES);
+      ExpectOpen(l.dir_s1d3, O_RDONLY | O_DIRECTORY, 0);
+    };
+    enforce();
+    check();
+
+    AddPathRule(fd, l.dir_s1d2, LANDLOCK_ACCESS_FS_WRITE_FILE);
+    enforce();
+    check();
+
+    AddPathRule(fd, l.dir_s1d1, kAccessRW);
+    enforce();
+    check();
+
+    AddPathRule(fd, l.dir_s1d3, LANDLOCK_ACCESS_FS_WRITE_FILE);
+    enforce();
+    close(fd);
+    check();
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LayersIntersectWhileRulesWithinALayerUnion) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  Layout1 l;
+  ASSERT_NO_FATAL_FAILURE(MakeLayout1(root.path(), &l));
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    auto check_first_layers = [&l] {
+      ExpectOpen(l.file1_s1d1, O_RDONLY, EACCES);
+      ExpectOpen(l.file1_s1d1, O_WRONLY, EACCES);
+      ExpectOpen(l.file1_s1d1, O_RDWR, EACCES);
+      ExpectOpen(l.dir_s1d1, O_RDONLY | O_DIRECTORY, EACCES);
+
+      ExpectOpen(l.file1_s1d2, O_RDONLY, 0);
+      ExpectOpen(l.file1_s1d2, O_WRONLY, EACCES);
+      ExpectOpen(l.file1_s1d2, O_RDWR, EACCES);
+
+      ExpectOpen(l.file1_s1d3, O_RDONLY, 0);
+      ExpectOpen(l.file1_s1d3, O_WRONLY, 0);
+      ExpectOpen(l.file1_s1d3, O_RDWR, 0);
+    };
+
+    int fd = CreateRuleset(kAccessRW);
+    AddPathRule(fd, l.dir_s1d2, LANDLOCK_ACCESS_FS_READ_FILE);
+    AddPathRule(fd, l.dir_s1d3, LANDLOCK_ACCESS_FS_WRITE_FILE);
+    EnforceOrDie(fd);
+    check_first_layers();
+
+    fd = CreateRuleset(kAccessRW);
+    AddPathRule(fd, l.dir_s1d2,
+                LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE);
+    EnforceOrDie(fd);
+    check_first_layers();
+
+    fd = CreateRuleset(kAccessRW);
+    AddPathRule(fd, l.dir_s1d2, LANDLOCK_ACCESS_FS_WRITE_FILE);
+    EnforceOrDie(fd);
+
+    ExpectOpen(l.file1_s1d1, O_RDONLY, EACCES);
+    ExpectOpen(l.file1_s1d1, O_WRONLY, EACCES);
+    ExpectOpen(l.file1_s1d1, O_RDWR, EACCES);
+    ExpectOpen(l.dir_s1d1, O_RDONLY | O_DIRECTORY, EACCES);
+
+    ExpectOpen(l.file1_s1d2, O_RDONLY, EACCES);
+    ExpectOpen(l.file1_s1d2, O_WRONLY, EACCES);
+    ExpectOpen(l.file1_s1d2, O_RDWR, EACCES);
+
+    ExpectOpen(l.file1_s1d3, O_RDONLY, EACCES);
+    ExpectOpen(l.file1_s1d3, O_WRONLY, 0);
+    ExpectOpen(l.file1_s1d3, O_RDWR, EACCES);
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, UnmountReleasesTheRulesFiles) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  Layout1 l;
+  ASSERT_NO_FATAL_FAILURE(MakeLayout1(root.path(), &l));
+  const std::string dir_s3d2 = JoinPath(root.path(), "s3d2");
+  const std::string dir_s3d3 = JoinPath(dir_s3d2, "s3d3");
+  ASSERT_THAT(mkdir(dir_s3d2.c_str(), 0755), SyscallSucceeds());
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", dir_s3d2.c_str(), "tmpfs", 0, nullptr) == 0);
+    TEST_PCHECK(mkdir(dir_s3d3.c_str(), 0755) == 0);
+
+    int fd = CreateRuleset(kAccessRW);
+    AddPathRule(fd, l.dir_s1d1, kAccessRO);
+    AddPathRule(fd, dir_s3d2, kAccessRO);
+    AddPathRule(fd, dir_s3d3, kAccessRO);
+
+    TEST_PCHECK(umount(dir_s3d2.c_str()) == 0);
+
+    EnforceOrDie(fd);
+    ExpectOpen(l.file1_s1d1, O_RDONLY, 0);
+    ExpectOpen(dir_s3d2, O_RDONLY, EACCES);
+    ExpectOpen(dir_s3d3, O_RDONLY, ENOENT);
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LayeredRulesetsOnlyIntersect) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath inside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed_dir.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    int fd = CreateRuleset(LANDLOCK_ACCESS_FS_READ_FILE);
+    EnforceOrDie(fd);
+    _exit(TryReadOpen(target));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, SameRulesetEnforcedTwiceStillDenies) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath inside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed_dir.path()));
+  TempPath outside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  static std::string allowed;
+  allowed = allowed_dir.path();
+  static std::string in_allowed;
+  in_allowed = inside.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fd = CreateRuleset(LANDLOCK_ACCESS_FS_READ_FILE);
+    AddPathRule(fd, allowed, LANDLOCK_ACCESS_FS_READ_FILE);
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+      _exit(kSetup);
+    }
+    if (landlock_restrict_self(fd, 0) != 0 ||
+        landlock_restrict_self(fd, 0) != 0) {
+      _exit(kSetup);
+    }
+    close(fd);
+    if (TryReadOpen(in_allowed) != kAllowed) {
+      _exit(kOther);
+    }
+    _exit(TryReadOpen(target));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RuleReachesFileThroughBindMount) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath covered_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath mount_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string dir = covered_dir.path();
+  const std::string mount_point = mount_dir.path();
+  ASSERT_NO_FATAL_FAILURE(CreateFile(JoinPath(dir, "f")));
+  const std::string via_mount = JoinPath(mount_point, "f");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(dir.c_str(), mount_point.c_str(), nullptr, MS_BIND,
+                      nullptr) == 0);
+
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, dir,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    _exit(TryReadOpen(via_mount));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RuleAboveBindMountPointReachesMountContents) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string src = JoinPath(root.path(), "src");
+  const std::string covering = JoinPath(root.path(), "covering");
+  const std::string mount_point = JoinPath(covering, "mp");
+  ASSERT_THAT(mkdir(src.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(covering.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(mount_point.c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_FATAL_FAILURE(CreateFile(JoinPath(src, "f")));
+  const std::string via_mount = JoinPath(mount_point, "f");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(src.c_str(), mount_point.c_str(), nullptr, MS_BIND,
+                      nullptr) == 0);
+
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, covering,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    _exit(TryReadOpen(via_mount));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RuleOnBindMountRootReachesDisconnectedDirectory) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string src = JoinPath(root.path(), "src");
+  const std::string mount_root = JoinPath(src, "a");
+  const std::string dir = JoinPath(mount_root, "b");
+  const std::string moved_dir = JoinPath(src, "b");
+  const std::string mount_point = JoinPath(root.path(), "mp");
+  ASSERT_THAT(mkdir(src.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(mount_root.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(dir.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(mount_point.c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_FATAL_FAILURE(CreateFile(JoinPath(dir, "f")));
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(mount_root.c_str(), mount_point.c_str(), nullptr, MS_BIND,
+                      nullptr) == 0);
+
+    int dirfd = open(JoinPath(mount_point, "b").c_str(),
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    TEST_PCHECK(dirfd >= 0);
+    TEST_PCHECK(rename(dir.c_str(), moved_dir.c_str()) == 0);
+
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, mount_root,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    _exit(ClassifyFs(openat(dirfd, "f", O_RDONLY)));
+  }));
+  const int want = LandlockErratumFixed(3) ? kAllowed : kDenied;
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == want)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MountDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath dst_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = src_dir.path();
+  const std::string to = dst_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(from.c_str(), to.c_str(), nullptr, MS_BIND, nullptr) ==
+                0);
+    TEST_PCHECK(umount2(to.c_str(), MNT_DETACH) == 0);
+
+    ApplyFsPolicy(kFsAccessV1, from, kFsAccessV1);
+    _exit(ClassifyMount(
+        mount(from.c_str(), to.c_str(), nullptr, MS_BIND, nullptr)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PivotRootDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath new_root_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string new_root = new_root_dir.path();
+  const std::string put_old = JoinPath(new_root, "old");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("none", new_root.c_str(), "tmpfs", 0, nullptr) == 0);
+    TEST_PCHECK(mkdir(put_old.c_str(), 0755) == 0);
+
+    ApplyFsPolicy(kFsAccessV1, new_root, kFsAccessV1);
+    _exit(ClassifyMount(PivotRoot(new_root, put_old)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MoveMountDeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  MoveMount(-1, "", -1, "", 0);
+  SKIP_IF(errno == ENOSYS);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath first_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath second_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = src_dir.path();
+  const std::string first = first_dir.path();
+  const std::string second = second_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(from.c_str(), first.c_str(), nullptr, MS_BIND, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, from, kFsAccessV1);
+    _exit(ClassifyMount(MoveMount(AT_FDCWD, first, AT_FDCWD, second, 0)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, Umount2DeniedWhenDomainActive) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath dst_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = src_dir.path();
+  const std::string to = dst_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount(from.c_str(), to.c_str(), nullptr, MS_BIND, nullptr) ==
+                0);
+
+    ApplyFsPolicy(kFsAccessV1, to, kFsAccessV1);
+    _exit(ClassifyMount(umount2(to.c_str(), MNT_DETACH)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kEperm)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RuleDiesWithTheFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  static std::string target;
+  target = file.release();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, target,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    if (TryReadOpen(target) != kAllowed) {
+      _exit(kSetup);
+    }
+    if (unlink(target.c_str()) != 0) {
+      _exit(kSetup);
+    }
+    int fd = open(target.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    close(fd);
+    _exit(TryReadOpen(target));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RelativePathsAreEnforced) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed_abs = JoinPath(root.path(), "a");
+  const std::string outside_abs = JoinPath(root.path(), "b");
+  ASSERT_THAT(mkdir(allowed_abs.c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(outside_abs.c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_FATAL_FAILURE(CreateFile(JoinPath(allowed_abs, "f")));
+  ASSERT_NO_FATAL_FAILURE(CreateFile(JoinPath(outside_abs, "g")));
+  static std::string top;
+  top = root.path();
+  static std::string allowed;
+  allowed = allowed_abs;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    if (chdir(top.c_str()) != 0) {
+      _exit(kSetup);
+    }
+    int outside_dirfd = open("b", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (outside_dirfd < 0) {
+      _exit(kSetup);
+    }
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    if (TryReadOpen("a/f") != kAllowed) {
+      _exit(kOther);
+    }
+    int denied = open("b/g", O_RDONLY);
+    if (denied >= 0 || errno != EACCES) {
+      _exit(kOther);
+    }
+    _exit(ClassifyFs(openat(outside_dirfd, "g", O_RDONLY)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ExecuteOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(root.path(), "#!/nonexistent\n", 0755));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_EXECUTE, allowed,
+                  LANDLOCK_ACCESS_FS_EXECUTE);
+    char* const argv[] = {const_cast<char*>(target.c_str()), nullptr};
+    char* const envp[] = {nullptr};
+    execve(target.c_str(), argv, envp);
+    _exit(errno == EACCES ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ExecuteOutsideAllowedTreeDeniedWhenOnlyReadFileHandled) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(root.path(), "#!/nonexistent\n", 0755));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_READ_FILE);
+    char* const argv[] = {const_cast<char*>(target.c_str()), nullptr};
+    char* const envp[] = {nullptr};
+    execve(target.c_str(), argv, envp);
+    _exit(errno == EACCES ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ExecuteInsideAllowedTreeDeniedWithoutReadFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath inside = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(allowed_dir.path(), "#!/nonexistent\n", 0755));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_EXECUTE);
+    char* const argv[] = {const_cast<char*>(target.c_str()), nullptr};
+    char* const envp[] = {nullptr};
+    execve(target.c_str(), argv, envp);
+    _exit(errno == EACCES ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ExecuteInsideAllowedTreeAllowedWhenReadFileUnhandled) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath inside = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(allowed_dir.path(), "#!/nonexistent\n", 0755));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_EXECUTE, allowed,
+                  LANDLOCK_ACCESS_FS_EXECUTE);
+    char* const argv[] = {const_cast<char*>(target.c_str()), nullptr};
+    char* const envp[] = {nullptr};
+    execve(target.c_str(), argv, envp);
+    _exit(errno == EACCES ? kDenied : kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ExecuteInsideAllowedTreeDeniedWithoutExecuteGrant) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath inside = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(allowed_dir.path(), "#!/nonexistent\n", 0755));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_READ_FILE);
+    char* const argv[] = {const_cast<char*>(target.c_str()), nullptr};
+    char* const envp[] = {nullptr};
+    execve(target.c_str(), argv, envp);
+    _exit(errno == EACCES ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkSameDirAllowedWithMakeReg) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkSameDirDeniedWithoutMakeReg) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    int fd = CreateRuleset(kFsAccessV1);
+    EnforceOrDie(fd);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkSameDirDoesNotRequireRemoveFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkAcrossDirectoriesRefusedWithExdev) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+  TempPath src_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(to, "hardlink");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(kFsAccessV1, from, kFsAccessV1, to, kFsAccessV1);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kExdev)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkAcrossDirectoriesWithoutRemoveFileStillReportsExdev) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from_dir.path()));
+  const std::string src = src_file.path();
+  const std::string dst = JoinPath(to_dir.path(), "linked");
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(
+        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE, from, 0,
+        to, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kExdev)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, LinkAcrossDirectoriesWithoutMakeRegReportsEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from_dir.path()));
+  const std::string src = src_file.path();
+  const std::string dst = JoinPath(to_dir.path(), "linked");
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(LANDLOCK_ACCESS_FS_MAKE_REG, from,
+                      LANDLOCK_ACCESS_FS_MAKE_REG, to, 0);
+    _exit(ClassifyRefer(link(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameSameDirAllowedWithMakeRegAndRemoveFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "renamed");
+  constexpr uint64_t kRights =
+      LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, allowed, kRights);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameSameDirDeniedWithoutRemoveFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "renamed");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameSameDirDeniedWithoutMakeReg) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "renamed");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameSameDirAllowedWhenRightsUnhandled) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(allowed, "renamed");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    int fd = CreateRuleset(LANDLOCK_ACCESS_FS_READ_DIR);
+    EnforceOrDie(fd);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameOverExistingFileDeniedWithoutRemoveFile) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  TempPath dst_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = dst_file.release();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameOverExistingFileAllowedWithBothRights) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  TempPath dst_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  const std::string src = src_file.release();
+  const std::string dst = dst_file.release();
+  constexpr uint64_t kRights =
+      LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, allowed, kRights);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameAcrossDirectoriesRefusedWithExdev) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+  TempPath src_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(to, "moved");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(kFsAccessV1, from, kFsAccessV1, to, kFsAccessV1);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kExdev)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameAcrossDirectoriesRefusedWhenRightsUnhandled) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from_dir.path()));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(to_dir.path(), "moved");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    int fd = CreateRuleset(LANDLOCK_ACCESS_FS_READ_DIR);
+    EnforceOrDie(fd);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kExdev)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameAcrossDirectoriesWithoutRemoveFileReportsEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from_dir.path()));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(to_dir.path(), "moved");
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(
+        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE, from, 0,
+        to, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameAcrossDirectoriesWithoutMakeRegReportsEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(from_dir.path()));
+  const std::string src = src_file.release();
+  const std::string dst = JoinPath(to_dir.path(), "moved");
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(
+        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE, from,
+        LANDLOCK_ACCESS_FS_REMOVE_FILE, to, 0);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameFileOverDirReportsEaccesNotEisdir) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath src_file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const TempPath dst_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  static std::string src;
+  static std::string dst;
+  src = src_file.path();
+  dst = dst_dir.path();
+
+  int control = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_READ_FILE);
+    _exit(ClassifyErrno(rename(src.c_str(), dst.c_str())));
+  }));
+  ASSERT_TRUE(WIFEXITED(control) && WEXITSTATUS(control) == kErrIsdir)
+      << "control exit status " << control;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicyDenyingAll(
+        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+        LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    _exit(ClassifyErrno(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kErrAcces)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameExchangeRequiresExchangeRights) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  static std::string allowed;
+  allowed = dir.path();
+  TempPath a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  TempPath b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed));
+  static std::string src;
+  src = a.release();
+  static std::string dst;
+  dst = b.release();
+  constexpr uint64_t kRights =
+      LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+  constexpr int kExchangeUnsupported = 107;
+  auto classify = [](int rc) -> int {
+    if (rc == 0) {
+      return kAllowed;
+    }
+    switch (errno) {
+      case EACCES:
+        return kDenied;
+      case EINVAL:
+      case ENOSYS:
+        return kExchangeUnsupported;
+      default:
+        return kOther;
+    }
+  };
+
+  int denied = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, allowed, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(classify(renameat2(AT_FDCWD, src.c_str(), AT_FDCWD, dst.c_str(),
+                             RENAME_EXCHANGE)));
+  }));
+  EXPECT_TRUE(WIFEXITED(denied) && WEXITSTATUS(denied) == kDenied)
+      << "exit status " << denied;
+
+  int granted = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, allowed, kRights);
+    _exit(classify(renameat2(AT_FDCWD, src.c_str(), AT_FDCWD, dst.c_str(),
+                             RENAME_EXCHANGE)));
+  }));
+  SKIP_IF(WIFEXITED(granted) && WEXITSTATUS(granted) == kExchangeUnsupported);
+  EXPECT_TRUE(WIFEXITED(granted) && WEXITSTATUS(granted) == kAllowed)
+      << "exit status " << granted;
+}
+
+TEST(LandlockV1Test, RenameExchangeAcrossDirectoriesRefusedWithExdev) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath a_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath b_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(a_dir.path()));
+  TempPath b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(b_dir.path()));
+  static std::string top;
+  top = root.path();
+  static std::string src;
+  src = a.release();
+  static std::string dst;
+  dst = b.release();
+  constexpr uint64_t kRights =
+      LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+  auto classify = [](int rc) -> int {
+    if (rc == 0) {
+      return kAllowed;
+    }
+    return ClassifyErrno(rc);
+  };
+
+  int granted = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, top, kRights);
+    _exit(classify(renameat2(AT_FDCWD, src.c_str(), AT_FDCWD, dst.c_str(),
+                             RENAME_EXCHANGE)));
+  }));
+  EXPECT_TRUE(WIFEXITED(granted) && WEXITSTATUS(granted) == kErrExdev)
+      << "exit status " << granted;
+
+  int denied = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, top, LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(classify(renameat2(AT_FDCWD, src.c_str(), AT_FDCWD, dst.c_str(),
+                             RENAME_EXCHANGE)));
+  }));
+  EXPECT_TRUE(WIFEXITED(denied) && WEXITSTATUS(denied) == kErrAcces)
+      << "exit status " << denied;
+}
+
+TEST(LandlockV1Test, RenameDirSameDirRequiresMakeDirAndRemoveDir) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(allowed));
+  const std::string src = src_dir.release();
+  const std::string dst = JoinPath(allowed, "renamed_dir");
+  constexpr uint64_t kRights =
+      LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, allowed, kRights);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameDirSameDirDeniedWithoutRemoveDir) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(allowed));
+  const std::string src = src_dir.release();
+  const std::string dst = JoinPath(allowed, "renamed_dir");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_DIR);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameDirAcrossDirectoriesWithoutMakeDirReportsEacces) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath from_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath to_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  TempPath src_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(from_dir.path()));
+  const std::string src = src_dir.release();
+  const std::string dst = JoinPath(to_dir.path(), "moved");
+  const std::string from = from_dir.path();
+  const std::string to = to_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyTwoDirPolicy(kFsAccessV1, from, LANDLOCK_ACCESS_FS_REMOVE_DIR, to,
+                      LANDLOCK_ACCESS_FS_MAKE_REG);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveDirOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside_dir.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    _exit(ClassifyFs(rmdir(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveDirInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath inside_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(allowed_dir.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside_dir.release();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_DIR);
+    _exit(ClassifyFs(rmdir(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveFileOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath outside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = outside.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyFs(unlink(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RemoveFileInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath inside =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(allowed_dir.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = inside.release();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_REMOVE_FILE, allowed,
+                  LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyFs(unlink(target.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MknodTypesRequireMatchingMakeRights) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  static std::string allowed;
+  allowed = dir.path();
+  static std::string fifo_path;
+  fifo_path = JoinPath(allowed, "fifo");
+  static std::string reg_path;
+  reg_path = JoinPath(allowed, "reg");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_REG,
+                  allowed, LANDLOCK_ACCESS_FS_MAKE_FIFO);
+    if (mkfifo(fifo_path.c_str(), 0644) != 0) {
+      _exit(kOther);
+    }
+    int rc = mknod(reg_path.c_str(), S_IFREG | 0644, 0);
+    _exit(rc < 0 && errno == EACCES ? kDenied : kOther);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MakeRegOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(root.path(), "new_file");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_REG);
+    int fd = open(target.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd >= 0) {
+      close(fd);
+    }
+    _exit(ClassifyFs(fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MakeRegInsideAllowedTreeAllowed) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath allowed_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(allowed_dir.path(), "new_file");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_REG, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_REG);
+    int fd = open(target.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd >= 0) {
+      close(fd);
+    }
+    _exit(ClassifyFs(fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameSymlinkSameDirRequiresMakeSym) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_link =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(allowed, "target"));
+  const std::string src = src_link.release();
+  const std::string dst = JoinPath(allowed, "renamed_link");
+  constexpr uint64_t kRights =
+      LANDLOCK_ACCESS_FS_MAKE_SYM | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(kRights, allowed, kRights);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, RenameSymlinkSameDirDeniedWithOnlyMakeReg) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string allowed = dir.path();
+  TempPath src_link =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(allowed, "target"));
+  const std::string src = src_link.release();
+  const std::string dst = JoinPath(allowed, "renamed_link");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SYM | LANDLOCK_ACCESS_FS_MAKE_REG |
+                      LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                  allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE);
+    _exit(ClassifyRefer(rename(src.c_str(), dst.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, SymlinkCreationRequiresMakeSym) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const TempPath nested_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(allowed_dir.path()));
+  static std::string allowed;
+  static std::string allowed_link;
+  static std::string nested_link;
+  static std::string denied_link;
+  allowed = allowed_dir.path();
+  allowed_link = JoinPath(allowed_dir.path(), "link");
+  nested_link = JoinPath(nested_dir.path(), "link");
+  denied_link = JoinPath(root.path(), "link");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_SYM, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_SYM);
+    if (symlink("none", allowed_link.c_str()) != 0 ||
+        symlink("none", nested_link.c_str()) != 0) {
+      _exit(kOther);
+    }
+    _exit(ClassifyFs(symlink("none", denied_link.c_str())));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+  EXPECT_THAT(unlink(nested_link.c_str()), SyscallSucceeds());
+  EXPECT_THAT(unlink(allowed_link.c_str()), SyscallSucceeds());
+}
+
+TEST(LandlockV1Test, MakeDirOutsideAllowedTreeDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath allowed_dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  const std::string allowed = allowed_dir.path();
+  static std::string target;
+  target = JoinPath(root.path(), "new_dir");
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_MAKE_DIR, allowed,
+                  LANDLOCK_ACCESS_FS_MAKE_DIR);
+    _exit(ClassifyFs(mkdir(target.c_str(), 0700)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, MagicLinkReopenCannotWidenAccess) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  static std::string allowed;
+  allowed = dir.path();
+  static std::string target;
+  target = file.path();
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
+                  allowed, LANDLOCK_ACCESS_FS_READ_FILE);
+    int fd = open(target.c_str(), O_RDONLY);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    const std::string proc_path = "/proc/self/fd/" + std::to_string(fd);
+    int ro = open(proc_path.c_str(), O_RDONLY);
+    if (ro < 0) {
+      _exit(kOther);
+    }
+    close(ro);
+    _exit(ClassifyFs(open(proc_path.c_str(), O_RDWR)));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PipeIsReopenableThroughProcFd) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fds[2];
+    if (pipe(fds) != 0) {
+      _exit(kSetup);
+    }
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_READ_FILE |
+                               LANDLOCK_ACCESS_FS_WRITE_FILE));
+    _exit(TryReadOpen("/proc/self/fd/" + std::to_string(fds[0])));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ProcFdReopenOfPipeIsExempt) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fds[2];
+    if (pipe(fds) != 0) {
+      _exit(kSetup);
+    }
+    ApplyFsPolicyDenyingAll(kFsAccessV1);
+    const std::string path = "/proc/self/fd/" + std::to_string(fds[0]);
+    _exit(TryReadOpen(path));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
       << "exit status " << status;
 }
 
@@ -571,6 +2306,331 @@ TEST(LandlockV1Test, TruncateUnrestrictedByV1Domain) {
     _exit(kAllowed);
   }));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, OverlayCopyUpAllowedByRuleOnMergedDir) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string root = base.path();
+  const std::string lower = JoinPath(root, "lower");
+  const std::string upper = JoinPath(root, "upper");
+  const std::string work = JoinPath(root, "work");
+  const std::string merged = JoinPath(root, "merged");
+  const std::string source = JoinPath(lower, "victim");
+  const std::string target = JoinPath(merged, "victim");
+  const std::string data =
+      "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.c_str(), "tmpfs", 0, nullptr) == 0);
+    TEST_PCHECK(mkdir(lower.c_str(), 0777) == 0);
+    TEST_PCHECK(mkdir(upper.c_str(), 0777) == 0);
+    TEST_PCHECK(mkdir(work.c_str(), 0777) == 0);
+    TEST_PCHECK(mkdir(merged.c_str(), 0777) == 0);
+
+    int lower_fd = open(source.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    TEST_PCHECK(lower_fd >= 0);
+    TEST_PCHECK(close(lower_fd) == 0);
+
+    if (mount("overlay", merged.c_str(), "overlay", 0, data.c_str()) != 0) {
+      _exit(kUnsupported);
+    }
+
+    ApplyFsPolicy(kFsAccessV1, merged, kFsAccessV1);
+    _exit(ClassifyFs(open(target.c_str(), O_WRONLY)));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, OverlayLayerFilesAndMergedFilesAreDifferent) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string root = base.path();
+  const std::string lower = JoinPath(root, "lower");
+  const std::string upper = JoinPath(root, "upper");
+  const std::string work = JoinPath(root, "work");
+  const std::string merged = JoinPath(root, "merged");
+  const std::string data =
+      "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
+  const std::string lower_fl = JoinPath(lower, "fl");
+  const std::string merged_fl = JoinPath(merged, "fl");
+  const std::string upper_fu = JoinPath(upper, "fu");
+  const std::string merged_fu = JoinPath(merged, "fu");
+
+  auto check = [&](const std::string& rule_dir, const std::string& target) {
+    return InForkedProcess([&] {
+      TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+      TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                  0);
+      TEST_PCHECK(mount("tmpfs", root.c_str(), "tmpfs", 0, nullptr) == 0);
+      TEST_PCHECK(mkdir(lower.c_str(), 0777) == 0);
+      TEST_PCHECK(mkdir(upper.c_str(), 0777) == 0);
+      TEST_PCHECK(mkdir(work.c_str(), 0777) == 0);
+      TEST_PCHECK(mkdir(merged.c_str(), 0777) == 0);
+      int fd = open(lower_fl.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+      TEST_PCHECK(fd >= 0);
+      TEST_PCHECK(close(fd) == 0);
+      if (mount("overlay", merged.c_str(), "overlay", 0, data.c_str()) != 0) {
+        _exit(kUnsupported);
+      }
+      fd = open(merged_fu.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+      TEST_PCHECK(fd >= 0);
+      TEST_PCHECK(close(fd) == 0);
+      ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE, rule_dir,
+                    LANDLOCK_ACCESS_FS_READ_FILE);
+      _exit(TryReadOpen(target));
+    });
+  };
+  struct Leg {
+    const std::string& rule_dir;
+    const std::string& target;
+    ChildResult want;
+    const char* what;
+  };
+  const Leg legs[] = {
+      {merged, merged_fl, kAllowed,
+       "merged rule reaches the merged lower-backed file"},
+      {merged, merged_fu, kAllowed,
+       "merged rule reaches the merged upper-backed file"},
+      {lower, lower_fl, kAllowed, "lower rule reaches the lower file"},
+      {merged, lower_fl, kDenied, "merged rule must not reach the lower file"},
+      {merged, upper_fu, kDenied, "merged rule must not reach the upper file"},
+      {lower, merged_fl, kDenied, "lower rule must not reach the merged file"},
+      {upper, merged_fu, kDenied, "upper rule must not reach the merged file"},
+  };
+  for (const Leg& leg : legs) {
+    int status = ASSERT_NO_ERRNO_AND_VALUE(check(leg.rule_dir, leg.target));
+    SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == leg.want)
+        << leg.what << ": exit status " << status;
+  }
+}
+
+TEST(LandlockV1Test, OverlayRuleOnLowerFileSurvivesCopyUp) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string root = base.path();
+  const std::string lower = JoinPath(root, "lower");
+  const std::string upper = JoinPath(root, "upper");
+  const std::string work = JoinPath(root, "work");
+  const std::string merged = JoinPath(root, "merged");
+  const std::string source = JoinPath(lower, "victim");
+  const std::string target = JoinPath(merged, "victim");
+  const std::string data =
+      "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([&] {
+    TEST_PCHECK(unshare(CLONE_NEWNS) == 0);
+    TEST_PCHECK(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) ==
+                0);
+    TEST_PCHECK(mount("tmpfs", root.c_str(), "tmpfs", 0, nullptr) == 0);
+    TEST_PCHECK(mkdir(lower.c_str(), 0777) == 0);
+    TEST_PCHECK(mkdir(upper.c_str(), 0777) == 0);
+    TEST_PCHECK(mkdir(work.c_str(), 0777) == 0);
+    TEST_PCHECK(mkdir(merged.c_str(), 0777) == 0);
+
+    int lower_fd = open(source.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    TEST_PCHECK(lower_fd >= 0);
+    TEST_PCHECK(close(lower_fd) == 0);
+
+    if (mount("overlay", merged.c_str(), "overlay", 0, data.c_str()) != 0) {
+      _exit(kUnsupported);
+    }
+
+    ApplyFsPolicy(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
+                  target,
+                  LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE);
+
+    int writable = open(target.c_str(), O_WRONLY);
+    if (writable < 0) {
+      _exit(ClassifyFs(writable));
+    }
+    TEST_PCHECK(close(writable) == 0);
+
+    _exit(ClassifyFs(open(target.c_str(), O_RDONLY)));
+  }));
+  SKIP_IF(WIFEXITED(status) && WEXITSTATUS(status) == kUnsupported);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceAttachDeniedForUnsandboxedTarget) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int stop_fd;
+    pid_t tracee = ForkTracee(false, &stop_fd);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceAttachAllowedWithinSameDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    int stop_fd;
+    pid_t tracee = ForkTracee(false, &stop_fd);
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceAttachAllowedForMoreRestrictedTarget) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    int stop_fd;
+    pid_t tracee = ForkTracee(true, &stop_fd);
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceAttachDeniedBetweenSiblingDomains) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int stop_fd;
+    pid_t tracee = ForkTracee(true, &stop_fd);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    _exit(TryAttach(tracee, stop_fd));
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceTracemeDeniedWhenParentMoreRestricted) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int go[2], result[2];
+    if (pipe(go) != 0 || pipe(result) != 0) {
+      _exit(kSetup);
+    }
+    pid_t child = fork();
+    if (child < 0) {
+      _exit(kSetup);
+    }
+    if (child == 0) {
+      close(go[1]);
+      close(result[0]);
+      char c;
+      while (read(go[0], &c, 1) == -1 && errno == EINTR) {
+      }
+      int rc = ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+      char out = rc == 0 ? kAllowed : (errno == EPERM ? kDenied : kOther);
+      write(result[1], &out, 1);
+      _exit(0);
+    }
+    close(go[0]);
+    close(result[1]);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    close(go[1]);
+
+    char out = kOther;
+    if (read(result[0], &out, 1) != 1) {
+      out = kSetup;
+    }
+    waitpid(child, nullptr, 0);
+    _exit(out);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, PtraceTracemeAllowedWithinSameDomain) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+    int result[2];
+    if (pipe(result) != 0) {
+      _exit(kSetup);
+    }
+    pid_t child = fork();
+    if (child < 0) {
+      _exit(kSetup);
+    }
+    if (child == 0) {
+      close(result[0]);
+      int rc = ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+      char out = rc == 0 ? kAllowed : (errno == EPERM ? kDenied : kOther);
+      write(result[1], &out, 1);
+      _exit(0);
+    }
+    close(result[1]);
+    char out = kOther;
+    if (read(result[0], &out, 1) != 1) {
+      out = kSetup;
+    }
+    waitpid(child, nullptr, 0);
+    _exit(out);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kAllowed)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ProcMemOfUnsandboxedTargetIsInaccessible) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int stop_fd;
+    pid_t tracee = ForkTracee(false, &stop_fd);
+    EnforceOrDie(CreateRuleset(LANDLOCK_ACCESS_FS_MAKE_DIR));
+
+    const std::string path = "/proc/" + std::to_string(tracee) + "/mem";
+    ChildResult result = TryReadOpen(path);
+    close(stop_fd);
+    waitpid(tracee, nullptr, 0);
+    _exit(result);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
+      << "exit status " << status;
+}
+
+TEST(LandlockV1Test, ProcEnvironOfUnsandboxedTargetDenied) {
+  SKIP_IF(LandlockAbiVersion() < 1);
+
+  static std::string environ_path;
+  environ_path = "/proc/" + std::to_string(getpid()) + "/environ";
+
+  int control = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    int fd = open(environ_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      _exit(kSetup);
+    }
+    char c;
+    _exit(read(fd, &c, 1) >= 0 ? kAllowed : kSetup);
+  }));
+  SKIP_IF(!(WIFEXITED(control) && WEXITSTATUS(control) == kAllowed));
+
+  int status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess([] {
+    TEST_CHECK_NO_ERRNO(SetCapabilitySets(CapSet{}));
+    ApplyFsPolicyDenyingAll(LANDLOCK_ACCESS_FS_MAKE_BLOCK);
+    int fd = open(environ_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      _exit(errno == EACCES ? kDenied : kOther);
+    }
+    char c;
+    ssize_t n = read(fd, &c, 1);
+    if (n < 0 && errno == EACCES) {
+      _exit(kDenied);
+    }
+    _exit(kAllowed);
+  }));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == kDenied)
       << "exit status " << status;
 }
 

@@ -47,9 +47,6 @@ const (
 
 // LandlockCreateRuleset implements Linux syscall landlock_create_ruleset(2).
 func LandlockCreateRuleset(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	if !t.Kernel().LandlockEnabled {
-		return 0, nil, linuxerr.ENOSYS
-	}
 	addr := args[0].Pointer()
 	size := args[1].SizeT()
 	flags := args[2].Uint()
@@ -123,9 +120,6 @@ func LandlockCreateRuleset(t *kernel.Task, sysno uintptr, args arch.SyscallArgum
 
 // LandlockAddRule implements Linux syscall landlock_add_rule(2).
 func LandlockAddRule(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	if !t.Kernel().LandlockEnabled {
-		return 0, nil, linuxerr.ENOSYS
-	}
 	rulesetFD := args[0].Int()
 	ruleType := args[1].Int()
 	addr := args[2].Pointer()
@@ -187,9 +181,6 @@ func LandlockAddRule(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) 
 
 // LandlockRestrictSelf implements Linux syscall landlock_restrict_self(2).
 func LandlockRestrictSelf(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	if !t.Kernel().LandlockEnabled {
-		return 0, nil, linuxerr.ENOSYS
-	}
 	rulesetFD := args[0].Int()
 	flags := args[1].Uint()
 

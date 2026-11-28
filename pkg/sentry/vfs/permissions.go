@@ -189,6 +189,59 @@ func AccessTypesForOpenFlags(opts *OpenOptions) AccessTypes {
 	}
 }
 
+// CheckOpenFileType returns the error that opening a file of type ftype with
+// opts reports because of the file's type, or nil if its type allows the open:
+//
+//   - ELOOP for a symlink, which is opened rather than followed only with
+//     O_NOFOLLOW. (O_PATH opens do not reach FilesystemImpls.)
+//
+//   - EISDIR for a directory opened with O_CREAT, or with an access mode or
+//     O_TRUNC that needs write access.
+func CheckOpenFileType(ftype linux.FileMode, opts *OpenOptions) error {
+	switch ftype.FileType() {
+	case linux.ModeSymlink:
+		return linuxerr.ELOOP
+	case linux.ModeDirectory:
+		if opts.Flags&linux.O_CREAT != 0 || AccessTypesForOpenFlags(opts).MayWrite() {
+			return linuxerr.EISDIR
+		}
+	}
+	return nil
+}
+
+// CheckMknodCapability returns EPERM if creds may not create a file with opts
+// for lack of capabilities, and nil otherwise. Creating a character or block
+// device needs CAP_MKNOD in the root user namespace, except for a character
+// device with device number 0:0, an overlay whiteout. This matches Linux's
+// fs/namei.c:vfs_mknod().
+func CheckMknodCapability(creds *auth.Credentials, opts *MknodOptions) error {
+	switch ft := opts.Mode.FileType(); ft {
+	case linux.ModeCharacterDevice, linux.ModeBlockDevice:
+		isWhiteout := ft == linux.ModeCharacterDevice && opts.DevMajor == 0 && opts.DevMinor == 0
+		if !isWhiteout && !creds.HasRootCapability(linux.CAP_MKNOD) {
+			return linuxerr.EPERM
+		}
+	}
+	return nil
+}
+
+// CheckRenameFlags returns EINVAL if flags is not a valid combination of
+// renameat2(2) flags, and nil otherwise. flags is invalid if it contains a
+// bit other than RENAME_NOREPLACE, RENAME_EXCHANGE and RENAME_WHITEOUT, or if
+// it contains RENAME_EXCHANGE together with RENAME_NOREPLACE or
+// RENAME_WHITEOUT. For example, RENAME_EXCHANGE|RENAME_WHITEOUT is invalid,
+// but RENAME_WHITEOUT alone is valid, even on a filesystem that does not
+// support it. This matches Linux's fs/namei.c:do_renameat2().
+func CheckRenameFlags(flags uint32) error {
+	if flags&^(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE|linux.RENAME_WHITEOUT) != 0 {
+		return linuxerr.EINVAL
+	}
+	if flags&linux.RENAME_EXCHANGE != 0 && flags&(linux.RENAME_NOREPLACE|linux.RENAME_WHITEOUT) != 0 {
+		return linuxerr.EINVAL
+	}
+	return nil
+}
+
 // MayReadFileWithOpenFlags returns true if a file with the given open flags
 // should be readable.
 func MayReadFileWithOpenFlags(flags uint32) bool {
