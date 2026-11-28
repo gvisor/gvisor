@@ -110,6 +110,23 @@ go_template_instance(
 )
 
 go_template_instance(
+    name = "temp_ref_set",
+    out = "temp_ref_set.go",
+    imports = {
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
+    package = "pgalloc",
+    prefix = "tempRef",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "tempRefInfo",
+        "Functions": "tempRefSetFunctions",
+    },
+)
+
+go_template_instance(
     name = "unfree_set",
     out = "unfree_set.go",
     consts = {
@@ -168,6 +185,7 @@ go_library(
         "pgalloc.go",
         "pgalloc_unsafe.go",
         "save_restore.go",
+        "temp_ref_set.go",
         "unfree_set.go",
         "unwaste_set.go",
     ],

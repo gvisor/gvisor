@@ -13,9 +13,14 @@
 // limitations under the License.
 
 #include <fcntl.h>
+#include <linux/capability.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -32,8 +37,10 @@
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
 #include "test/util/multiprocess_util.h"
@@ -197,6 +204,137 @@ TEST(ProcPidSmapsTest, DontDump) {
     expect_dd(start + kPageSize, true);
   };
   EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
+// Pages that a forked child shares with its parent are Shared_Dirty in both,
+// and count half toward each one's Pss, until the parent writes them, breaking
+// copy-on-write. MAP_STACK limits gVisor's copy-on-write granularity to
+// adjacent pages so the VMA retains both private and shared pages after the
+// write.
+TEST(ProcPidSmapsTest, ForkCopyOnWrite) {
+  constexpr size_t kPages = 16;
+  constexpr size_t kWrittenPages = 4;
+  // PROT_NONE guard pages on either side keep the tested vma from merging with
+  // neighbouring mappings.
+  Mapping const guarded = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon((kPages + 2) * kPageSize, PROT_NONE, MAP_PRIVATE | MAP_STACK));
+  uintptr_t const addr = guarded.addr() + kPageSize;
+  void* const region = reinterpret_cast<void*>(addr);
+  ASSERT_THAT(mprotect(region, kPages * kPageSize, PROT_READ | PROT_WRITE),
+              SyscallSucceeds());
+  memset(region, 'a', kPages * kPageSize);
+
+  pid_t const child = fork();
+  if (child == 0) {
+    while (true) {
+      pause();
+    }
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  auto cleanup = Cleanup([child] {
+    EXPECT_THAT(kill(child, SIGKILL), SyscallSucceeds());
+    EXPECT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+
+  size_t const all_kb = kPages * kPageSize / 1024;
+  size_t const written_kb = kWrittenPages * kPageSize / 1024;
+  ProcSmapsEntry const before = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+      ASSERT_NO_ERRNO_AND_VALUE(ReadProcSmaps(child)), addr));
+  EXPECT_LE(before.rss_kb, all_kb);
+  EXPECT_EQ(before.shared_dirty_kb, before.rss_kb);
+  EXPECT_EQ(before.private_dirty_kb, 0);
+  EXPECT_THAT(before.pss_kb, Optional(before.shared_dirty_kb / 2));
+
+  memset(region, 'b', kWrittenPages * kPageSize);
+
+  ProcSmapsEntry const child_after =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+          ASSERT_NO_ERRNO_AND_VALUE(ReadProcSmaps(child)), addr));
+  EXPECT_LE(child_after.rss_kb, all_kb);
+  EXPECT_EQ(child_after.shared_dirty_kb + child_after.private_dirty_kb,
+            child_after.rss_kb);
+  EXPECT_GT(child_after.shared_dirty_kb, 0);
+  EXPECT_GE(child_after.private_dirty_kb, written_kb);
+  EXPECT_THAT(child_after.pss_kb, Optional(child_after.private_dirty_kb +
+                                           child_after.shared_dirty_kb / 2));
+
+  ProcSmapsEntry const parent_after =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+          ASSERT_NO_ERRNO_AND_VALUE(ReadProcSelfSmaps()), addr));
+  EXPECT_LE(parent_after.rss_kb, all_kb);
+  EXPECT_EQ(parent_after.shared_dirty_kb, child_after.shared_dirty_kb);
+  EXPECT_GE(parent_after.private_dirty_kb, written_kb);
+  EXPECT_THAT(parent_after.pss_kb, Optional(parent_after.private_dirty_kb +
+                                            parent_after.shared_dirty_kb / 2));
+}
+
+// Locked reports the proportional size for an mlocked private VMA shared
+// across fork, and 0 for the child (which does not inherit the lock).
+TEST(ProcPidSmapsTest, ForkCopyOnWriteLocked) {
+  constexpr size_t kPages = 8;
+  constexpr size_t kWrittenPages = 2;
+  size_t const region_bytes = kPages * kPageSize;
+  struct rlimit rlim = {};
+  ASSERT_THAT(getrlimit(RLIMIT_MEMLOCK, &rlim), SyscallSucceeds());
+  bool const can_mlock =
+      rlim.rlim_cur >= region_bytes ||
+      ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_IPC_LOCK));
+  SKIP_IF(!can_mlock);
+
+  Mapping const guarded = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon((kPages + 2) * kPageSize, PROT_NONE, MAP_PRIVATE | MAP_STACK));
+  uintptr_t const addr = guarded.addr() + kPageSize;
+  void* const region = reinterpret_cast<void*>(addr);
+  ASSERT_THAT(mprotect(region, region_bytes, PROT_READ | PROT_WRITE),
+              SyscallSucceeds());
+  memset(region, 'a', region_bytes);
+  ASSERT_THAT(mlock(region, region_bytes), SyscallSucceeds());
+
+  pid_t const child = fork();
+  if (child == 0) {
+    while (true) {
+      pause();
+    }
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  auto cleanup = Cleanup([child] {
+    EXPECT_THAT(kill(child, SIGKILL), SyscallSucceeds());
+    EXPECT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+
+  size_t const written_kb = kWrittenPages * kPageSize / 1024;
+  ProcSmapsEntry const parent_before =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+          ASSERT_NO_ERRNO_AND_VALUE(ReadProcSelfSmaps()), addr));
+  EXPECT_EQ(parent_before.shared_dirty_kb, parent_before.rss_kb);
+  EXPECT_THAT(parent_before.pss_kb,
+              Optional(parent_before.shared_dirty_kb / 2));
+  EXPECT_THAT(parent_before.locked_kb,
+              Optional(parent_before.shared_dirty_kb / 2));
+
+  ProcSmapsEntry const child_before =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+          ASSERT_NO_ERRNO_AND_VALUE(ReadProcSmaps(child)), addr));
+  EXPECT_THAT(child_before.locked_kb, Optional(0));
+
+  memset(region, 'b', kWrittenPages * kPageSize);
+
+  ProcSmapsEntry const parent_after =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+          ASSERT_NO_ERRNO_AND_VALUE(ReadProcSelfSmaps()), addr));
+  EXPECT_GT(parent_after.shared_dirty_kb, 0);
+  EXPECT_GE(parent_after.private_dirty_kb, written_kb);
+  size_t const expected_pss_kb =
+      parent_after.private_dirty_kb + parent_after.shared_dirty_kb / 2;
+  EXPECT_THAT(parent_after.pss_kb, Optional(expected_pss_kb));
+  EXPECT_THAT(parent_after.locked_kb, Optional(expected_pss_kb));
+
+  ProcSmapsEntry const child_after =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+          ASSERT_NO_ERRNO_AND_VALUE(ReadProcSmaps(child)), addr));
+  EXPECT_THAT(child_after.locked_kb, Optional(0));
 }
 
 // Tests that gVisor's /proc/[pid]/smaps provides all of the fields we expect it

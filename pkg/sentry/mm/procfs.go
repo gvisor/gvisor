@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 const (
@@ -174,41 +175,70 @@ func (mm *MemoryManager) vmaSmapsEntryIntoLocked(ctx context.Context, vseg vmaIt
 	mm.appendVMAMapsEntryLocked(ctx, vseg, mm.MapsCallbackFuncForBuffer(b))
 	vma := vseg.ValuePtr()
 
-	// We take mm.activeMu here in each call to vmaSmapsEntryLocked, instead of
-	// requiring it to be locked as a precondition, to reduce the latency
-	// impact of reading /proc/[pid]/smaps on concurrent performance-sensitive
-	// operations requiring activeMu for writing like faults.
-	mm.activeMu.RLock()
-	var rss uint64
-	var anon uint64
+	// We take mm.activeMu in bounded chunks instead of holding it across the
+	// entire walk to reduce the latency impact of reading /proc/[pid]/smaps on
+	// concurrent performance-sensitive operations requiring activeMu for
+	// writing like faults.
+	const smapsMaxPMAsPerLock = 256
+	smapsMaxCOWBytes := 1024 * uint64(hostarch.PageSize)
+	var rss, anon, shared, sharedPSS uint64
 	vsegAR := vseg.Range()
-	for pseg := mm.pmas.LowerBoundSegment(vsegAR.Start); pseg.Ok() && pseg.Start() < vsegAR.End; pseg = pseg.NextSegment() {
-		psegAR := pseg.Range().Intersect(vsegAR)
-		size := uint64(psegAR.Length())
-		rss += size
-		if pseg.ValuePtr().private {
-			anon += size
+	for addr := vsegAR.Start; addr < vsegAR.End; {
+		mm.activeMu.RLock()
+		var pmas int
+		var cowBytes uint64
+		for pseg := mm.pmas.LowerBoundSegment(addr); pseg.Ok() && pseg.Start() < vsegAR.End; pseg = pseg.NextSegment() {
+			psegAR := pseg.Range().Intersect(hostarch.AddrRange{Start: addr, End: vsegAR.End})
+			pma := pseg.ValuePtr()
+			if pma.private && pma.needCOW {
+				if rem := smapsMaxCOWBytes - cowBytes; uint64(psegAR.Length()) > rem {
+					psegAR.End = psegAR.Start + hostarch.Addr(rem)
+				}
+			}
+			size := uint64(psegAR.Length())
+			rss += size
+			if pma.private {
+				anon += size
+				// Only copy-on-write pmas share private pages with other pmas,
+				// so their reference counts are mapcounts; extra references on
+				// other private pmas are pins (see MemoryManager.Fork).
+				if pma.needCOW {
+					n, pss := mm.mf.SharedBytes(pseg.fileRangeOf(psegAR))
+					shared += n
+					sharedPSS += pss
+					cowBytes += size
+				}
+			}
+			addr = psegAR.End
+			pmas++
+			if pmas >= smapsMaxPMAsPerLock || cowBytes >= smapsMaxCOWBytes {
+				break
+			}
 		}
+		if addr < vsegAR.End && pmas < smapsMaxPMAsPerLock && cowBytes < smapsMaxCOWBytes {
+			addr = vsegAR.End
+		}
+		mm.activeMu.RUnlock()
 	}
-	mm.activeMu.RUnlock()
 
 	fmt.Fprintf(b, "Size:           %8d kB\n", vseg.Range().Length()/1024)
 	fmt.Fprintf(b, "Rss:            %8d kB\n", rss/1024)
-	// Currently we report PSS = RSS, i.e. we pretend each page mapped by a pma
-	// is only mapped by that pma. This avoids having to query memmap.Mappables
-	// for reference count information on each page. As a corollary, all pages
-	// are accounted as "private" whether or not the vma is private; compare
-	// Linux's fs/proc/task_mmu.c:smaps_account().
-	fmt.Fprintf(b, "Pss:            %8d kB\n", rss/1024)
-	fmt.Fprintf(b, "Shared_Clean:   %8d kB\n", 0)
-	fmt.Fprintf(b, "Shared_Dirty:   %8d kB\n", 0)
+	// Private pages still shared copy-on-write are reported as shared and
+	// divided among their sharers in PSS; all other pages are reported as
+	// private whether or not the vma is private.
+	pssBytes := ((rss-shared)<<pgalloc.PSSShift + sharedPSS) >> pgalloc.PSSShift
+	fmt.Fprintf(b, "Pss:            %8d kB\n", pssBytes/1024)
 	// Pretend that all pages are dirty if the vma is writable, and clean otherwise.
-	clean := rss
+	var sharedClean, sharedDirty, privateClean, privateDirty uint64
 	if vma.effectivePerms.Write {
-		clean = 0
+		sharedDirty, privateDirty = shared, rss-shared
+	} else {
+		sharedClean, privateClean = shared, rss-shared
 	}
-	fmt.Fprintf(b, "Private_Clean:  %8d kB\n", clean/1024)
-	fmt.Fprintf(b, "Private_Dirty:  %8d kB\n", (rss-clean)/1024)
+	fmt.Fprintf(b, "Shared_Clean:   %8d kB\n", sharedClean/1024)
+	fmt.Fprintf(b, "Shared_Dirty:   %8d kB\n", sharedDirty/1024)
+	fmt.Fprintf(b, "Private_Clean:  %8d kB\n", privateClean/1024)
+	fmt.Fprintf(b, "Private_Dirty:  %8d kB\n", privateDirty/1024)
 	// Pretend that all pages are "referenced" (recently touched).
 	fmt.Fprintf(b, "Referenced:     %8d kB\n", rss/1024)
 	fmt.Fprintf(b, "Anonymous:      %8d kB\n", anon/1024)
@@ -221,9 +251,9 @@ func (mm *MemoryManager) vmaSmapsEntryIntoLocked(ctx context.Context, vseg vmaIt
 	fmt.Fprintf(b, "SwapPss:        %8d kB\n", 0)
 	fmt.Fprintf(b, "KernelPageSize: %8d kB\n", hostarch.PageSize/1024)
 	fmt.Fprintf(b, "MMUPageSize:    %8d kB\n", hostarch.PageSize/1024)
-	locked := rss
-	if vma.mlockMode == memmap.MLockNone {
-		locked = 0
+	var locked uint64
+	if vma.mlockMode != memmap.MLockNone {
+		locked = pssBytes
 	}
 	fmt.Fprintf(b, "Locked:         %8d kB\n", locked/1024)
 
