@@ -27,11 +27,15 @@ import (
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
-// containerManager supplies distinct savings pairs to concurrent exports.
-// Its name matches the control RPC receiver in the sandbox process.
+// containerManager supplies distinct savings pairs to concurrent exports, and
+// passes on the network args it is given. Its name matches the control RPC
+// receiver in the sandbox process.
 type containerManager struct {
 	entered chan<- struct{}
 	release <-chan struct{}
+
+	// networkArgs receives the args of each SetNetworkArgs call.
+	networkArgs chan<- *sentryapi.CreateLinksAndRoutesArgs
 
 	// lateZero delays a zero-valued first reply until another export completes.
 	lateZero <-chan struct{}

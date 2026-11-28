@@ -106,6 +106,81 @@ func waitForStatIncrement(t *testing.T, name string, stat *tcpip.StatCounter, ba
 	t.Fatalf("timed out waiting for %s to increment from %d (got %d)", name, baseline, stat.Value())
 }
 
+// TestCreateLinksAndRoutesOnLinkDefaultRoute checks that a default route
+// without a gateway is installed, and that it routes any destination directly
+// out of its link.
+func TestCreateLinksAndRoutesOnLinkDefaultRoute(t *testing.T) {
+	creator := &sandboxNetstackCreator{
+		clock: tcpip.NewStdClock(),
+		uid:   &testUniqueIDProvider{},
+	}
+	inetStack, err := creator.CreateStack()
+	if err != nil {
+		t.Fatalf("CreateStack(): %v", err)
+	}
+	s := inetStack.(*netstack.Stack).Stack
+	defer s.Destroy()
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatalf("Socketpair(): %v", err)
+	}
+	epFile := os.NewFile(uintptr(fds[0]), "proxy-ep")
+	peerFile := os.NewFile(uintptr(fds[1]), "proxy-peer")
+	defer epFile.Close()
+	defer peerFile.Close()
+
+	local4 := net.IPv4(192, 0, 2, 7).To4()
+	local6 := net.ParseIP("2001:db8::7")
+	n := &Network{Stack: s}
+	args := &sentryapi.CreateLinksAndRoutesArgs{
+		FilePayload: urpc.FilePayload{Files: []*os.File{epFile}},
+		FDBasedLinks: []sentryapi.FDBasedLink{{
+			Name: "eth0",
+			MTU:  1500,
+			Addresses: []sentryapi.IPWithPrefix{
+				{Address: local4, PrefixLen: 32},
+				{Address: local6, PrefixLen: 128},
+			},
+			NumChannels: 1,
+			IsProxy:     true,
+		}},
+		Defaultv4Gateway: sentryapi.DefaultRoute{Name: "eth0", Route: sentryapi.Route{
+			Destination: net.IPNet{IP: net.IPv4zero.To4(), Mask: net.CIDRMask(0, 32)},
+		}},
+		Defaultv6Gateway: sentryapi.DefaultRoute{Name: "eth0", Route: sentryapi.Route{
+			Destination: net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+		}},
+	}
+	if err := n.CreateLinksAndRoutes(args, nil); err != nil {
+		t.Fatalf("CreateLinksAndRoutes(): %v", err)
+	}
+
+	for _, tc := range []struct {
+		proto  tcpip.NetworkProtocolNumber
+		local  net.IP
+		remote string
+	}{
+		{header.IPv4ProtocolNumber, local4, "198.51.100.1"},
+		{header.IPv6ProtocolNumber, local6, "2001:db9::1"},
+	} {
+		remote := tcpip.AddrFromSlice(net.ParseIP(tc.remote))
+		if tc.proto == header.IPv4ProtocolNumber {
+			remote = tcpip.AddrFromSlice(net.ParseIP(tc.remote).To4())
+		}
+		r, err := s.FindRoute(0, tcpip.Address{}, remote, tc.proto, false)
+		if err != nil {
+			t.Errorf("FindRoute(%v): %v", remote, err)
+			continue
+		}
+		// An empty next hop sends to the remote address directly.
+		if r.RemoteAddress() != remote || r.NextHop() != (tcpip.Address{}) || r.LocalAddress() != tcpip.AddrFromSlice(tc.local) {
+			t.Errorf("route to %v has remote %v, next hop %q and local address %v, want %v, none and %v", remote, r.RemoteAddress(), r.NextHop(), r.LocalAddress(), remote, tc.local)
+		}
+		r.Release()
+	}
+}
+
 func TestCreateLinksAndRoutesExternalLoopback(t *testing.T) {
 	proxyIPv4 := net.IPv4(10, 0, 0, 2).To4()
 	proxyIPv6 := net.ParseIP("fd00::2").To16()

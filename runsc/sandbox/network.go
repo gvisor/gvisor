@@ -57,6 +57,10 @@ import (
 // If 'conf.Network' is NoNetwork, skips local configuration and creates a
 // loopback interface only.
 //
+// If 'conf.NetworkProxyConfig' is peer, the configuration of the
+// --network-proxy-path link comes from the peer's hello, and the network
+// namespace is not used.
+//
 // Run the following container to test it:
 //
 //	docker run -di --runtime=runsc -p 8080:80 -v $PWD:/usr/local/apache2/htdocs/ httpd:2.4
@@ -89,6 +93,12 @@ func (s *Sandbox) setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, con
 			return fmt.Errorf("creating default loopback interface: %v", err)
 		}
 	case config.NetworkSandbox:
+		if conf.NetworkProxyConfig == config.NetworkProxyConfigPeer {
+			if err := createInterfacesAndRoutesFromPeer(conn, conf, s.ID, disableIPv6, isRestore); err != nil {
+				return fmt.Errorf("creating interfaces from network proxy peer: %w", err)
+			}
+			break
+		}
 		// Build the path to the net namespace of the sandbox process.
 		// This is what we will copy.
 		nsPath := filepath.Join("/proc", strconv.Itoa(pid), "ns/net")
