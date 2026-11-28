@@ -335,6 +335,53 @@ TEST_F(OverlayLockedMountTest, LockedMountStopsOverlayUpperdir) {
               IsPosixErrorOkAndHolds(0));
 }
 
+TEST_F(OverlayLockedMountTest, UnbindableMountStopsOverlayLayer) {
+  const std::string layer = SubPath("layer");
+  const std::string other = SubPath("other");
+  const std::string upper_mnt = SubPath("upper_mnt");
+  Mkdirs({layer, other, upper_mnt});
+  if (HasFatalFailure()) {
+    return;
+  }
+  const Cleanup layer_mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", layer, kTmpfs, 0, "", MNT_DETACH));
+  const Cleanup upper_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", upper_mnt, kTmpfs, 0, "", MNT_DETACH));
+  const std::string sub = JoinPath(layer, "sub");
+  const std::string upper = JoinPath(upper_mnt, "upper");
+  const std::string work = JoinPath(upper_mnt, "work");
+  Mkdirs({sub, upper, work});
+  if (HasFatalFailure()) {
+    return;
+  }
+  const std::string lower_opts = absl::StrCat("lowerdir=", layer, ":", other);
+  const std::string sub_opts = absl::StrCat("lowerdir=", sub, ":", other);
+  const std::string upper_opts =
+      absl::StrCat("lowerdir=", other, ",upperdir=", upper, ",workdir=", work);
+
+  ASSERT_THAT(
+      mount("overlay", merged_.c_str(), "overlay", 0, lower_opts.c_str()),
+      SyscallSucceeds());
+  ASSERT_THAT(umount2(merged_.c_str(), 0), SyscallSucceeds());
+  ASSERT_THAT(mount("", layer.c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  EXPECT_THAT(
+      mount("overlay", merged_.c_str(), "overlay", 0, lower_opts.c_str()),
+      SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(mount("overlay", merged_.c_str(), "overlay", 0, sub_opts.c_str()),
+              SyscallFailsWithErrno(EINVAL));
+
+  ASSERT_THAT(
+      mount("overlay", merged_.c_str(), "overlay", 0, upper_opts.c_str()),
+      SyscallSucceeds());
+  ASSERT_THAT(umount2(merged_.c_str(), 0), SyscallSucceeds());
+  ASSERT_THAT(mount("", upper_mnt.c_str(), "", MS_UNBINDABLE, nullptr),
+              SyscallSucceeds());
+  EXPECT_THAT(
+      mount("overlay", merged_.c_str(), "overlay", 0, upper_opts.c_str()),
+      SyscallFailsWithErrno(EINVAL));
+}
+
 TEST_F(OverlayLockedMountTest, LockedMountStopsOverlayOfSysfs) {
   const std::string sys = SubPath("sys");
   const std::string other = SubPath("other");

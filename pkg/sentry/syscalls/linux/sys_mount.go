@@ -46,7 +46,7 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		flags = flags &^ linux.MS_MGC_MSK
 	}
 
-	const unsupported = linux.MS_UNBINDABLE | linux.MS_NODIRATIME
+	const unsupported = linux.MS_NODIRATIME
 
 	// Linux just allows passing any flags to mount(2) - it won't fail when
 	// unknown or unsupported flags are passed. Since we don't implement

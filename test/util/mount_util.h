@@ -101,6 +101,7 @@ struct MountOptional {
   int shared;
   int master;
   int propagate_from;
+  bool unbindable;
 };
 
 // MountOptionals returns a map of mount points to their optional fields as
