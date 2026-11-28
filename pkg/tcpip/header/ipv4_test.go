@@ -15,6 +15,7 @@
 package header_test
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -22,6 +23,132 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/prependable"
 )
+
+func TestIPv4OptionIteratorNext(t *testing.T) {
+	tests := []struct {
+		name             string
+		options          header.IPv4Options
+		wantOptions      []header.IPv4Options
+		wantConcreteType any
+		wantProblem      *header.IPv4OptParameterProblem
+	}{
+		{
+			name: "Empty",
+		},
+		{
+			name:        "NOP",
+			options:     header.IPv4Options{byte(header.IPv4OptionNOPType)},
+			wantOptions: []header.IPv4Options{{byte(header.IPv4OptionNOPType)}},
+		},
+		{
+			name:        "ListEnd",
+			options:     header.IPv4Options{byte(header.IPv4OptionListEndType)},
+			wantOptions: []header.IPv4Options{{byte(header.IPv4OptionListEndType)}},
+		},
+		{
+			name:        "Generic",
+			options:     header.IPv4Options{2, 3, 0xff},
+			wantOptions: []header.IPv4Options{{2, 3, 0xff}},
+		},
+		{
+			name:             "RouterAlert",
+			options:          header.IPv4Options{byte(header.IPv4OptionRouterAlertType), header.IPv4OptionRouterAlertLength, 0, 0},
+			wantOptions:      []header.IPv4Options{{byte(header.IPv4OptionRouterAlertType), header.IPv4OptionRouterAlertLength, 0, 0}},
+			wantConcreteType: (*header.IPv4OptionRouterAlert)(nil),
+		},
+		{
+			name:        "TruncatedAfterNOP",
+			options:     header.IPv4Options{byte(header.IPv4OptionNOPType), 2},
+			wantOptions: []header.IPv4Options{{byte(header.IPv4OptionNOPType)}},
+			wantProblem: &header.IPv4OptParameterProblem{Pointer: header.IPv4MinimumSize + 1, NeedICMP: true},
+		},
+		{
+			name:        "LengthTooShortAfterNOP",
+			options:     header.IPv4Options{byte(header.IPv4OptionNOPType), 2, 1},
+			wantOptions: []header.IPv4Options{{byte(header.IPv4OptionNOPType)}},
+			wantProblem: &header.IPv4OptParameterProblem{Pointer: header.IPv4MinimumSize + 1, NeedICMP: true},
+		},
+		{
+			name:        "LengthTooLongAfterNOP",
+			options:     header.IPv4Options{byte(header.IPv4OptionNOPType), 2, 3},
+			wantOptions: []header.IPv4Options{{byte(header.IPv4OptionNOPType)}},
+			wantProblem: &header.IPv4OptParameterProblem{Pointer: header.IPv4MinimumSize + 1, NeedICMP: true},
+		},
+		{
+			name:    "InvalidRouterAlertLength",
+			options: header.IPv4Options{byte(header.IPv4OptionRouterAlertType), 3, 0},
+			wantProblem: &header.IPv4OptParameterProblem{
+				Pointer:  header.IPv4MinimumSize + header.IPv4OptionLengthOffset,
+				NeedICMP: true,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			iterator := test.options.MakeIterator()
+			for optionIndex, wantOption := range test.wantOptions {
+				option, done, problem := iterator.Next()
+				if problem != nil {
+					t.Fatalf("iterator.Next() option %d returned unexpected problem: %+v", optionIndex, problem)
+				}
+				if done {
+					t.Fatalf("iterator.Next() option %d unexpectedly indicated completion", optionIndex)
+				}
+				if diff := cmp.Diff([]byte(wantOption), option.Contents()); diff != "" {
+					t.Errorf("iterator.Next() option %d contents mismatch (-want +got):\n%s", optionIndex, diff)
+				}
+				if got, want := option.Type(), header.IPv4OptionType(wantOption[0]); got != want {
+					t.Errorf("iterator.Next() option %d type = %d, want %d", optionIndex, got, want)
+				}
+				if got, want := option.Size(), uint8(len(wantOption)); got != want {
+					t.Errorf("iterator.Next() option %d size = %d, want %d", optionIndex, got, want)
+				}
+				if test.wantConcreteType != nil && reflect.TypeOf(option) != reflect.TypeOf(test.wantConcreteType) {
+					t.Errorf("iterator.Next() option %d concrete type = %T, want %T", optionIndex, option, test.wantConcreteType)
+				}
+			}
+
+			option, done, problem := iterator.Next()
+			if option != nil {
+				t.Errorf("iterator.Next() final option = %v, want nil", option)
+			}
+			if diff := cmp.Diff(test.wantProblem, problem); diff != "" {
+				t.Errorf("iterator.Next() final problem mismatch (-want +got):\n%s", diff)
+			}
+			if problem == nil && !done {
+				t.Errorf("iterator.Next() final done = false, want true")
+			}
+		})
+	}
+}
+
+func TestIPv4OptionIteratorReplacement(t *testing.T) {
+	original := header.IPv4Options{byte(header.IPv4OptionNOPType), 2, 3, 0xaa}
+	iterator := original.MakeIterator()
+
+	nop, done, problem := iterator.Next()
+	if problem != nil || done {
+		t.Fatalf("iterator.Next() for NOP = (_, %t, %+v), want (_, false, nil)", done, problem)
+	}
+	iterator.PushNOPOrEnd(nop.Type())
+
+	option, done, problem := iterator.Next()
+	if problem != nil || done {
+		t.Fatalf("iterator.Next() for generic option = (_, %t, %+v), want (_, false, nil)", done, problem)
+	}
+	replacement := iterator.InitReplacement(option)
+	replacement[2] = 0xbb
+	iterator.ConsumeBuffer(len(replacement))
+	iterator.PushNOPOrEnd(header.IPv4OptionListEndType)
+
+	if diff := cmp.Diff([]byte{byte(header.IPv4OptionNOPType), 2, 3, 0xbb, 0, 0, 0, 0}, []byte(iterator.Finalize())); diff != "" {
+		t.Errorf("iterator.Finalize() mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]byte{byte(header.IPv4OptionNOPType), 2, 3, 0xaa}, []byte(original)); diff != "" {
+		t.Errorf("original options changed (-want +got):\n%s", diff)
+	}
+}
 
 func TestIPv4OptionsSerializer(t *testing.T) {
 	optCases := []struct {
