@@ -226,7 +226,7 @@ func (p *PortForward) doStream(ctx context.Context, port string, c *container.Co
 		return fmt.Errorf("invalid port string %q: %v", port, err)
 	}
 
-	if p.portNum < 0 || p.portNum > math.MaxUint16 {
+	if p.portNum <= 0 || p.portNum > math.MaxUint16 {
 		return fmt.Errorf("invalid port %d: %v", p.portNum, err)
 	}
 

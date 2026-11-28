@@ -165,6 +165,38 @@ func TestPortForwardStreamMode(t *testing.T) {
 	}
 }
 
+// TestPortForwardStreamModeZeroPort verifies that stream mode rejects port 0
+// as invalid instead of forwarding it to the sandbox.
+func TestPortForwardStreamModeZeroPort(t *testing.T) {
+	ctx := t.Context()
+	server := dockerutil.MakeContainer(ctx, t)
+	defer server.CleanUp(ctx)
+
+	// The container is loaded before ports are parsed, so it must exist, but
+	// nothing needs to listen in it.
+	if err := server.Spawn(ctx, dockerutil.RunOpts{Image: "basic/alpine"}, "sleep", "infinity"); err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// Port validation fails before this socket is opened.
+	uds := path.Join(t.TempDir(), "never-opened.sock")
+	pf, err := newPortForwardStreamProcess(ctx, server, uds, 0)
+	if err != nil {
+		t.Fatalf("failed to create port forward process: %v", err)
+	}
+
+	if err := pf.Wait(); err == nil {
+		t.Fatalf("port-forward to port 0 succeeded, want failure; out: %s", pf.Output())
+	}
+	out := pf.Output()
+	if !strings.Contains(out, "invalid port 0") {
+		t.Fatalf("port-forward output does not report an invalid port; out: %s", out)
+	}
+	if strings.Contains(out, "connection refused") {
+		t.Fatalf("port 0 was forwarded to the sandbox; out: %s", out)
+	}
+}
+
 func getUnusedPort() (int, error) {
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
