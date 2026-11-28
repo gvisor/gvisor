@@ -51,13 +51,7 @@ const (
 )
 
 var (
-	arbitraryPriority Priority = func() Priority {
-		priority, err := NewStandardPriority("filter", arbitraryFamily, arbitraryHook)
-		if err != nil {
-			panic(fmt.Sprintf("unexpected error for NewStandardPriority: %v", err))
-		}
-		return priority
-	}()
+	arbitraryPriority Priority = NewIntPriority(linux.NF_IP_PRI_FILTER)
 
 	arbitraryInfoPolicyAccept *BaseChainInfo = &BaseChainInfo{
 		BcType:   BaseChainTypeFilter,

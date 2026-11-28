@@ -545,23 +545,14 @@ var supportedHooksForBaseChainTypes [NumBaseChainTypes][]stack.NFHook = [NumBase
 
 // Priority represents the priority of a base chain which specifies the order
 // in which base chains with the same hook value are traversed.
-// nftables allows for 2 types of priorities: 1) a simple signed integer value
-// or 2) a predefined standard priority name (which is implicitly mapped to a
-// signed integer value). Priorities are traversed in ascending order such that
-// lower priority value have precedence.
-// Use the respective NewIntPriority or NewStandardPriority to create new
-// Priority objects.
+// Priorities are traversed in ascending order such that lower priority values
+// have precedence.
+// Use NewIntPriority to create new Priority objects.
 type Priority struct {
 	// Contents are hidden to prevent creating invalid Priority objects.
 
-	// value is the priority value of the base chain (in ascending order). This is
-	// set whether the priority is represented by a simple signed integer value or
-	// a standard priority name.
+	// value is the priority value of the base chain (in ascending order).
 	value int
-
-	// standardPriority is the standard priority name if the priority is a
-	// predefined standard priority name, otherwise it is the empty string.
-	standardPriorityName string
 }
 
 // NewIntPriority creates a new Priority object given a simple signed integer
@@ -570,121 +561,14 @@ func NewIntPriority(value int) Priority {
 	return Priority{value: value}
 }
 
-// NewStandardPriority creates a new Priority object given a standard priority
-// name, returning an error if the standard priority name is not compatible with
-// the given address family and hook.
-func NewStandardPriority(name string, family stack.AddressFamily, hook stack.NFHook) (Priority, *syserr.AnnotatedError) {
-	// Validates address family and hook first.
-	if err := validateAddressFamily(family); err != nil {
-		return Priority{}, err
-	}
-	if err := validateHook(hook, family); err != nil {
-		return Priority{}, err
-	}
-
-	// Ensures the standard priority name is set.
-	if name == "" {
-		return Priority{}, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "standard priority name cannot be empty")
-	}
-
-	// Looks up standard priority name in the standard priority matrix.
-	familyMatrix, exists := standardPriorityMatrix[family]
-	if !exists {
-		return Priority{}, syserr.NewAnnotatedError(syserr.ErrNoFileOrDir, fmt.Sprintf("standard priority names are not available for address family %v", family))
-	}
-	sp, exists := familyMatrix[name]
-	if !exists {
-		return Priority{}, syserr.NewAnnotatedError(syserr.ErrNoFileOrDir, fmt.Sprintf("standard priority name %s not compatible for address family %s", name, family))
-	}
-
-	// Checks for hook compatibility.
-	if !slices.Contains(sp.hooks, hook) {
-		return Priority{}, syserr.NewAnnotatedError(syserr.ErrNotSupported, fmt.Sprintf("hook %s is not compatible with standard priority %s", hook, name))
-	}
-
-	return Priority{value: sp.value, standardPriorityName: name}, nil
-}
-
-// IsStandardPriority returns true if the priority is a standard priority name.
-func (p Priority) IsStandardPriority() bool {
-	return p.standardPriorityName != ""
-}
-
 // GetValue returns the priority value for the Priority object.
 func (p Priority) GetValue() int {
 	return p.value
 }
 
-// GetStandardPriorityName returns the standard priority name for the Priority
-// object. It panics if the priority is not a standard priority name.
-func (p Priority) GetStandardPriorityName() string {
-	if !p.IsStandardPriority() {
-		panic("priority is not a standard priority")
-	}
-	return p.standardPriorityName
-}
-
 // String for Priority returns the string representation of the Priority object.
 func (p Priority) String() string {
-	if p.IsStandardPriority() {
-		return p.standardPriorityName
-	}
 	return fmt.Sprintf("%d", p.value)
-}
-
-// standardPriority represents the information for a predefined standard
-// priority name and mapping. Standard priorities are only available for the IP,
-// IP6, Inet, and Bridge address families, and the matrix below maps each
-// standard priority name to the priority value and hooks that the priority
-// applies to for the supported address families.
-type standardPriority struct {
-	// name is the standard priority name.
-	name string
-	// value is the priority value of the standard priority name.
-	value int
-	// hooks are the hooks that are compatible with the standard priority name.
-	hooks []stack.NFHook
-}
-
-// standardPriorityMatrix is used to look up information for the predefined
-// standard priority names.
-// TODO: b/493710955 - Not used, clean up.
-var standardPriorityMatrix = map[stack.AddressFamily](map[string]standardPriority){
-	stack.IP: spmIP,
-	// Note: IPv6 standard priorities constants currently have the same values as
-	// IPv4's, but the definitions (in the linux kernel) may change in the future.
-	stack.IP6: map[string]standardPriority{ // from uapi/linux/netfilter_ipv6.h
-		"raw":      {name: "raw", value: linux.NF_IP6_PRI_RAW, hooks: supportedHooksList[stack.IP6]},
-		"mangle":   {name: "mangle", value: linux.NF_IP6_PRI_MANGLE, hooks: supportedHooksList[stack.IP6]},
-		"dstnat":   {name: "dstnat", value: linux.NF_IP6_PRI_NAT_DST, hooks: []stack.NFHook{stack.NFPrerouting}},
-		"filter":   {name: "filter", value: linux.NF_IP6_PRI_FILTER, hooks: supportedHooksList[stack.IP6]},
-		"security": {name: "security", value: linux.NF_IP6_PRI_SECURITY, hooks: supportedHooksList[stack.IP6]},
-		"srcnat":   {name: "srcnat", value: linux.NF_IP6_PRI_NAT_SRC, hooks: []stack.NFHook{stack.NFPostrouting}},
-	},
-	stack.Inet: spmIP,
-	stack.Arp: map[string]standardPriority{ // defined as same as IP filter priority
-		"filter": {name: "filter", value: spmIP["filter"].value, hooks: supportedHooksList[stack.Arp]},
-	},
-	stack.Bridge: map[string]standardPriority{ // from uapi/linux/netfilter_bridge.h
-		"dstnat": {name: "dstnat", value: linux.NF_BR_PRI_NAT_DST_BRIDGED, hooks: []stack.NFHook{stack.NFPrerouting}},
-		"filter": {name: "filter", value: linux.NF_BR_PRI_FILTER_BRIDGED, hooks: supportedHooksList[stack.Bridge]},
-		"out":    {name: "out", value: linux.NF_BR_PRI_NAT_DST_OTHER, hooks: []stack.NFHook{stack.NFOutput}},
-		"srcnat": {name: "srcnat", value: linux.NF_BR_PRI_NAT_SRC, hooks: []stack.NFHook{stack.NFPostrouting}},
-	},
-	stack.Netdev: map[string]standardPriority{ // defined as same as IP filter priority
-		"filter": {name: "filter", value: spmIP["filter"].value, hooks: supportedHooksList[stack.Netdev]},
-	},
-}
-
-// Used in the standardPriorityMatrix above.
-// Note: IPv4 and Inet address families use the same standard priority names.
-var spmIP = map[string]standardPriority{ // from uapi/linux/netfilter_ipv4.h
-	"raw":      {name: "raw", value: linux.NF_IP_PRI_RAW, hooks: supportedHooksList[stack.IP]},
-	"mangle":   {name: "mangle", value: linux.NF_IP_PRI_MANGLE, hooks: supportedHooksList[stack.IP]},
-	"dstnat":   {name: "dstnat", value: linux.NF_IP_PRI_NAT_DST, hooks: []stack.NFHook{stack.NFPrerouting}},
-	"filter":   {name: "filter", value: linux.NF_IP_PRI_FILTER, hooks: supportedHooksList[stack.IP]},
-	"security": {name: "security", value: linux.NF_IP_PRI_SECURITY, hooks: supportedHooksList[stack.IP]},
-	"srcnat":   {name: "srcnat", value: linux.NF_IP_PRI_NAT_SRC, hooks: []stack.NFHook{stack.NFPostrouting}},
 }
 
 // validateBaseChainInfo ensures the base chain info is valid by checking the
