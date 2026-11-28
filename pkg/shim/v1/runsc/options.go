@@ -15,7 +15,9 @@
 package runsc
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/BurntSushi/toml"
 	"github.com/containerd/log"
@@ -89,5 +91,34 @@ type Options struct {
 	EnableHibernateServer bool `toml:"enable_hibernate_server" json:"enableHibernateServer"`
 
 	// RunscConfig is a key/value map of all runsc flags.
-	RunscConfig map[string]string `toml:"runsc_config" json:"runscConfig"`
+	RunscConfig RunscFlags `toml:"runsc_config" json:"runscConfig"`
+}
+
+// RunscFlags is a key/value map of runsc flags. TOML booleans and numbers are
+// accepted in their string form, so `debug = true` is the same as `debug = "true"`.
+type RunscFlags map[string]string
+
+// UnmarshalTOML implements toml.Unmarshaler.
+func (f *RunscFlags) UnmarshalTOML(data any) error {
+	table, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("runsc_config must be a table, got %T", data)
+	}
+	flags := make(RunscFlags, len(table))
+	for name, value := range table {
+		switch v := value.(type) {
+		case string:
+			flags[name] = v
+		case bool:
+			flags[name] = strconv.FormatBool(v)
+		case int64:
+			flags[name] = strconv.FormatInt(v, 10)
+		case float64:
+			flags[name] = strconv.FormatFloat(v, 'f', -1, 64)
+		default:
+			return fmt.Errorf("runsc_config.%s: unsupported value type %T", name, value)
+		}
+	}
+	*f = flags
+	return nil
 }
