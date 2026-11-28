@@ -22,7 +22,9 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -540,5 +542,71 @@ func TestAsyncLoadShortRead(t *testing.T) {
 	}
 	if !dst.HasUniqueRef(fr) {
 		t.Error("page loader still holds a reference after reporting EIO")
+	}
+}
+
+// gatedPageReader holds each read until the test releases the eager loader.
+type gatedPageReader struct {
+	io.ReaderAt
+	gate <-chan struct{}
+}
+
+func (r *gatedPageReader) ReadAt(p []byte, off int64) (int, error) {
+	<-r.gate
+	return r.ReaderAt.ReadAt(p, off)
+}
+
+func TestDecommitDuringAsyncLoad(t *testing.T) {
+	f := newSaveTestMemoryFile(t, "", false)
+	fr := allocateSaveTestPages(t, f)
+	pwritePage(t, f, fr, 5, 42)
+	var metadata, pages bytes.Buffer
+	saved := make(chan error, 1)
+	apfs, err := StartAsyncPagesFileSave(stateio.NewIOWriter(&pages, 1<<20, 16, 4), func(err error) { saved <- err })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SaveTo(context.Background(), &metadata, &SaveOpts{PagesFile: apfs}); err != nil {
+		t.Fatal(err)
+	}
+	apfs.MemoryFilesDone()
+	if err := <-saved; err != nil {
+		t.Fatal(err)
+	}
+
+	gate := make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(gate) })
+	loaded := make(chan error, 1)
+	reader := &gatedPageReader{bytes.NewReader(pages.Bytes()), gate}
+	apfl, err := StartAsyncPagesFileLoad(stateio.NewIOReader(reader, 1<<20, 16, 4), func(err error) { loaded <- err }, nil, AsyncPagesFileLoadOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := newSaveTestMemoryFile(t, "", false)
+	if err := restored.LoadFrom(context.Background(), &metadata, &LoadOpts{PagesFile: apfl}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { restored.DecRef(fr) })
+	apfl.MemoryFilesDone()
+	page := memmap.FileRange{fr.Start + 5*uint64(hostarch.PageSize), fr.Start + 6*uint64(hostarch.PageSize)}
+	decommitted := make(chan struct{})
+	go func() { restored.Decommit(page); close(decommitted) }()
+	select {
+	case <-decommitted:
+		t.Error("Decommit returned before the pending page load")
+	case <-time.After(50 * time.Millisecond):
+	}
+	release.Do(func() { close(gate) })
+	if err := <-loaded; err != nil {
+		t.Fatal(err)
+	}
+	<-decommitted
+	bs, err := restored.MapInternal(page, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bs.Head().ToSlice()[17]; got != 0 {
+		t.Errorf("decommitted byte: got %d, want 0", got)
 	}
 }
