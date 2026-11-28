@@ -354,6 +354,13 @@ steps:
       queue: "cgroupv1"
   - <<: *common
     <<: *source_test
+    label: ":lock: Unit tests (lockdep, AMD64)"
+    command: make BAZEL_OPTIONS=--config=lockdep unit-tests
+    agents:
+      arch: "amd64"
+      queue: "default"
+  - <<: *common
+    <<: *source_test
     label: ":test_tube: Unit tests (ARM64)"
     command: make unit-tests
     agents:
@@ -371,6 +378,14 @@ steps:
       queue: "cgroupv1"
 
   # All system call tests.
+  - <<: *common
+    <<: *source_test
+    label: ":lock: System call tests (lockdep, AMD64)"
+    command: make BAZEL_OPTIONS=--config=lockdep OPTIONS=--config=syscalls-amd64-lockdep syscall-tests
+    parallelism: 20
+    agents:
+      arch: "amd64"
+      queue: "default"
   - <<: *common
     <<: *source_test
     label: ":muscle: System call tests (ARM64)"
