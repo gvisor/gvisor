@@ -27,7 +27,9 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -382,6 +384,67 @@ func TestFSCheckpointRestoreSizeLimit(t *testing.T) {
 		},
 	}, nil); err == nil {
 		t.Fatalf("NewMountNamespace succeeded, want error")
+	}
+}
+
+// TestFSCheckpointRestorePages checks that FS checkpoint restore rebuilds
+// regularFile.pages and reports the expected st_blocks.
+func TestFSCheckpointRestorePages(t *testing.T) {
+	const wantPages = uint64(16)
+	ctx := contexttest.Context(t)
+	src := mountFromTarTestOnly(t, ctx, tarWithFile(t, "./f", randomBytes(int(wantPages)*int(hostarch.PageSize))))
+	var ckpt bytes.Buffer
+	if err := FSCheckpointWrite(ctx, &src.vfsfs, &ckpt); err != nil {
+		t.Fatalf("FSCheckpointWrite: %v", err)
+	}
+
+	// Both mounts share src.mf; take an extra reference on each segment so both
+	// mounts can release them cleanly on teardown.
+	srcRF := src.root.inode.impl.(*directory).childMap["f"].inode.impl.(*regularFile)
+	srcRF.dataMu.RLock()
+	for seg := srcRF.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		src.mf.IncRef(seg.FileRange(), 0)
+	}
+	srcRF.dataMu.RUnlock()
+
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatalf("VFS init: %v", err)
+	}
+	vfsObj.MustRegisterFilesystemType("tmpfs", FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+	})
+	mntns, err := vfsObj.NewMountNamespace(ctx, auth.CredentialsFromContext(ctx), "", "tmpfs", &vfs.MountOptions{
+		GetFilesystemOptions: vfs.GetFilesystemOptions{
+			InternalData: FilesystemOpts{
+				MemoryFile:            src.mf,
+				SourceTar:             io.NopCloser(&ckpt),
+				SourceTarFSCheckpoint: true,
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewMountNamespace: %v", err)
+	}
+	defer mntns.DecRef(ctx)
+
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+	fs := root.Mount().Filesystem().Impl().(*filesystem)
+	rf := fs.root.inode.impl.(*directory).childMap["f"].inode.impl.(*regularFile)
+	if got := rf.pages.Load(); got != wantPages {
+		t.Errorf("rf.pages = %d, want %d", got, wantPages)
+	}
+	rf.dataMu.RLock()
+	spanPages := rf.data.Span() >> hostarch.PageShift
+	rf.dataMu.RUnlock()
+	if spanPages != wantPages {
+		t.Errorf("rf.data.Span()/PageSize = %d, want %d", spanPages, wantPages)
+	}
+	var stat linux.Statx
+	rf.inode.statTo(&stat)
+	if wantBlocks := wantPages * (uint64(hostarch.PageSize) / 512); stat.Blocks != wantBlocks {
+		t.Errorf("stat.Blocks = %d, want %d", stat.Blocks, wantBlocks)
 	}
 }
 

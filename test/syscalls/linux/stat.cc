@@ -1146,6 +1146,53 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param.name;
     });
 
+TEST(StatSparseTest, TmpfsSparseBlocks) {
+  const TempPath path =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn("/dev/shm"));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(IsTmpfs(path.path())));
+
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path.path(), O_RDWR));
+  struct stat initial_st;
+  ASSERT_THAT(fstat(fd.get(), &initial_st), SyscallSucceeds());
+  SKIP_IF(!IsRunningOnGvisor() && initial_st.st_blksize != kPageSize);
+
+  const blkcnt_t kBlocksPerPage = kPageSize / 512;
+
+  auto expect_blocks = [&](const char* step, blkcnt_t want) {
+    SCOPED_TRACE(step);
+    struct stat st;
+    ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+    EXPECT_EQ(st.st_blocks, want);
+    struct kernel_statx stx;
+    ASSERT_THAT(statx(fd.get(), "", AT_EMPTY_PATH, STATX_BLOCKS, &stx),
+                SyscallSucceeds());
+    EXPECT_EQ(stx.stx_blocks, static_cast<uint64_t>(want));
+  };
+
+  expect_blocks("empty", 0);
+
+  // Sparse truncate allocates no blocks.
+  ASSERT_THAT(ftruncate(fd.get(), 16 * kPageSize), SyscallSucceeds());
+  expect_blocks("sparse grow", 0);
+
+  // Writing one byte allocates one page.
+  const char kByte = 'A';
+  ASSERT_THAT(pwrite(fd.get(), &kByte, 1, 8 * kPageSize),
+              SyscallSucceedsWithValue(1));
+  expect_blocks("write page 8", kBlocksPerPage);
+
+  ASSERT_THAT(pwrite(fd.get(), &kByte, 1, 0), SyscallSucceedsWithValue(1));
+  expect_blocks("write page 0", 2 * kBlocksPerPage);
+
+  // Shrinking frees pages past the new EOF.
+  ASSERT_THAT(ftruncate(fd.get(), kPageSize), SyscallSucceeds());
+  expect_blocks("shrink to 1 page", kBlocksPerPage);
+
+  ASSERT_THAT(ftruncate(fd.get(), 0), SyscallSucceeds());
+  expect_blocks("shrink to 0", 0);
+}
+
 }  // namespace
 
 }  // namespace testing

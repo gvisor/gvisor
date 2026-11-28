@@ -110,6 +110,13 @@ type regularFile struct {
 	// Readers that do not require consistency (like Stat) may read the
 	// value atomically without holding either lock.
 	size atomicbitops.Uint64
+
+	// pages is the number of pages allocated in data. It must never be less
+	// than the number of pages in data.
+	//
+	// +checkatomic
+	// +checklocks:dataMu
+	pages atomicbitops.Uint64 `state:"nosave"`
 }
 
 // newRegularFile creates a new regular file.
@@ -267,6 +274,7 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 	// and can remove them.
 	rf.dataMu.Lock()
 	decPages := rf.data.Truncate(newSize, rf.inode.fs.mf)
+	rf.subPagesLocked(decPages)
 	rf.dataMu.Unlock()
 	rf.inode.fs.unaccountPages(decPages)
 	return nil
@@ -392,6 +400,7 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	// rf.data.Fill() may fail mid-way. We still want to account any pages that
 	// were allocated, irrespective of an error.
 	rf.inode.fs.adjustPageAcct(pagesToFill, pagesAlloced)
+	rf.addPagesLocked(pagesAlloced)
 
 	// translateRange bounds how far Translate extends the returned translation
 	// over pages that are *already* present, beyond the allocation-bounded
@@ -557,6 +566,7 @@ func (rf *regularFile) allocateLocked(ctx context.Context, mode, newSize uint64,
 	// f.data.Fill() may fail mid-way. We still want to account any pages that
 	// were allocated, irrespective of an error.
 	rf.inode.fs.adjustPageAcct(pagesToFill, pagesAlloced)
+	rf.addPagesLocked(pagesAlloced)
 	if err != nil && err != io.EOF {
 		return err
 	}
@@ -690,6 +700,22 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 		offset += fd.off
 	case linux.SEEK_END:
 		offset += int64(fd.inode().impl.(*regularFile).size.Load())
+	case linux.SEEK_DATA, linux.SEEK_HOLE:
+		rf := fd.inode().impl.(*regularFile)
+		var (
+			newOff int64
+			err    error
+		)
+		if whence == linux.SEEK_DATA {
+			newOff, err = rf.seekData(offset)
+		} else {
+			newOff, err = rf.seekHole(offset)
+		}
+		if err != nil {
+			return 0, err
+		}
+		fd.off = newOff
+		return newOff, nil
 	default:
 		return 0, linuxerr.EINVAL
 	}
@@ -698,6 +724,66 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 	}
 	fd.off = offset
 	return offset, nil
+}
+
+// +checklocks:rf.dataMu
+func (rf *regularFile) addPagesLocked(n uint64) {
+	if n > 0 {
+		rf.pages.Store(rf.pages.RacyLoad() + n)
+	}
+}
+
+// +checklocks:rf.dataMu
+func (rf *regularFile) subPagesLocked(n uint64) {
+	if n > 0 {
+		rf.pages.Store(rf.pages.RacyLoad() - n)
+	}
+}
+
+func (rf *regularFile) seekData(offset int64) (int64, error) {
+	if offset < 0 {
+		return 0, linuxerr.ENXIO
+	}
+	rf.dataMu.RLock()
+	defer rf.dataMu.RUnlock()
+	size := rf.size.RacyLoad()
+	uoff := uint64(offset)
+	if uoff >= size {
+		return 0, linuxerr.ENXIO
+	}
+	seg := rf.data.LowerBoundSegment(uoff)
+	if !seg.Ok() || seg.Start() >= size {
+		return 0, linuxerr.ENXIO
+	}
+	if seg.Start() > uoff {
+		return int64(seg.Start()), nil
+	}
+	return offset, nil
+}
+
+func (rf *regularFile) seekHole(offset int64) (int64, error) {
+	if offset < 0 {
+		return 0, linuxerr.ENXIO
+	}
+	rf.dataMu.RLock()
+	defer rf.dataMu.RUnlock()
+	size := rf.size.RacyLoad()
+	uoff := uint64(offset)
+	if uoff >= size {
+		return 0, linuxerr.ENXIO
+	}
+	seg, gap := rf.data.Find(uoff)
+	if gap.Ok() {
+		return offset, nil
+	}
+	for seg.Ok() && seg.End() < size {
+		next, nextGap := seg.NextNonEmpty()
+		if nextGap.Ok() {
+			return int64(nextGap.Start()), nil
+		}
+		seg = next
+	}
+	return int64(size), nil
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
@@ -936,6 +1022,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 
 			// Write to that memory as usual.
 			seg, gap = rw.file.data.Insert(gap, gapMR, fr.Start), fsutil.FileRangeGapIterator{}
+			rw.file.addPagesLocked(pagesReserved)
 		default:
 			panic("unreachable")
 		}

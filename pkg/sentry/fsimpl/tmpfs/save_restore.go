@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -79,6 +80,13 @@ func (i *inode) saveDefaultACL() *vfs.PosixACL {
 // loadDefaultACL is called by stateify.
 func (i *inode) loadDefaultACL(_ goContext.Context, defaultACL *vfs.PosixACL) {
 	i.defaultACL.Store(defaultACL)
+}
+
+// afterLoad is invoked by stateify.
+func (rf *regularFile) afterLoad(goContext.Context) {
+	rf.dataMu.Lock()
+	rf.pages.Store(rf.data.Span() >> hostarch.PageShift)
+	rf.dataMu.Unlock()
 }
 
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
