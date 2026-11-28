@@ -250,9 +250,9 @@ func (vfs *VirtualFilesystem) CloneMountNamespace(
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
 
-	cloneType := 0
+	cloneType := copyUnbindable
 	if ns.Owner != newns.Owner {
-		cloneType = sharedToFollowerClone
+		cloneType |= sharedToFollowerClone
 	}
 	newRoot, err := vfs.cloneMountTree(ctx, ns.root, ns.root.root, cloneType,
 		func(ctx context.Context, src, dst *Mount) {
@@ -302,9 +302,9 @@ func (vfs *VirtualFilesystem) CloneTreeToAnonNS(
 	}
 
 	// Sanity checks
-
-	// TODO(b/305893463): When MS_UNBINDABLE is added,
-	// MS_UNBINDABLE mounts should be rejected here.
+	if fromMnt.isUnbindable {
+		return nil, linuxerr.EINVAL
+	}
 
 	fsName := fromMnt.Filesystem().FilesystemType().Name()
 	// fromMnt must not have been detached from its mount tree (e.g. via

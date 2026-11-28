@@ -36,6 +36,8 @@ const (
 	// copyMntNSFile allows cloneMountTree to copy mounts of mount namespace
 	// files that the caller's mount namespace can contain.
 	copyMntNSFile
+	// copyUnbindable allows cloneMountTree to copy unbindable mounts.
+	copyUnbindable
 
 	propagationFlags = linux.MS_SHARED | linux.MS_PRIVATE | linux.MS_SLAVE | linux.MS_UNBINDABLE
 )
@@ -150,6 +152,7 @@ func (vfs *VirtualFilesystem) SetMountPropagation(mnt *Mount, propFlag uint32, r
 func (vfs *VirtualFilesystem) setPropagation(mnt *Mount, propFlags uint32) {
 	if propFlags == linux.MS_SHARED {
 		mnt.isShared = true
+		mnt.isUnbindable = false
 		return
 	}
 	// pflag is MS_PRIVATE, MS_SLAVE, or MS_UNBINDABLE. The algorithm is the same
@@ -202,6 +205,9 @@ func (vfs *VirtualFilesystem) setPropagation(mnt *Mount, propFlags uint32) {
 		mnt.leader = leader
 	} else {
 		mnt.leader = nil
+	}
+	if propFlags != linux.MS_SLAVE {
+		mnt.isUnbindable = propFlags == linux.MS_UNBINDABLE
 	}
 
 	// Add mnts followers to leader's follower list. This also links all their

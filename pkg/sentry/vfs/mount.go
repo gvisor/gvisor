@@ -116,6 +116,10 @@ type Mount struct {
 	// isShared indicates this mount has the MS_SHARED propagation type.
 	isShared bool
 
+	// isUnbindable indicates this mount has the MS_UNBINDABLE propagation type.
+	// isUnbindable is protected by VirtualFilesystem.mountMu.
+	isUnbindable bool
+
 	// sharedEntry is an entry in a circular list (ring) of mounts in a shared
 	// peer group.
 	sharedEntry mountEntry
@@ -448,16 +452,35 @@ func (vfs *VirtualFilesystem) mountHasLockedChildren(mnt *Mount, vd VirtualDentr
 	return false
 }
 
+// treeContainsUnbindable returns true if mnt or any of its descendants is
+// unbindable.
+//
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) treeContainsUnbindable(mnt *Mount) bool {
+	if mnt.isUnbindable {
+		return true
+	}
+	for c := range mnt.children {
+		if vfs.treeContainsUnbindable(c) {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckClonePrivateMount returns a non-nil error if a private mount without
 // submounts cannot be cloned from vd, as Linux's clone_private_mount() checks:
-// vd's mount must be in the caller's mount namespace or be the root of an
-// anonymous mount namespace, creds must hold CAP_SYS_ADMIN in the user
-// namespace owning vd's mount namespace, and no locked mount can be mounted at
-// or below vd.
+// vd's mount must not be unbindable, it must be in the caller's mount
+// namespace or be the root of an anonymous mount namespace, creds must hold
+// CAP_SYS_ADMIN in the user namespace owning vd's mount namespace, and no
+// locked mount can be mounted at or below vd.
 func (vfs *VirtualFilesystem) CheckClonePrivateMount(ctx context.Context, creds *auth.Credentials, vd VirtualDentry) error {
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
 	mnt := vd.mount
+	if mnt.isUnbindable {
+		return linuxerr.EINVAL
+	}
 	if !vfs.validInMountNS(ctx, mnt) && (mnt.umounted || mnt.ns == nil || !mnt.ns.anon || mnt != mnt.ns.root) {
 		return linuxerr.EINVAL
 	}
@@ -604,6 +627,10 @@ func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Crede
 		}
 	}
 
+	if mp.mount.isShared && vfs.treeContainsUnbindable(sourceMnt) {
+		return linuxerr.EINVAL
+	}
+
 	// Verify that source is not an ancestor of destination
 	for p := mp.mount; p != nil; p = p.parent() {
 		if p == sourceMnt {
@@ -703,6 +730,7 @@ func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountO
 		}
 	}
 	clone.isShared = mnt.isShared
+	clone.isUnbindable = mnt.isUnbindable
 	clone.locked = mnt.locked
 	clone.lockedFlags = mnt.lockedFlags
 	if cloneType&makeFollowerClone != 0 || (cloneType&sharedToFollowerClone != 0 && mnt.isShared) {
@@ -722,6 +750,7 @@ func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountO
 	}
 	if cloneType&makeSharedClone != 0 {
 		clone.isShared = true
+		clone.isUnbindable = false
 	}
 	return clone, nil
 }
@@ -743,8 +772,15 @@ type cloneTreeNode struct {
 // cloneMountTree returns EINVAL if a descendant is a mount of a mount
 // namespace file that ctx's mount namespace cannot contain.
 //
+// If cloneType does not have copyUnbindable, cloneMountTree returns EINVAL if
+// mnt is unbindable, and does not copy descendants that are unbindable, nor
+// any mounts below them. It returns EPERM if such a descendant is also locked.
+//
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, root *Dentry, cloneType int, cloneFunc func(ctx context.Context, oldmnt, newMnt *Mount)) (*Mount, error) {
+	if cloneType&copyUnbindable == 0 && mnt.isUnbindable {
+		return nil, linuxerr.EINVAL
+	}
 	var ctxNS *MountNamespace
 	if cloneType&copyMntNSFile == 0 {
 		if isMountNSFile(VirtualDentry{mount: mnt, dentry: root}) != nil {
@@ -769,6 +805,13 @@ func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, ro
 				continue
 			}
 			if mp := c.getKey(); p.prevMount == mnt && !mp.mount.fs.Impl().IsDescendant(VirtualDentry{mnt, root}, mp) {
+				continue
+			}
+			if cloneType&copyUnbindable == 0 && c.isUnbindable {
+				if c.locked {
+					vfs.abortUncommitedMount(ctx, clone)
+					return nil, linuxerr.EPERM
+				}
 				continue
 			}
 			if ns := isMountNSFile(VirtualDentry{mount: c, dentry: c.root}); ns != nil {
@@ -864,6 +907,9 @@ func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credential
 	defer cleanup.Clean()
 	// sourceVd.mount must not be umounted, regardless of the filesystem type
 	if sourceVd.mount.umounted {
+		return linuxerr.EINVAL
+	}
+	if sourceVd.mount.isUnbindable {
 		return linuxerr.EINVAL
 	}
 	// The source mount must be in the caller's mount namespace, except for
@@ -2048,7 +2094,6 @@ func superBlockOpts(mountPath string, mnt *Mount) string {
 func (vfs *VirtualFilesystem) generateOptionalTags(ctx context.Context, mnt *Mount, root VirtualDentry) string {
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
-	// TODO(b/305893463): Support MS_UNBINDABLE propagation type.
 	var optionalSb strings.Builder
 	if mnt.isShared {
 		fmt.Fprintf(&optionalSb, "shared:%d ", mnt.groupID)
@@ -2069,6 +2114,9 @@ func (vfs *VirtualFilesystem) generateOptionalTags(ctx context.Context, mnt *Mou
 		if dominant != nil && dominant != mnt.leader {
 			fmt.Fprintf(&optionalSb, "propagate_from:%d ", dominant.groupID)
 		}
+	}
+	if mnt.isUnbindable {
+		optionalSb.WriteString("unbindable ")
 	}
 	return optionalSb.String()
 }
