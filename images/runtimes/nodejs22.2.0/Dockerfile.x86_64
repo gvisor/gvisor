@@ -26,6 +26,12 @@ RUN make -j $(nproc) test-build
 RUN out/Release/node --check test/common/index.js \
   && out/Release/node --check test/parallel/test-http-outgoing-end-cork.js
 
+# Keep the TLS address-family regression independent of external servers.
+COPY tls-loopback.patch /tmp/tls-loopback.patch
+RUN patch -p1 --no-backup-if-mismatch < /tmp/tls-loopback.patch \
+  && out/Release/node --check test/parallel/test-tls-autoselectfamily-servername.js \
+  && rm -f /tmp/tls-loopback.patch
+
 # Including dumb-init emulates the Linux "init" process, preventing the failure
 # of tests involving worker processes.
 ENTRYPOINT ["/usr/bin/dumb-init"]
