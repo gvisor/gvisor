@@ -36,6 +36,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
@@ -465,6 +466,10 @@ type sock struct {
 	//
 	// +checklocks:readMu
 	sockOptInq bool
+
+	// packetMmapMu serializes PACKET_RX_RING, PACKET_VERSION, PACKET_RESERVE,
+	// and ConfigureMMap.
+	packetMmapMu sync.Mutex `state:"nosave"`
 }
 
 var _ = socket.Socket(&sock{})
@@ -3011,25 +3016,36 @@ func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, opt
 		if err := ep.SetSockOpt(&req); err != nil {
 			return syserr.TranslateNetstackError(err)
 		}
-		if ep, ok := ep.(stack.MappablePacketEndpoint); ok {
-			var pme *packetmmap.Endpoint
-			if ep.GetPacketMMapEndpoint() != nil {
-				pme = ep.GetPacketMMapEndpoint().(*packetmmap.Endpoint)
-				if pme.Mapped() {
-					return syserr.ErrBusy
-				}
-			} else {
-				pme = &packetmmap.Endpoint{}
-			}
-			opts := ep.GetPacketMMapOpts(&req, true /* isRx */)
-			if opts.Req.TpFrameNr != 0 || opts.Req.TpBlockNr != 0 {
-				if err := pme.Init(t, opts); err != nil {
-					return syserr.FromError(err)
-				}
-				ep.SetPacketMMapEndpoint(pme)
-			}
-		} else {
+		mappableEP, ok := ep.(stack.MappablePacketEndpoint)
+		if !ok {
 			return syserr.ErrNotSupported
+		}
+		s.packetMmapMu.Lock()
+		defer s.packetMmapMu.Unlock()
+		// Teardown the ring if it exists.
+		if cur := mappableEP.GetPacketMMapEndpoint(); cur != nil {
+			pme := cur.(*packetmmap.Endpoint)
+			// Reject changes to a mapped ring or if it already exists.
+			if pme.Mapped() || req.TpBlockNr != 0 {
+				return syserr.ErrBusy
+			}
+			// Teardown requires both TpBlockNr and TpFrameNr to be zero.
+			if req.TpFrameNr != 0 {
+				return syserr.ErrInvalidArgument
+			}
+			// Detach before closing to drain the readers.
+			mappableEP.SetPacketMMapEndpoint(nil)
+			pme.Close()
+			return nil
+		}
+		opts := mappableEP.GetPacketMMapOpts(&req, true /* isRx */)
+		if opts.Req.TpFrameNr != 0 || opts.Req.TpBlockNr != 0 {
+			pme := &packetmmap.Endpoint{}
+			// Create and attach a new ring buffer.
+			if err := pme.Init(t, opts); err != nil {
+				return syserr.FromError(err)
+			}
+			mappableEP.SetPacketMMapEndpoint(pme)
 		}
 		return nil
 	case linux.PACKET_VERSION:
@@ -3037,12 +3053,16 @@ func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, opt
 			return syserr.ErrInvalidArgument
 		}
 		v := hostarch.ByteOrder.Uint32(optVal)
+		s.packetMmapMu.Lock()
+		defer s.packetMmapMu.Unlock()
 		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.PacketMMapVersionOption, int(v)))
 	case linux.PACKET_RESERVE:
 		if len(optVal) < sizeOfInt32 {
 			return syserr.ErrInvalidArgument
 		}
 		v := hostarch.ByteOrder.Uint32(optVal)
+		s.packetMmapMu.Lock()
+		defer s.packetMmapMu.Unlock()
 		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.PacketMMapReserveOption, int(v)))
 	case linux.PACKET_ADD_MEMBERSHIP, linux.PACKET_AUXDATA:
 		// Silently ignore these options.
@@ -3924,18 +3944,21 @@ func (s *sock) EventUnregister(e *waiter.Entry) {
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (s *sock) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
-	if mappablePacketEP, ok := s.Endpoint.(stack.MappablePacketEndpoint); ok {
-		packetMMapEP := mappablePacketEP.GetPacketMMapEndpoint()
-		if packetMMapEP == nil {
-			return linuxerr.ENODEV
-		}
-		ep := packetMMapEP.(*packetmmap.Endpoint)
-		if err := vfs.GenericConfigureMMap(&s.vfsfd, ep, opts); err != nil {
-			return err
-		}
-		return ep.ConfigureMMap(ctx, opts)
+	mappablePacketEP, ok := s.Endpoint.(stack.MappablePacketEndpoint)
+	if !ok {
+		return linuxerr.ENODEV
 	}
-	return linuxerr.ENODEV
+	s.packetMmapMu.Lock()
+	defer s.packetMmapMu.Unlock()
+	packetMMapEP := mappablePacketEP.GetPacketMMapEndpoint()
+	if packetMMapEP == nil {
+		return linuxerr.ENODEV
+	}
+	ep := packetMMapEP.(*packetmmap.Endpoint)
+	if err := vfs.GenericConfigureMMap(&s.vfsfd, ep, opts); err != nil {
+		return err
+	}
+	return ep.ConfigureMMap(ctx, opts)
 }
 
 // HasCapability checks if the task has the given capability in the

@@ -24,10 +24,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -714,6 +718,159 @@ TEST(PacketMmapTest, PacketStatistics) {
               SyscallSucceeds());
   EXPECT_EQ(stats.tp_drops, expected_dropped);
   EXPECT_EQ(stats.tp_packets, tp_frame_nr + expected_dropped);
+}
+
+// MakeRingReq builds a valid tpacket_req with the given block count.
+tpacket_req MakeRingReq(uint32_t blocks) {
+  uint32_t block_size = kLargeFrameSize * 32;
+  return {
+      .tp_block_size = block_size,
+      .tp_block_nr = blocks,
+      .tp_frame_size = kLargeFrameSize,
+      .tp_frame_nr = (block_size * blocks) / kLargeFrameSize,
+  };
+}
+
+// RunWithBarrier runs fns in parallel after synchronizing their start.
+void RunWithBarrier(const std::vector<std::function<void()>>& fns) {
+  const int count = static_cast<int>(fns.size());
+  std::atomic<int> ready{0};
+  std::vector<std::thread> threads;
+  threads.reserve(fns.size());
+  for (const auto& fn : fns) {
+    threads.emplace_back([&ready, count, &fn] {
+      ready.fetch_add(1);
+      while (ready.load() < count) {
+        std::this_thread::yield();
+      }
+      fn();
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+}
+
+TEST(PacketMmapTest, SetRingTwiceAndResetBeforeMmap) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(
+      HavePacketSocketCapability(SOCK_DGRAM, ETH_P_IP)));
+  FileDescriptor mmap_sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_PACKET, SOCK_DGRAM, 0));
+  auto set_opt = [&](int opt, const auto& val) {
+    return setsockopt(mmap_sock.get(), SOL_PACKET, opt, &val, sizeof(val));
+  };
+
+  tpacket_req req = MakeRingReq(1 /* blocks */);
+  tpacket_req zero_req = {};
+  tpacket_req bad_zero_req = {.tp_frame_nr = 1};
+  int version = TPACKET_V2;
+  int reserve = 4;
+
+  ASSERT_THAT(set_opt(PACKET_RX_RING, req), SyscallSucceeds());
+
+  // Before mmap, duplicate setup fails with EBUSY and bad teardown leaves the
+  // ring intact.
+  EXPECT_THAT(set_opt(PACKET_RX_RING, req), SyscallFailsWithErrno(EBUSY));
+  EXPECT_THAT(set_opt(PACKET_VERSION, version), SyscallFailsWithErrno(EBUSY));
+  EXPECT_THAT(set_opt(PACKET_RESERVE, reserve), SyscallFailsWithErrno(EBUSY));
+  EXPECT_THAT(set_opt(PACKET_RX_RING, bad_zero_req),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(set_opt(PACKET_VERSION, version), SyscallFailsWithErrno(EBUSY));
+
+  // A zeroed request tears down the unmapped ring so it can be reconfigured.
+  ASSERT_THAT(set_opt(PACKET_RX_RING, zero_req), SyscallSucceeds());
+  ASSERT_THAT(set_opt(PACKET_VERSION, version), SyscallSucceeds());
+  ASSERT_THAT(set_opt(PACKET_RX_RING, req), SyscallSucceeds());
+
+  size_t ring_size = static_cast<size_t>(req.tp_block_size) * req.tp_block_nr;
+  void* ring = mmap(nullptr, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                    mmap_sock.get(), 0 /* offset */);
+  ASSERT_NE(ring, MAP_FAILED) << "errno=" << errno;
+  auto ring_cleanup = Cleanup([ring, ring_size] {
+    ASSERT_THAT(munmap(ring, ring_size), SyscallSucceeds());
+  });
+
+  // Once mapped, both valid and invalid teardown requests fail with EBUSY.
+  EXPECT_THAT(set_opt(PACKET_RX_RING, bad_zero_req),
+              SyscallFailsWithErrno(EBUSY));
+  EXPECT_THAT(set_opt(PACKET_RX_RING, zero_req), SyscallFailsWithErrno(EBUSY));
+}
+
+TEST(PacketMmapTest, ConcurrentSetRing) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(
+      HavePacketSocketCapability(SOCK_DGRAM, ETH_P_IP)));
+
+  tpacket_req req = MakeRingReq(1 /* blocks */);
+  constexpr int kThreads = 4;
+  for (int iter = 0; iter < 20; ++iter) {
+    FileDescriptor mmap_sock =
+        ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_PACKET, SOCK_DGRAM, 0));
+    std::atomic<int> successes{0};
+    std::atomic<int> busy_errors{0};
+    auto set_ring = [&] {
+      if (setsockopt(mmap_sock.get(), SOL_PACKET, PACKET_RX_RING, &req,
+                     sizeof(req)) == 0) {
+        successes.fetch_add(1);
+      } else if (errno == EBUSY) {
+        busy_errors.fetch_add(1);
+      }
+    };
+    RunWithBarrier(std::vector<std::function<void()>>(kThreads, set_ring));
+    EXPECT_EQ(successes.load(), 1);
+    EXPECT_EQ(busy_errors.load(), kThreads - 1);
+  }
+}
+
+TEST(PacketMmapTest, ConcurrentRingOps) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(
+      HavePacketSocketCapability(SOCK_DGRAM, ETH_P_IP)));
+
+  tpacket_req req = MakeRingReq(1 /* blocks */);
+  tpacket_req zero_req = {};
+  size_t ring_size = static_cast<size_t>(req.tp_block_size) * req.tp_block_nr;
+
+  for (int iter = 0; iter < 20; ++iter) {
+    FileDescriptor mmap_sock =
+        ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_PACKET, SOCK_DGRAM, 0));
+    auto set_or_busy = [&](int opt, const auto& val) {
+      if (setsockopt(mmap_sock.get(), SOL_PACKET, opt, &val, sizeof(val)) !=
+          0) {
+        EXPECT_EQ(errno, EBUSY);
+      }
+    };
+    RunWithBarrier({
+        // Create and tear down the ring.
+        [&] {
+          set_or_busy(PACKET_RX_RING, req);
+          set_or_busy(PACKET_RX_RING, zero_req);
+        },
+        // Update ring version and reserve.
+        [&] {
+          int version = TPACKET_V2;
+          int reserve = 4;
+          set_or_busy(PACKET_VERSION, version);
+          set_or_busy(PACKET_RESERVE, reserve);
+        },
+        // Read packet ring stats.
+        [&] {
+          tpacket_stats stats = {};
+          socklen_t len = sizeof(stats);
+          EXPECT_THAT(getsockopt(mmap_sock.get(), SOL_PACKET, PACKET_STATISTICS,
+                                 &stats, &len),
+                      SyscallSucceeds());
+        },
+        // Map and unmap the ring.
+        [&] {
+          void* addr = mmap(nullptr, ring_size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, mmap_sock.get(), 0 /* offset */);
+          if (addr != MAP_FAILED) {
+            EXPECT_THAT(munmap(addr, ring_size), SyscallSucceeds());
+          } else {
+            EXPECT_THAT(errno, ::testing::AnyOf(EINVAL, ENODEV));
+          }
+        },
+    });
+  }
 }
 
 }  // namespace
