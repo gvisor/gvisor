@@ -127,6 +127,7 @@ go_test(
         "stubfilter_amd64_test.go",
         "stubfilter_arm64_test.go",
         "stubfilter_test.go",
+        "sysmsg_thread_arm64_test.go",
         "systrap_test.go",
         "systrap_unsafe_test.go",
     ],
