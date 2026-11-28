@@ -853,6 +853,14 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) error {
 	saveStart := time.Now()
 
+	// Fail before save pauses the network stacks or writes state if the
+	// network state cannot be restored.
+	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		if err := rootNS.CheckRestorableStacks(); err != nil {
+			return err
+		}
+	}
+
 	// Discard unsavable mappings, such as those for host file descriptors.
 	if err := k.invalidateUnsavableMappings(ctx); err != nil {
 		return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
@@ -915,14 +923,14 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	// Save the timekeeper's state.
 
 	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-		// Pause the network stack.
+		// Pause the network stacks of all network namespaces.
 		netstackPauseStart := time.Now()
 		// Stack.removeConf should be true when resume=false and vice versa.
-		k.rootNetworkNamespace.Stack().SetRemoveConf(!resume)
-		log.Infof("Pausing root network namespace")
-		k.rootNetworkNamespace.Stack().Pause()
-		defer k.rootNetworkNamespace.Stack().Resume()
-		log.Infof("Pausing root network namespace took [%s].", time.Since(netstackPauseStart))
+		k.rootNetworkNamespace.SetRemoveConfStacks(!resume)
+		log.Infof("Pausing network namespaces")
+		k.rootNetworkNamespace.PauseStacks()
+		defer k.rootNetworkNamespace.ResumeStacks()
+		log.Infof("Pausing network namespaces took [%s].", time.Since(netstackPauseStart))
 	}
 
 	// Save the kernel state.
@@ -1177,7 +1185,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 		if err := networkArgs.ConfigureNetwork(s); err != nil {
 			return fmt.Errorf("configuring network: %w", err)
 		}
-		s.Restore()
+		k.rootNetworkNamespace.RestoreStacks()
 		timeline.Reached("Network stack restored")
 	}
 

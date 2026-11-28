@@ -74,7 +74,7 @@ func TestNICMTULimitsSurviveMove(t *testing.T) {
 	if err := src.CreateNICWithOptions(nicID, ep, stack.NICOptions{MinMTU: 1000, MaxMTU: 2000}); err != nil {
 		t.Fatalf("CreateNICWithOptions(%d, _, _) = %v", nicID, err)
 	}
-	id, err := src.SetNICStack(nicID, dst)
+	id, err := src.SetNICStack(nicID, dst, "")
 	if err != nil {
 		t.Fatalf("SetNICStack(%d, _) = %v", nicID, err)
 	}
@@ -2839,7 +2839,7 @@ func TestNICMulticastPreservation(t *testing.T) {
 			if got := s.NICInfo()[id].Flags.Multicast; got != multicast {
 				t.Errorf("NICInfo().Flags.Multicast = %t, want %t", got, multicast)
 			}
-			newID, err := s.SetNICStack(id, peer)
+			newID, err := s.SetNICStack(id, peer, "")
 			if err != nil {
 				t.Fatalf("SetNICStack: %s", err)
 			}
@@ -6172,4 +6172,15 @@ func TestNetworkProtocolEnabled(t *testing.T) {
 		t.Fatalf("SetNICNetworkProtocolEnabled(%d, ipv6, true): %s", nicID1, err)
 	}
 	checkState(false /* wantGlobal */, false /* wantDefault */, map[tcpip.NICID]bool{nicID1: true, nicID2: false})
+}
+
+func TestNextNICIDSkipsExistingNICs(t *testing.T) {
+	s := stack.New(stack.Options{})
+	defer s.Destroy()
+	if err := s.CreateNIC(1, channel.New(0, defaultMTU, "")); err != nil {
+		t.Fatalf("CreateNIC(1, _) = %s", err)
+	}
+	if got := s.NextNICID(); got == 1 {
+		t.Errorf("NextNICID() = 1, want an ID other than the existing NIC's")
+	}
 }

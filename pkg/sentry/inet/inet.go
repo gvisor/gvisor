@@ -107,11 +107,27 @@ type Stack interface {
 	// Pause pauses the network stack before save.
 	Pause()
 
-	// Resume resumes the network stack after save.
-	Resume()
+	// ResumeEndpoints is the first phase of resume after save. It resumes
+	// transport endpoints and protocol background workers.
+	ResumeEndpoints()
 
-	// Restore restarts the network stack after restore.
-	Restore()
+	// ResumeLinkEndpoints is the second phase of resume after save. It resumes
+	// link-layer background workers. It runs after ResumeEndpoints has run on
+	// all stacks.
+	ResumeLinkEndpoints()
+
+	// CheckRestorable returns an error if restore cannot bring back the
+	// network state of the stack. isRoot reports whether the stack belongs
+	// to the root network namespace. The caller must hold the kernel paused.
+	CheckRestorable(isRoot bool) error
+
+	// RestoreNICsAndEndpoints is the first phase of restore. It runs before
+	// asynchronous endpoint loading is complete.
+	RestoreNICsAndEndpoints()
+
+	// RestoreBackgroundWorkers is the second phase of restore. It runs after
+	// asynchronous endpoint loading is complete.
+	RestoreBackgroundWorkers()
 
 	// ResetConfig resets the stack's NICs and configuration.
 	ResetConfig()

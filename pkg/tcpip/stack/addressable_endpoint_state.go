@@ -764,6 +764,27 @@ func (a *AddressableEndpointState) Cleanup() {
 	}
 }
 
+// Restore drops all references on each address, except the reference that a
+// permanent address holds on itself. Objects that saved a reference on an
+// address must take it again after Restore.
+func (a *AddressableEndpointState) Restore() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, addrState := range a.endpoints {
+		var wantRefs int64
+		addrState.mu.RLock()
+		if addrState.kind.IsPermanent() {
+			wantRefs = 1
+		}
+		addrState.mu.RUnlock()
+
+		for gotRefs := addrState.refs.ReadRefs(); gotRefs > wantRefs; gotRefs-- {
+			a.decAddressRefLocked(addrState)
+		}
+	}
+}
+
 var _ AddressEndpoint = (*addressState)(nil)
 
 // addressState holds state for an address.

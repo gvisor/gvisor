@@ -105,10 +105,17 @@ type IPTables struct {
 	//
 	// +checklocks:mu
 	modified bool
+	// modifiedTables holds, for each table ID, whether the IPv4 or IPv6
+	// table with that ID was replaced at least once.
+	//
+	// +checklocks:mu
+	modifiedTables [NumTables]bool
 }
 
-// Modified returns whether iptables has been modified. It is inherently racy
-// and intended for use only in tests.
+// Modified returns whether a table was replaced at least once. It stays true
+// after that, even if the new table equals the default table. The result can
+// change at any time unless nothing can replace tables, for example while the
+// kernel is paused for save.
 func (it *IPTables) Modified() bool {
 	it.mu.Lock()
 	defer it.mu.Unlock()

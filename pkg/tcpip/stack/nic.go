@@ -57,6 +57,10 @@ type nic struct {
 	// It is immutable.
 	multicast bool
 
+	// preserve indicates whether the NIC is preserved across save and restore.
+	// It is immutable.
+	preserve bool
+
 	stats sharedStats
 
 	// enableDisableMu is used to synchronize attempts to enable/disable the NIC.
@@ -226,6 +230,7 @@ func newNIC(stack *Stack, id tcpip.NICID, ep LinkEndpoint, opts NICOptions) *nic
 		minMTU:                           opts.MinMTU,
 		maxMTU:                           opts.MaxMTU,
 		multicast:                        opts.Multicast,
+		preserve:                         opts.Preserve || opts.Kind == NICKindTun,
 		adminDown:                        atomicbitops.FromBool(opts.Disabled),
 	}
 	nic.linkResQueue.init(nic)

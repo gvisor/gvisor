@@ -21,6 +21,7 @@ go_library(
         "masquerade.go",
         "multiport_matcher.go",
         "multiport_matcher_v1.go",
+        "nat_check.go",
         "netfilter.go",
         "owner_matcher.go",
         "owner_matcher_v1.go",

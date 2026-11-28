@@ -636,7 +636,7 @@ func TestIPTablesJumpLoop(t *testing.T) {
 	}
 	iptables.ReplaceTable(FilterID, table, true /* ipv6 */)
 
-	// This should drop the packet (due to exceeding maxJumps) without a stack overflow.
+	// This should drop the packet (due to exceeding MaxJumps) without a stack overflow.
 	pkt := v6PacketBuffer()
 	if iptables.CheckInput(pkt, "") {
 		t.Errorf("CheckInput with jump loop expected to drop packet, but got accept")
