@@ -1085,6 +1085,8 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		fmt.Fprintf(buf, "VmHWM:\t%d kB\n", mm.MaxResidentSetSize()>>10)
 		fmt.Fprintf(buf, "VmRSS:\t%d kB\n", rss>>10)
 		fmt.Fprintf(buf, "VmData:\t%d kB\n", mm.VirtualDataSize()>>10)
+		// The sentry never swaps application memory out.
+		fmt.Fprintf(buf, "VmSwap:\t0 kB\n")
 	}
 
 	fmt.Fprintf(buf, "Threads:\t%d\n", s.task.ThreadGroup().Count())

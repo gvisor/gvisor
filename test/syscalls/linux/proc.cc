@@ -2646,6 +2646,18 @@ TEST(ProcPidStatTest, VmStats) {
   EXPECT_TRUE(IsDigits(data_str.substr(0, data_str.length() - 3))) << data_str;
   // ... which is not 0.
   EXPECT_NE('0', data_str[0]);
+
+  // VmSwap is present, and may be 0.
+  const auto swap_it = status.find("VmSwap");
+  ASSERT_NE(swap_it, status.end());
+
+  absl::string_view swap_str(swap_it->second);
+
+  // Room for the " kB" suffix plus at least one digit.
+  ASSERT_GT(swap_str.length(), 3);
+  EXPECT_TRUE(absl::EndsWith(swap_str, " kB"));
+  // Everything else is part of a number.
+  EXPECT_TRUE(IsDigits(swap_str.substr(0, swap_str.length() - 3))) << swap_str;
 }
 
 // Hold /proc/[pid]/stat open across reap; a successful read must not start
